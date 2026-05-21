@@ -1873,13 +1873,15 @@ class DataProcessorWindow(QMainWindow):
             self.ai_diagnosis_result.setText('正在分析，请稍候...')
             self.ai_diagnosis_stream = ""  # 用于流式接收
 
-            # 使用子线程调用Ollama
-            from py.ollama_client import OllamaGenerateThread
-            self.ollama_gen_thread = OllamaGenerateThread(
-                base_url=self.ollama_client.base_url,
-                model=self.ollama_client.model,
-                prompt=prompt,
-                keep_alive="5m"
+            # 使用子线程调用本地模型
+            from py.llama_generate_thread import LlamaGenerateThread
+            model_path = self.ai_model_path.text()
+            if not model_path:
+                self.ai_diagnosis_result.setText('请先选择GGUF模型文件')
+                return
+            self.ollama_gen_thread = LlamaGenerateThread(
+                model_path=model_path,
+                prompt=prompt
             )
             self.ollama_gen_thread.token_received.connect(self._on_diagnosis_token)
             self.ollama_gen_thread.finished.connect(self._on_diagnosis_finished)
@@ -1974,12 +1976,14 @@ class DataProcessorWindow(QMainWindow):
             self.ai_chat_stream = ""
             self.ai_chat_user_q = user_question
 
-            from py.ollama_client import OllamaGenerateThread
-            self.ollama_chat_thread = OllamaGenerateThread(
-                base_url=self.ollama_client.base_url,
-                model=self.ollama_client.model,
-                prompt=full_prompt,
-                keep_alive="5m"
+            from py.llama_generate_thread import LlamaGenerateThread
+            model_path = self.ai_model_path.text()
+            if not model_path:
+                self.ai_chat_result.setText('请先选择GGUF模型文件')
+                return
+            self.ollama_chat_thread = LlamaGenerateThread(
+                model_path=model_path,
+                prompt=full_prompt
             )
             self.ollama_chat_thread.token_received.connect(self._on_chat_token)
             self.ollama_chat_thread.finished.connect(self._on_chat_finished)
@@ -2102,12 +2106,14 @@ Template content:
 Please summarize these features briefly so I can generate new reports based on this template."""
             self.word_template_analysis.setText('正在分析，请稍候...')
 
-            from py.ollama_client import OllamaGenerateThread
-            self.word_template_thread = OllamaGenerateThread(
-                base_url=self.ollama_client.base_url,
-                model=self.ollama_client.model,
-                prompt=prompt,
-                keep_alive="5m"
+            from py.llama_generate_thread import LlamaGenerateThread
+            model_path = self.ai_model_path.text()
+            if not model_path:
+                self.word_template_analysis.setText('请先选择GGUF模型文件')
+                return
+            self.word_template_thread = LlamaGenerateThread(
+                model_path=model_path,
+                prompt=prompt
             )
             self.word_template_thread.finished.connect(lambda r: self.word_template_analysis.setText(r if r else 'AI分析失败'))
             self.word_template_thread.error.connect(lambda e: self.word_template_analysis.setText(f'分析失败: {e}'))
@@ -2193,12 +2199,14 @@ Please summarize:
 Only analyze the file list, don't read specific content."""
         self.project_content_analysis.setText('正在分析，请稍候...')
 
-        from py.ollama_client import OllamaGenerateThread
-        self.project_content_thread = OllamaGenerateThread(
-            base_url=self.ollama_client.base_url,
-            model=self.ollama_client.model,
-            prompt=prompt,
-            keep_alive="5m"
+        from py.llama_generate_thread import LlamaGenerateThread
+        model_path = self.ai_model_path.text()
+        if not model_path:
+            self.project_content_analysis.setText('请先选择GGUF模型文件')
+            return
+        self.project_content_thread = LlamaGenerateThread(
+            model_path=model_path,
+            prompt=prompt
         )
         self.project_content_thread.finished.connect(lambda r: self.project_content_analysis.setText(r if r else 'AI分析失败'))
         self.project_content_thread.error.connect(lambda e: self.project_content_analysis.setText(f'分析失败: {e}'))
@@ -3517,12 +3525,15 @@ Please analyze this time series data and identify:
 
 If anything is unclear, ask me to clarify via dialog. Keep response concise under 200 words."""
 
-            from py.ollama_client import OllamaGenerateThread
-            self.ollama_diag_thread = OllamaGenerateThread(
-                base_url=self.ollama_client.base_url,
-                model=self.ollama_client.model,
-                prompt=prompt,
-                keep_alive="5m"
+            from py.llama_generate_thread import LlamaGenerateThread
+            model_path = self.ai_model_path.text()
+            if not model_path:
+                self.ai_diagnosis_result.setText('请先选择GGUF模型文件')
+                self.ai_diagnosis_btn.setEnabled(True)
+                return
+            self.ollama_diag_thread = LlamaGenerateThread(
+                model_path=model_path,
+                prompt=prompt
             )
             self.ollama_diag_thread.finished.connect(self._on_gen_diagnosis_finished)
             self.ollama_diag_thread.error.connect(self._on_gen_diagnosis_error)
@@ -3615,12 +3626,14 @@ If anything is unclear, ask me to clarify via dialog. Keep response concise unde
             self.custom_query_result.setText('正在处理，请稍候...')
             self.custom_query_stream = ""
 
-            from py.ollama_client import OllamaGenerateThread
-            self.custom_query_thread = OllamaGenerateThread(
-                base_url=self.ollama_client.base_url,
-                model=self.ollama_client.model,
-                prompt=full_prompt,
-                keep_alive="5m"
+            from py.llama_generate_thread import LlamaGenerateThread
+            model_path = self.ai_model_path.text()
+            if not model_path:
+                self.custom_query_result.setText('请先选择GGUF模型文件')
+                return
+            self.custom_query_thread = LlamaGenerateThread(
+                model_path=model_path,
+                prompt=full_prompt
             )
             self.custom_query_thread.token_received.connect(self._on_custom_query_token)
             self.custom_query_thread.finished.connect(self._on_custom_query_finished)
