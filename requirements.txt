@@ -7,3 +7,7 @@ python-docx>=0.8.0
 openpyxl>=3.1.0
 matplotlib>=3.7.0
 requests>=2.28.0
+
+# Local LLM (llama-cpp-python) - GPU加速
+# Install with: $env:CMAKE_ARGS="-DGGML_CUDA=on"; pip install llama-cpp-python
+llama-cpp-python>=0.2.0
