@@ -2,6 +2,7 @@
 # PyQt6-based offline data analysis software
 
 import sys
+import os
 import json
 from pathlib import Path
 from PyQt6.QtWidgets import (
@@ -1634,6 +1635,13 @@ class DataProcessorWindow(QMainWindow):
         self.ai_model_path = QLineEdit()
         self.ai_model_path.setPlaceholderText('选择GGUF模型文件路径...')
         self.ai_model_path.setMinimumWidth(200)
+        # 默认路径
+        default_model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+        if os.path.exists(default_model_dir):
+            models = [f for f in os.listdir(default_model_dir) if f.endswith('.gguf')]
+            if models:
+                self.ai_model_path.setText(os.path.join(default_model_dir, models[0]))
+                self.ai_model_path.setStyleSheet('color: #333;')
         model_layout.addWidget(self.ai_model_path)
 
         select_model_btn = QPushButton('浏览...')
