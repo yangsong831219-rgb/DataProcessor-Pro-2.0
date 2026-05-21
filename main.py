@@ -1626,25 +1626,27 @@ class DataProcessorWindow(QMainWindow):
         config_group.setLayout(config_layout)
         layout.addWidget(config_group)
 
-        # 模型选择
-        model_group = QGroupBox('AI模型')
+        # 模型选择 - 本地GGUF文件
+        model_group = QGroupBox('本地模型')
         model_layout = QHBoxLayout()
 
-        model_layout.addWidget(QLabel('模型:'))
-        self.ai_model_combo = QComboBox()
-        self.ai_model_combo.setMinimumWidth(150)
-        self.ai_model_combo.addItems(['gemma4:e4b', 'qwen3.5:0.8b', 'qwen3.5:9b'])
-        self.ai_model_combo.currentTextChanged.connect(self.on_ollama_model_changed)
-        model_layout.addWidget(self.ai_model_combo)
+        model_layout.addWidget(QLabel('模型文件:'))
+        self.ai_model_path = QLineEdit()
+        self.ai_model_path.setPlaceholderText('选择GGUF模型文件路径...')
+        self.ai_model_path.setMinimumWidth(200)
+        model_layout.addWidget(self.ai_model_path)
 
-        self.ai_status_label = QLabel('Ollama状态: 检测中...')
+        select_model_btn = QPushButton('浏览...')
+        select_model_btn.clicked.connect(self.select_local_model)
+        model_layout.addWidget(select_model_btn)
+
+        self.ai_status_label = QLabel('状态: 未加载')
         model_layout.addWidget(self.ai_status_label)
 
-        ollama_toggle = QPushButton('启动服务')
-        ollama_toggle.setCheckable(True)
-        ollama_toggle.clicked.connect(self.toggle_ollama_service)
-        self.ollama_toggle_btn = ollama_toggle
-        model_layout.addWidget(ollama_toggle)
+        unload_btn = QPushButton('卸载模型')
+        unload_btn.clicked.connect(self.unload_local_model)
+        model_layout.addWidget(unload_btn)
+        self.ollama_toggle_btn = unload_btn
 
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
@@ -3380,44 +3382,64 @@ Only analyze the file list, don't read specific content."""
             if current in models:
                 self.ai_model_combo.setCurrentText(current)
 
-    def toggle_ollama_service(self):
-        """切换Ollama服务状态"""
-        if not self.ollama_client:
-            QMessageBox.warning(self, '警告', 'Ollama客户端未初始化')
-            return
+    def select_local_model(self):
+        """选择本地GGUF模型文件"""
+        from PyQt6.QtWidgets import QFileDialog
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, '选择GGUF模型文件', '', 'GGUF Files (*.gguf);;All Files (*)'
+        )
+        if file_path:
+            self.ai_model_path.setText(file_path)
+            self.ai_model_path.setStyleSheet('color: #333;')
 
-        if self.ollama_client.is_available():
-            # 服务正在运行，停止它
-            if self.ollama_client.stop_service():
-                self.ai_status_label.setText('Ollama状态: 已停止')
-                self.ai_status_label.setStyleSheet('color: orange;')
-                self.ollama_toggle_btn.setText('启动服务')
-                self.ollama_toggle_btn.setChecked(False)
-            else:
-                self.ai_status_label.setText('Ollama状态: 停止失败')
-                self.ai_status_label.setStyleSheet('color: red;')
-        else:
-            # 服务未运行，启动它
-            self.ai_status_label.setText('Ollama状态: 正在启动...')
-            self.ai_status_label.setStyleSheet('color: blue;')
-            QApplication.processEvents()
-
-            # 更新客户端模型为当前选择的模型
-            self.ollama_client.model = self.ai_model_combo.currentText()
-
-            if self.ollama_client.start_service():
-                model_name = self.ollama_client.model
-                self.ai_status_label.setText(f'Ollama状态: 已连接 ({model_name})')
+            # 更新状态
+            from py.local_llm_manager import get_global_llm_manager
+            llm = get_global_llm_manager()
+            if llm.load_model(file_path):
+                self.ai_status_label.setText(f'状态: 已加载 ({file_path.split("/")[-1]})')
                 self.ai_status_label.setStyleSheet('color: green;')
-                self.ollama_toggle_btn.setText('停止服务')
-                self.ollama_toggle_btn.setChecked(True)
-                self.refresh_ollama_models()
             else:
-                self.ai_status_label.setText('Ollama状态: 启动失败')
+                self.ai_status_label.setText('状态: 加载失败')
                 self.ai_status_label.setStyleSheet('color: red;')
-                self.ollama_toggle_btn.setText('启动服务')
-                self.ollama_toggle_btn.setChecked(False)
-                QMessageBox.warning(self, '警告', 'Ollama服务启动失败，请确保已安装Ollama (https://ollama.com)')
+
+    def unload_local_model(self):
+        """卸载当前模型"""
+        from py.local_llm_manager import get_global_llm_manager
+        llm = get_global_llm_manager()
+        if llm.unload_model():
+            self.ai_status_label.setText('状态: 未加载')
+            self.ai_status_label.setStyleSheet('color: gray;')
+        else:
+            self.ai_status_label.setText('状态: 卸载失败')
+            self.ai_status_label.setStyleSheet('color: orange;')
+
+    def check_ollama_status(self):
+        """检查本地模型状态"""
+        from py.local_llm_manager import get_global_llm_manager
+        llm = get_global_llm_manager()
+        if llm.is_model_loaded():
+            model_name = llm.get_current_model_path().split("/")[-1]
+            self.ai_status_label.setText(f'状态: 已加载 ({model_name})')
+            self.ai_status_label.setStyleSheet('color: green;')
+        else:
+            self.ai_status_label.setText('状态: 未加载')
+            self.ai_status_label.setStyleSheet('color: gray;')
+
+    def _on_ollama_status_result(self, is_available):
+        """Ollama状态检测结果"""
+        pass  # 不再使用
+
+    def _on_ollama_models_list(self, models):
+        """收到模型列表"""
+        pass  # 不再使用
+
+    def on_ollama_model_changed(self, model_name):
+        """模型切换（不再使用，保留接口）"""
+        pass
+
+    def refresh_ollama_models(self):
+        """刷新模型列表（不再使用）"""
+        pass
 
     def generate_ai_diagnosis(self):
         """生成AI诊断摘要 - 分析计算后的全部物理量数据"""
