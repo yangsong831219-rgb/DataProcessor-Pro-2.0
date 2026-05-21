@@ -2,10 +2,20 @@
 LocalLLMManager - 基于 llama-cpp-python 的本地大模型管理
 支持多模型平滑切换、流式输出、GPU加速
 """
-from llama_cpp import Llama
-from llama_cpp.server import LlamaServer
 import gc
 import os
+
+
+def _check_llama_cpp():
+    """检查llama_cpp是否可用"""
+    try:
+        from llama_cpp import Llama
+        return True
+    except ImportError:
+        return False
+
+
+LLAMA_CPP_AVAILABLE = _check_llama_cpp()
 
 
 class LocalLLMManager:
@@ -32,6 +42,10 @@ class LocalLLMManager:
         Returns:
             bool: 加载是否成功
         """
+        if not LLAMA_CPP_AVAILABLE:
+            print("错误: llama-cpp-python未安装。请运行: pip install llama-cpp-python")
+            return False
+
         # 如果请求的模型已经是当前加载的模型，直接返回
         if self.llm is not None and self.current_model_path == model_path:
             return True
@@ -49,6 +63,7 @@ class LocalLLMManager:
 
         print(f"正在加载新模型: {model_path}")
         try:
+            from llama_cpp import Llama
             self.llm = Llama(
                 model_path=model_path,
                 n_gpu_layers=n_gpu_layers,
@@ -101,7 +116,12 @@ class LocalLLMManager:
             yield "错误：模型未加载"
             return
 
+        if not LLAMA_CPP_AVAILABLE:
+            yield "错误: llama-cpp-python未安装"
+            return
+
         try:
+            from llama_cpp import Llama
             response = self.llm(
                 prompt,
                 max_tokens=max_tokens,
@@ -133,7 +153,11 @@ class LocalLLMManager:
         if not self.llm:
             return "错误：模型未加载"
 
+        if not LLAMA_CPP_AVAILABLE:
+            return "错误: llama-cpp-python未安装"
+
         try:
+            from llama_cpp import Llama
             response = self.llm(
                 prompt,
                 max_tokens=max_tokens,
@@ -157,3 +181,8 @@ def get_global_llm_manager() -> LocalLLMManager:
     if _global_llm_manager is None:
         _global_llm_manager = LocalLLMManager()
     return _global_llm_manager
+
+
+def is_llama_cpp_available() -> bool:
+    """检查llama-cpp-python是否可用"""
+    return LLAMA_CPP_AVAILABLE

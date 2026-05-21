@@ -3,8 +3,19 @@ Llama生成线程 - 基于 llama-cpp-python 的PyQt线程实现
 支持流式输出、token批处理
 """
 from PyQt6.QtCore import QThread, pyqtSignal
-from py.local_llm_manager import get_global_llm_manager
 import time
+
+
+def _check_llama_cpp():
+    """检查llama_cpp是否可用"""
+    try:
+        from llama_cpp import Llama
+        return True
+    except ImportError:
+        return False
+
+
+LLAMA_CPP_AVAILABLE = _check_llama_cpp()
 
 
 class LlamaGenerateThread(QThread):
@@ -42,13 +53,18 @@ class LlamaGenerateThread(QThread):
 
     def run(self):
         """在子线程中执行模型推理"""
+        if not LLAMA_CPP_AVAILABLE:
+            self.error.emit("llama-cpp-python未安装，请运行: pip install llama-cpp-python")
+            return
+
         try:
+            from py.local_llm_manager import get_global_llm_manager
             llm_manager = get_global_llm_manager()
 
             # 1. 确保模型已加载
             success = llm_manager.load_model(self.model_path, self.n_ctx)
             if not success:
-                self.error.emit("模型加载失败，请检查模型文件路径或显存占用")
+                self.error.emit("模型加载失败，请检查模型文件路径")
                 return
 
             # 2. 格式化prompt（支持Qwen等模型的ChatML格式）
