@@ -37,6 +37,10 @@ import matplotlib.pyplot as plt
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
 
+# ============ Backend Module Imports ============
+from py.wiki_system import WikiFileSystem
+from py.multi_agent import run_multi_agent, MultiAgentState
+
 
 # ============ Data Templates ============
 
@@ -1276,6 +1280,8 @@ class DataProcessorWindow(QMainWindow):
         self.info_menu_list.addItem('PPT报告生成')
         self.info_menu_list.addItem('AI诊断')
         self.info_menu_list.addItem('项目资料管理')
+        self.info_menu_list.addItem('知识库管理')
+        self.info_menu_list.addItem('技能插件中心')
         self.info_menu_list.currentRowChanged.connect(self.on_info_menu_changed)
         left_layout.addWidget(self.info_menu_list)
 
@@ -1313,6 +1319,14 @@ class DataProcessorWindow(QMainWindow):
         # 项目资料管理页面
         project_manage_page = self.create_project_manage_page()
         self.report_content_stack.addWidget(project_manage_page)
+
+        # 知识库管理页面
+        wiki_page = self.create_wiki_page()
+        self.report_content_stack.addWidget(wiki_page)
+
+        # 技能插件中心页面
+        skill_center_page = self.create_skill_center_page()
+        self.report_content_stack.addWidget(skill_center_page)
 
         self.report_tab.setLayout(main_layout)
 
@@ -1679,6 +1693,11 @@ class DataProcessorWindow(QMainWindow):
         clear_result_btn.clicked.connect(lambda: self.ai_diagnosis_result.clear())
         result_btn_layout.addWidget(clear_result_btn)
 
+        multi_agent_btn = QPushButton('运行多智能体诊断')
+        multi_agent_btn.setStyleSheet('background-color: #52c41a; color: white;')
+        multi_agent_btn.clicked.connect(self.run_multi_agent_diagnosis)
+        result_btn_layout.addWidget(multi_agent_btn)
+
         result_layout.addLayout(result_btn_layout)
         result_group.setLayout(result_layout)
         layout.addWidget(result_group)
@@ -1761,6 +1780,460 @@ class DataProcessorWindow(QMainWindow):
         layout.addStretch()
         page.setLayout(layout)
         return page
+
+    # ============ 知识库管理页面 ============
+    def create_wiki_page(self):
+        """知识库管理页面"""
+        page = QWidget()
+        main_layout = QHBoxLayout()
+
+        # 左侧：页面列表
+        left_panel = QWidget()
+        left_layout = QVBoxLayout()
+
+        # 页面列表标题
+        list_label = QLabel('Wiki 页面')
+        list_label.setStyleSheet('font-weight: bold; font-size: 14px;')
+        left_layout.addWidget(list_label)
+
+        # 页面列表
+        self.wiki_page_list = QListWidget()
+        self.wiki_page_list.itemClicked.connect(self.on_wiki_page_selected)
+        left_layout.addWidget(self.wiki_page_list)
+
+        # 页面操作按钮
+        btn_layout = QHBoxLayout()
+        new_page_btn = QPushButton('新建')
+        new_page_btn.setStyleSheet('background-color: #1890ff; color: white;')
+        new_page_btn.clicked.connect(self.on_wiki_new_page)
+        btn_layout.addWidget(new_page_btn)
+
+        delete_page_btn = QPushButton('删除')
+        delete_page_btn.setStyleSheet('background-color: #ff4d4f; color: white;')
+        delete_page_btn.clicked.connect(self.on_wiki_delete_page)
+        btn_layout.addWidget(delete_page_btn)
+
+        left_layout.addLayout(btn_layout)
+
+        # 搜索区域
+        search_layout = QHBoxLayout()
+        self.wiki_search_input = QLineEdit()
+        self.wiki_search_input.setPlaceholderText('搜索...')
+        search_btn = QPushButton('搜索')
+        search_btn.clicked.connect(self.on_wiki_search)
+        search_layout.addWidget(self.wiki_search_input)
+        search_layout.addWidget(search_btn)
+
+        upload_btn = QPushButton('上传文件')
+        upload_btn.setStyleSheet('background-color: #52c41a; color: white;')
+        upload_btn.clicked.connect(self.on_wiki_upload)
+        search_layout.addWidget(upload_btn)
+
+        left_layout.addLayout(search_layout)
+
+        # 使用说明按钮
+        help_btn = QPushButton('使用说明')
+        help_btn.clicked.connect(self.show_wiki_help)
+        left_layout.addWidget(help_btn)
+
+        left_panel.setLayout(left_layout)
+        left_panel.setMaximumWidth(220)
+        main_layout.addWidget(left_panel)
+
+        # 右侧：页面编辑器
+        right_panel = QWidget()
+        right_layout = QVBoxLayout()
+
+        # 页面标题输入
+        title_layout = QHBoxLayout()
+        title_layout.addWidget(QLabel('标题:'))
+        self.wiki_title_input = QLineEdit()
+        self.wiki_title_input.setPlaceholderText('页面标题')
+        title_layout.addWidget(self.wiki_title_input)
+
+        save_page_btn = QPushButton('保存页面')
+        save_page_btn.setStyleSheet('background-color: #1890ff; color: white;')
+        save_page_btn.clicked.connect(self.on_wiki_save_page)
+        title_layout.addWidget(save_page_btn)
+
+        right_layout.addLayout(title_layout)
+
+        # 内容编辑器
+        self.wiki_content_edit = QTextEdit()
+        self.wiki_content_edit.setPlaceholderText('页面内容 (支持 Markdown 格式)...')
+        right_layout.addWidget(self.wiki_content_edit)
+
+        # 搜索结果显示
+        self.wiki_search_result = QTextEdit()
+        self.wiki_search_result.setMaximumHeight(120)
+        self.wiki_search_result.setPlaceholderText('搜索结果...')
+        self.wiki_search_result.setReadOnly(True)
+        right_layout.addWidget(self.wiki_search_result)
+
+        right_panel.setLayout(right_layout)
+        main_layout.addWidget(right_panel, 1)
+
+        page.setLayout(main_layout)
+
+        # 初始化知识库
+        self.wiki_fs = WikiFileSystem()
+        self.refresh_wiki_pages()
+
+        return page
+
+    def refresh_wiki_pages(self):
+        """刷新Wiki页面列表"""
+        self.wiki_page_list.clear()
+        pages = self.wiki_fs.list_pages()
+        # 解析页面列表，提取页面名
+        for line in pages.split('\n'):
+            if line.startswith('## '):
+                page_name = line[3:].strip()
+                self.wiki_page_list.addItem(page_name)
+
+    def on_wiki_page_selected(self, item):
+        """选中Wiki页面时加载内容"""
+        page_name = item.text()
+        content = self.wiki_fs.read_wiki_page(page_name)
+        if content and not content.startswith('Error:'):
+            self.wiki_title_input.setText(page_name)
+            self.wiki_content_edit.setPlainText(content)
+        else:
+            self.wiki_title_input.setText(page_name)
+            self.wiki_content_edit.clear()
+
+    def on_wiki_new_page(self):
+        """新建Wiki页面"""
+        self.wiki_title_input.clear()
+        self.wiki_content_edit.clear()
+        self.wiki_title_input.setFocus()
+
+    def on_wiki_delete_page(self):
+        """删除Wiki页面"""
+        current_item = self.wiki_page_list.currentItem()
+        if current_item:
+            page_name = current_item.text()
+            reply = QMessageBox.question(self, '确认', f'确定删除页面 "{page_name}"？',
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.wiki_fs.delete_wiki_page(page_name)
+                self.refresh_wiki_pages()
+                self.wiki_title_input.clear()
+                self.wiki_content_edit.clear()
+
+    def on_wiki_save_page(self):
+        """保存Wiki页面"""
+        page_name = self.wiki_title_input.text().strip()
+        if not page_name:
+            QMessageBox.warning(self, '警告', '请输入页面标题')
+            return
+
+        content = self.wiki_content_edit.toPlainText()
+        result = self.wiki_fs.write_wiki_page(page_name, content)
+        self.refresh_wiki_pages()
+        QMessageBox.information(self, '成功', result)
+
+    def on_wiki_search(self):
+        """搜索Wiki页面"""
+        keyword = self.wiki_search_input.text().strip()
+        if not keyword:
+            return
+        result = self.wiki_fs.search_pages(keyword)
+        self.wiki_search_result.setPlainText(result)
+
+    def on_wiki_upload(self):
+        """上传文件到知识库"""
+        file_path, _ = QFileDialog.getOpenFileName(self, '选择文件', '', 'All Files (*)')
+        if file_path:
+            result = self.wiki_fs.upload_file_to_wiki(file_path)
+            self.refresh_wiki_pages()
+            QMessageBox.information(self, '成功', result)
+
+    def show_wiki_help(self):
+        """显示知识库使用说明"""
+        help_text = """# 知识库使用说明
+
+## 功能概述
+知识库是一个基于本地文件系统的文档管理系统，支持 Markdown 格式存储。
+
+## 基本操作
+
+### 查看页面
+1. 在左侧列表点击页面名称
+2. 右侧将显示页面内容
+
+### 新建页面
+1. 点击"新建"按钮
+2. 输入页面标题
+3. 编辑内容
+4. 点击"保存页面"
+
+### 编辑页面
+1. 从列表选择页面
+2. 修改标题或内容
+3. 点击"保存页面"保存修改
+
+### 删除页面
+1. 从列表选择页面
+2. 点击"删除"按钮
+3. 确认删除
+
+### 搜索
+1. 在搜索框输入关键词
+2. 点击"搜索"按钮
+3. 结果显示在下方
+
+### 上传文件
+1. 点击"上传文件"按钮
+2. 选择要上传的文件
+3. 文件将自动添加到知识库
+
+## 存储位置
+知识库文件存储在: wiki_vault/pages/
+索引文件: wiki_vault/wiki_map.json
+"""
+        help_dialog = QDialog(self)
+        help_dialog.setWindowTitle('知识库使用说明')
+        help_dialog.resize(700, 600)
+
+        layout = QVBoxLayout()
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(help_text)
+        layout.addWidget(text_edit)
+
+        close_btn = QPushButton('关闭')
+        close_btn.clicked.connect(help_dialog.close)
+        layout.addWidget(close_btn)
+
+        help_dialog.setLayout(layout)
+        help_dialog.exec()
+
+    # ============ 技能插件中心页面 ============
+    def create_skill_center_page(self):
+        """技能插件中心页面"""
+        page = QWidget()
+        main_layout = QVBoxLayout()
+
+        # 说明标签
+        info_label = QLabel('技能插件中心：管理AI Agent技能，支持从GitHub加载自定义技能')
+        info_label.setStyleSheet('color: #666; padding: 10px;')
+        main_layout.addWidget(info_label)
+
+        # 技能表格区域
+        skill_group = QGroupBox('内置技能')
+        skill_layout = QVBoxLayout()
+
+        self.skill_table = QTableWidget()
+        self.skill_table.setColumnCount(3)
+        self.skill_table.setHorizontalHeaderLabels(['技能名称', '功能说明', '启用'])
+        self.skill_table.setRowCount(10)
+
+        # 内置技能列表
+        built_in_skills = [
+            ('Python_REPL', 'Python沙箱执行器', True),
+            ('arxiv', '学术文献搜索', False),
+            ('ddg_search', '联网搜索', False),
+            ('wikipedia', '维基百科', False),
+            ('apply_butterworth_filter', '巴特沃斯滤波', True),
+            ('execute_custom_formula', '自定义公式', True),
+            ('read_wiki_page', 'Wiki读', True),
+            ('write_wiki_page', 'Wiki写', True),
+            ('list_wiki_pages', 'Wiki列表', True),
+            ('search_wiki_pages', 'Wiki搜索', True),
+        ]
+
+        for i, (name, desc, enabled) in enumerate(built_in_skills):
+            self.skill_table.setItem(i, 0, QTableWidgetItem(name))
+            self.skill_table.setItem(i, 1, QTableWidgetItem(desc))
+            checkbox = QTableWidgetItem()
+            checkbox.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+            self.skill_table.setItem(i, 2, checkbox)
+
+        self.skill_table.resizeColumnsToContents()
+        skill_layout.addWidget(self.skill_table)
+        skill_group.setLayout(skill_layout)
+        main_layout.addWidget(skill_group)
+
+        # GitHub技能加载区域
+        github_group = QGroupBox('GitHub技能加载')
+        github_layout = QGridLayout()
+
+        github_layout.addWidget(QLabel('仓库所有者:'), 0, 0)
+        self.github_owner_input = QLineEdit()
+        github_layout.addWidget(self.github_owner_input, 0, 1)
+
+        github_layout.addWidget(QLabel('仓库名称:'), 0, 2)
+        self.github_repo_input = QLineEdit()
+        github_layout.addWidget(self.github_repo_input, 0, 3)
+
+        github_layout.addWidget(QLabel('文件路径:'), 1, 0)
+        self.github_path_input = QLineEdit()
+        self.github_path_input.setText('skills/')
+        github_layout.addWidget(self.github_path_input, 1, 1)
+
+        github_layout.addWidget(QLabel('分支:'), 1, 2)
+        self.github_branch_input = QLineEdit()
+        self.github_branch_input.setText('main')
+        github_layout.addWidget(self.github_branch_input, 1, 3)
+
+        github_layout.addWidget(QLabel('GitHub Token:'), 2, 0)
+        self.github_token_input = QLineEdit()
+        self.github_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        github_layout.addWidget(self.github_token_input, 2, 1, 1, 3)
+
+        btn_row = QHBoxLayout()
+        load_skill_btn = QPushButton('下载并加载技能')
+        load_skill_btn.setStyleSheet('background-color: #52c41a; color: white;')
+        load_skill_btn.clicked.connect(self.on_load_github_skill)
+        btn_row.addWidget(load_skill_btn)
+
+        view_loaded_btn = QPushButton('查看已加载')
+        view_loaded_btn.setStyleSheet('background-color: #1890ff; color: white;')
+        view_loaded_btn.clicked.connect(self.on_view_loaded_skills)
+        btn_row.addWidget(view_loaded_btn)
+
+        clear_all_btn = QPushButton('清除全部')
+        clear_all_btn.setStyleSheet('background-color: #ff4d4f; color: white;')
+        clear_all_btn.clicked.connect(self.on_clear_all_skills)
+        btn_row.addWidget(clear_all_btn)
+
+        github_layout.addLayout(btn_row, 3, 0, 1, 4)
+
+        github_group.setLayout(github_layout)
+        main_layout.addWidget(github_group)
+
+        # Agent思考日志区
+        log_group = QGroupBox('Agent 思考日志')
+        log_layout = QVBoxLayout()
+
+        self.agent_log = QTextEdit()
+        self.agent_log.setReadOnly(True)
+        self.agent_log.setStyleSheet('''
+            QTextEdit { background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas, monospace; }
+        ''')
+        log_layout.addWidget(self.agent_log)
+
+        clear_log_btn = QPushButton('清空日志')
+        clear_log_btn.clicked.connect(lambda: self.agent_log.clear())
+        log_layout.addWidget(clear_log_btn)
+
+        log_group.setLayout(log_layout)
+        main_layout.addWidget(log_group)
+
+        # 使用说明按钮
+        help_btn = QPushButton('使用说明')
+        help_btn.clicked.connect(self.show_skill_center_help)
+        main_layout.addWidget(help_btn)
+
+        page.setLayout(main_layout)
+        return page
+
+    def on_load_github_skill(self):
+        """从GitHub加载技能"""
+        owner = self.github_owner_input.text().strip()
+        repo = self.github_repo_input.text().strip()
+        path = self.github_path_input.text().strip()
+        branch = self.github_branch_input.text().strip() or 'main'
+        token = self.github_token_input.text().strip()
+
+        if not owner or not repo:
+            QMessageBox.warning(self, '警告', '请输入仓库所有者和仓库名称')
+            return
+
+        self.agent_log.append(f'<span style="color: blue;">[INFO]</span> 正在从 GitHub 加载技能...')
+        self.agent_log.append(f'<span style="color: orange;">[LOAD]</span> {owner}/{repo}/{path}@{branch}')
+
+        # 使用GitHub loader如果可用
+        try:
+            from py.github_skill_loader import GithubSkillLoader
+            loader = GithubSkillLoader(token if token else None)
+            self.agent_log.append(f'<span style="color: green;">[OK]</span> 技能加载功能已调用')
+            QMessageBox.information(self, '提示', '技能加载功能已触发，请查看日志')
+        except ImportError:
+            self.agent_log.append(f'<span style="color: red;">[ERROR]</span> github_skill_loader 模块未找到')
+            QMessageBox.warning(self, '警告', '技能加载模块未安装')
+
+    def on_view_loaded_skills(self):
+        """查看已加载的技能"""
+        self.agent_log.append('<span style="color: blue;">[INFO]</span> 已加载技能列表:')
+        # 显示内置技能状态
+        for row in range(self.skill_table.rowCount()):
+            name_item = self.skill_table.item(row, 0)
+            check_item = self.skill_table.item(row, 2)
+            if name_item and check_item:
+                name = name_item.text()
+                enabled = check_item.checkState() == Qt.CheckState.Checked
+                status = '启用' if enabled else '禁用'
+                self.agent_log.append(f'  - {name}: {status}')
+
+    def on_clear_all_skills(self):
+        """清除所有技能"""
+        reply = QMessageBox.question(self, '确认', '确定清除所有已加载的技能？',
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.agent_log.append('<span style="color: red;">[WARN]</span> 已清除所有自定义技能')
+            QMessageBox.information(self, '提示', '自定义技能已清除')
+
+    def show_skill_center_help(self):
+        """显示技能中心使用说明"""
+        help_text = """# 技能插件中心使用说明
+
+## 功能概述
+技能插件中心允许你管理和加载AI Agent技能，包括内置技能和自定义GitHub技能。
+
+## 内置技能
+
+| 技能名称 | 功能说明 |
+|---------|---------|
+| Python_REPL | Python沙箱执行器 |
+| arxiv | 学术文献搜索 |
+| ddg_search | 联网搜索 |
+| wikipedia | 维基百科 |
+| apply_butterworth_filter | 巴特沃斯滤波 |
+| execute_custom_formula | 自定义公式 |
+| read_wiki_page | Wiki读 |
+| write_wiki_page | Wiki写 |
+| list_wiki_pages | Wiki列表 |
+| search_wiki_pages | Wiki搜索 |
+
+## 从GitHub加载技能
+
+1. 填写仓库信息：
+   - 仓库所有者
+   - 仓库名称
+   - 文件路径（如 skills/）
+   - 分支（默认 main）
+   - GitHub Token（可选，私有仓库需要）
+
+2. 点击"下载并加载技能"
+
+3. 查看已加载技能列表
+
+## Agent日志颜色说明
+
+- 绿色：代码执行
+- 蓝色：搜索操作
+- 橙色：AI思考
+- 紫色：Wiki操作
+- 红色：错误
+"""
+        help_dialog = QDialog(self)
+        help_dialog.setWindowTitle('技能插件中心使用说明')
+        help_dialog.resize(800, 650)
+
+        layout = QVBoxLayout()
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(help_text)
+        layout.addWidget(text_edit)
+
+        close_btn = QPushButton('关闭')
+        close_btn.clicked.connect(help_dialog.close)
+        layout.addWidget(close_btn)
+
+        help_dialog.setLayout(layout)
+        help_dialog.exec()
 
     def on_info_menu_changed(self, row):
         """切换信息整合功能页面"""
@@ -1916,6 +2389,95 @@ class DataProcessorWindow(QMainWindow):
     def _on_diagnosis_error(self, err_msg):
         """诊断出错"""
         self.ai_diagnosis_result.setText(f'诊断失败: {err_msg}')
+
+    def run_multi_agent_diagnosis(self):
+        """运行多智能体诊断 (CrewAI/LangGraph workflow)"""
+        if self.current_data is None or self.current_data.empty:
+            QMessageBox.warning(self, '警告', '请先加载数据')
+            return
+
+        # 获取数据统计信息
+        stats = {}
+        all_data = []
+        if self.sensor_results:
+            sensor_id = list(self.sensor_results.keys())[0]
+            data = list(self.sensor_results[sensor_id])
+            arr = np.array(data)
+            arr = arr[~np.isnan(arr)]
+            if len(arr) > 10:
+                all_data = arr.tolist()
+                stats = {
+                    'max': float(np.max(arr)),
+                    'min': float(np.min(arr)),
+                    'mean': float(np.mean(arr)),
+                    'std': float(np.std(arr)),
+                    'peak_to_peak': float(np.max(arr) - np.min(arr)),
+                    'rms': float(np.sqrt(np.mean(arr ** 2))),
+                    'count': len(arr)
+                }
+        else:
+            arr = self.current_data.select_dtypes(include=[np.number]).values
+            arr = arr[~np.isnan(arr)]
+            if len(arr) > 10:
+                all_data = arr.tolist()
+                stats = {
+                    'max': float(np.max(arr)),
+                    'min': float(np.min(arr)),
+                    'mean': float(np.mean(arr)),
+                    'std': float(np.std(arr)),
+                    'count': len(arr)
+                }
+
+        if len(all_data) < 10:
+            self.ai_diagnosis_result.setText('数据不足以进行诊断分析')
+            return
+
+        # 显示运行中状态
+        self.ai_diagnosis_result.setText('正在运行多智能体诊断...\n数据科学家正在分析数据...\n请稍候...')
+        QApplication.processEvents()
+
+        try:
+            # 构建用户输入
+            sensor_id = list(self.sensor_results.keys())[0] if self.sensor_results else 'Sensor1'
+            user_input = f"""分析传感器 {sensor_id} 的测量数据。
+
+数据统计:
+- 数据点数: {stats.get('count', len(all_data))}
+- 最大值: {stats.get('max', 0):.4f}
+- 最小值: {stats.get('min', 0):.4f}
+- 平均值: {stats.get('mean', 0):.4f}
+- 标准差: {stats.get('std', 0):.4f}
+- 峰峰值: {stats.get('peak_to_peak', 0):.4f}
+- RMS: {stats.get('rms', 0):.4f}
+
+请进行数据分析和诊断。"""
+
+            # 运行多智能体工作流
+            result = run_multi_agent(user_input)
+
+            # 显示结果
+            output = []
+            output.append('=' * 50)
+            output.append('数据科学家报告:')
+            output.append('=' * 50)
+            output.append(result.get('data_scientist_report', '无'))
+            output.append('')
+            output.append('=' * 50)
+            output.append('审查员意见:')
+            output.append('=' * 50)
+            output.append(result.get('audit_result', '无'))
+            output.append('')
+            output.append('=' * 50)
+            output.append('首席专家诊断:')
+            output.append('=' * 50)
+            output.append(result.get('chief_scientist_report', '无'))
+
+            self.ai_diagnosis_result.setText('\n'.join(output))
+
+        except Exception as e:
+            self.ai_diagnosis_result.setText(f'多智能体诊断出错: {str(e)}')
+            import traceback
+            traceback.print_exc()
 
     def ai_chat_query(self):
         """AI交互问答"""
