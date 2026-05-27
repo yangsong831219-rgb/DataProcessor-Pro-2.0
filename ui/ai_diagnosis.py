@@ -480,13 +480,16 @@ class AiDiagnosisWidget(QWidget):
             self._connect_with_config(self._ai_models_config[name])
 
     def _on_model_config(self) -> None:
-        # 使用主窗口的 AIModelConfigDialog
         main_win = self._find_main()
-        if main_win and hasattr(main_win, 'AIModelConfigDialog'):
+        if not main_win:
+            return
+        try:
             from main import AIModelConfigDialog
             dlg = AIModelConfigDialog(main_win)
             dlg.exec()
             self._load_models_config()
+        except ImportError:
+            self._warn(self, '无法加载模型配置对话框')
 
     def _on_connect_model(self) -> None:
         name = self.ai_model_combo.currentText()
@@ -566,6 +569,24 @@ class AiDiagnosisWidget(QWidget):
 
     def _set_latency(self, text: str) -> None:
         self.ai_latency_label.setText(f"延迟: {text}")
+        # 根据延迟值动态更新颜色
+        if text == '-- ms':
+            color, bg = '#999', '#f5f5f5'
+        else:
+            try:
+                ms = int(text.replace('ms', '').strip())
+                if ms < 300:
+                    color, bg = '#52c41a', '#f6ffed'
+                elif ms < 800:
+                    color, bg = '#faad14', '#fffbe6'
+                else:
+                    color, bg = '#ff4d4f', '#fff1f0'
+            except ValueError:
+                color, bg = '#999', '#f5f5f5'
+        self.ai_latency_label.setStyleSheet(
+            f"color: {color}; font-size: 12px; padding: 6px 14px; "
+            f"background: {bg}; border-radius: 4px;"
+        )
 
     # ═══════════════════════════════════════════════
     # AI 诊断
