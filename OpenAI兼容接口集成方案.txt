@@ -1,0 +1,131 @@
+================================================================================
+                OpenAI 兼容接口在线大模型集成方案
+                        (2026-05-22 新增)
+================================================================================
+
+一、核心优势
+--------------------------------------------------------------------------------
+1. 零环境依赖：不需要本地 GPU/DLL，客户端体积锐减
+2. 高可用性：低配置电脑也能流畅运行
+3. 零成本切换：换供应商只需改 api_key 和 base_url 两行配置
+4. 丝滑流式：缓冲发射机制解决 PyQt UI 卡顿问题
+
+
+二、新增文件
+--------------------------------------------------------------------------------
+py/online_llm_thread.py - OnlineLlamaGenerateThread 类
+
+信号接口（与 LlamaGenerateThread 完全兼容）:
+    token_received = pyqtSignal(str)  # 实时 token
+    finished = pyqtSignal(str)         # 完成时完整响应
+    error = pyqtSignal(str)            # 错误信息
+
+
+三、支持的供应商
+--------------------------------------------------------------------------------
+| 平台 | 模型名 | base_url | 特点 |
+|------|--------|----------|------|
+| DeepSeek | deepseek-chat | https://api.deepseek.com/v1 | 极度推荐，性价比最高 |
+| 阿里百炼 | qwen-turbo | https://dashscope.aliyuncs.com/compatible-mode/v1 | 官方服务，新人送额度 |
+| 硅基流动 | Qwen/Qwen2.5-7B-Instruct | https://api.siliconflow.cn/v1 | 基础模型免费 |
+
+
+四、使用示例
+--------------------------------------------------------------------------------
+from py.online_llm_thread import OnlineLlamaGenerateThread
+
+# DeepSeek 配置
+API_KEY = "sk-xxxxxxxxxxxxxxxxxxx"
+BASE_URL = "https://api.deepseek.com/v1"
+MODEL_NAME = "deepseek-chat"
+
+# 在 main.py 中调用
+thread = OnlineLlamaGenerateThread(
+    prompt=用户输入,
+    api_key=API_KEY,
+    base_url=BASE_URL,
+    model_name=MODEL_NAME,
+    system_prompt="你是一个专业的设备与系统 AI 诊断专家",
+    temperature=0.7,
+    max_tokens=2048
+)
+
+thread.token_received.connect(self._on_token)
+thread.finished.connect(self._on_finished)
+thread.error.connect(self._on_error)
+thread.start()
+
+
+五、核心实现代码
+--------------------------------------------------------------------------------
+from PyQt6.QtCore import QThread, pyqtSignal
+from openai import OpenAI
+
+class OnlineLlamaGenerateThread(QThread):
+    token_received = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, prompt, api_key, base_url, model_name,
+                 system_prompt=None, temperature=0.7, max_tokens=2048):
+        super().__init__()
+        self.prompt = prompt
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model_name = model_name
+        self.system_prompt = system_prompt or "你是一个专业的AI助手"
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+
+    def run(self):
+        try:
+            client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": self.prompt}
+                ],
+                stream=True,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens
+            )
+
+            full_response = ""
+            buffer = ""
+
+            for chunk in response:
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    token = delta.content
+                    full_response += token
+                    buffer += token
+
+                    # 缓冲发射，减少 PyQt 信号开销
+                    if len(buffer) >= 3 or any(p in buffer for p in ['\n', '。', '！', '？', '，']):
+                        self.token_received.emit(buffer)
+                        buffer = ""
+
+            if buffer:
+                self.token_received.emit(buffer)
+
+            if full_response:
+                self.finished.emit(full_response)
+            else:
+                self.error.emit("模型未返回有效响应")
+
+        except Exception as e:
+            self.error.emit(f"请求失败: {str(e)}")
+
+
+六、与本地 Ollama 的对比
+--------------------------------------------------------------------------------
+| 维度 | 本地 Ollama | 在线 OpenAI 兼容 |
+|------|-------------|------------------|
+| 硬件要求 | 需要 GPU 或高性能 CPU | 无要求 |
+| 模型大小 | 2-4GB GGUF 文件 | 无需本地存储 |
+| 响应速度 | 本地推理，较慢 | 依赖网络，极快 |
+| 成本 | 一次性模型文件费用 | 按 token 计费 |
+| 稳定性 | 依赖本地环境 | 依赖网络质量 |
+| 适用场景 | 隐私要求高、无网络 | 通用场景、高并发 |

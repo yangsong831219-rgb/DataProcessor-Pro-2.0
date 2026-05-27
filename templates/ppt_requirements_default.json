@@ -1,0 +1,100 @@
+{
+  "report_type": "ppt",
+  "version": "1.0",
+  "slides": [
+    {
+      "title": "封面",
+      "type": "cover",
+      "content_guidelines": [
+        "报告标题",
+        "副标题或项目名称",
+        "作者/团队",
+        "日期"
+      ]
+    },
+    {
+      "title": "目录",
+      "type": "toc",
+      "content_guidelines": [
+        "列出主要章节",
+        "3-5个主要部分",
+        "简洁明了"
+      ]
+    },
+    {
+      "title": "执行摘要",
+      "type": "content",
+      "content_guidelines": [
+        "核心发现总结",
+        "关键数据亮点",
+        "主要结论（3-5条）"
+      ],
+      "bullets": 5
+    },
+    {
+      "title": "数据概览",
+      "type": "content",
+      "content_guidelines": [
+        "数据来源说明",
+        "数据规模（行数、列数）",
+        "主要变量列表"
+      ],
+      "bullets": 4
+    },
+    {
+      "title": "统计摘要",
+      "type": "content_with_chart",
+      "content_guidelines": [
+        "关键统计指标表格或图表",
+        "最大值、最小值、均值、标准差",
+        "数据分布特征"
+      ],
+      "bullets": 4,
+      "chart_type": "table or bar"
+    },
+    {
+      "title": "分析结果",
+      "type": "content_with_chart",
+      "content_guidelines": [
+        "主要分析发现",
+        "数据趋势和模式",
+        "异常情况说明"
+      ],
+      "bullets": 5,
+      "chart_type": "line or scatter"
+    },
+    {
+      "title": "结论与建议",
+      "type": "content",
+      "content_guidelines": [
+        "主要结论（3-5条）",
+        "针对性建议",
+        "后续行动建议"
+      ],
+      "bullets": 5
+    },
+    {
+      "title": "谢谢",
+      "type": "ending",
+      "content_guidelines": [
+        "联系方式（可选）",
+        "Q&A环节提示"
+      ]
+    }
+  ],
+  "formatting_rules": {
+    "language": "中文",
+    "style": "简洁、视觉化、重点突出",
+    "title_format": "简短有力的标题",
+    "content_format": "每页一个主题，关键词突出",
+    "bullets": "使用项目符号，每页不超过6个要点",
+    "charts": "图表配合说明，数据清晰",
+    "design": "避免大段文字，使用图标和视觉元素"
+  },
+  "content_generation_prompts": {
+    "system_role": "你是一个专业的PPT报告生成助手，擅长制作简洁、视觉化的演示文稿。",
+    "output_format": "列出每页幻灯片的标题和要点内容，使用清晰的层级结构。每页幻灯片内容要简洁，每页只包含一个核心主题。",
+    "tone": "简洁、专业、便于演示",
+    "avoid": "避免长段落描述，每页要点控制在6个以内，避免使用过多专业术语。"
+  }
+}

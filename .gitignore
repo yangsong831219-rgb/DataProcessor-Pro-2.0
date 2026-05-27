@@ -1,0 +1,26 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# API keys and sensitive config
+ai_models_config.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# CodeGraph
+.codegraph/
+
+# OS files
+Thumbs.db
+.DS_Store

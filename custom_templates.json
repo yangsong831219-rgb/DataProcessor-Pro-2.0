@@ -1,0 +1,96 @@
+[
+  {
+    "id": "enlight_custom",
+    "name": "ENLIGHT (光纤传感)公式版",
+    "file_format": "enlight",
+    "delimiter": "\t",
+    "skip_rows": 122,
+    "columns": [
+      {
+        "name": "时间",
+        "comment": "时间戳",
+        "data_type": "time"
+      },
+      {
+        "name": "A1G1",
+        "comment": "A1G1",
+        "data_type": "numeric"
+      },
+      {
+        "name": "A1G2",
+        "comment": "A1G2",
+        "data_type": "numeric"
+      },
+      {
+        "name": "A2G1",
+        "comment": "A2G1",
+        "data_type": "numeric"
+      },
+      {
+        "name": "A2G2",
+        "comment": "A2G2",
+        "data_type": "numeric"
+      },
+      {
+        "name": "B1G1",
+        "comment": "B1G1",
+        "data_type": "numeric"
+      },
+      {
+        "name": "B1G2",
+        "comment": "B1G2",
+        "data_type": "numeric"
+      },
+      {
+        "name": "B2G1",
+        "comment": "B2G1",
+        "data_type": "numeric"
+      },
+      {
+        "name": "B2G2",
+        "comment": "B2G2",
+        "data_type": "numeric"
+      },
+      {
+        "name": "W1",
+        "comment": "FBG_A1",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "W2",
+        "comment": "FBG_A2",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "W3",
+        "comment": "FBG_B1",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "W4",
+        "comment": "FBG_D1",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "W5",
+        "comment": "FBG_F1",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "W6",
+        "comment": "FBG_F2",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "W7",
+        "comment": "FBG_G1",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "W8",
+        "comment": "FBG_G2",
+        "data_type": "wavelength"
+      }
+    ]
+  }
+]

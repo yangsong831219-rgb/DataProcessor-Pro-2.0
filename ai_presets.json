@@ -1,0 +1,21 @@
+{
+  "DeepSeek": {
+    "base_url": "https://api.deepseek.com/v1",
+    "model_name": "deepseek-chat",
+    "builtin": true
+  },
+  "阿里百炼": {
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model_name": "qwen-turbo",
+    "builtin": true
+  },
+  "硅基流动": {
+    "base_url": "https://api.siliconflow.cn/v1",
+    "model_name": "Qwen/Qwen2.5-7B-Instruct",
+    "builtin": true
+  },
+  "MiniMax-M2.7": {
+    "base_url": "https://api.minimaxi.com/v1",
+    "model_name": "MiniMax-M2.7"
+  }
+}

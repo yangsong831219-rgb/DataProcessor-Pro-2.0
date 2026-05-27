@@ -1,0 +1,96 @@
+[
+  {
+    "id": "custom_ENLIGHT（光纤传感）公式版",
+    "name": "ENLIGHT（光纤传感）公式版",
+    "file_format": "fiber_custom",
+    "delimiter": "\t",
+    "skip_rows": 123,
+    "columns": [
+      {
+        "name": "Timestamp",
+        "comment": "时间戳",
+        "data_type": "time"
+      },
+      {
+        "name": "A1G1",
+        "comment": "A1G1",
+        "data_type": "numeric"
+      },
+      {
+        "name": "A1G2",
+        "comment": "A1G2",
+        "data_type": "numeric"
+      },
+      {
+        "name": "A2G1",
+        "comment": "A2G1",
+        "data_type": "numeric"
+      },
+      {
+        "name": "A2G2",
+        "comment": "A2G2",
+        "data_type": "numeric"
+      },
+      {
+        "name": "B1G1",
+        "comment": "B1G1",
+        "data_type": "numeric"
+      },
+      {
+        "name": "B1G2",
+        "comment": "B1G2",
+        "data_type": "numeric"
+      },
+      {
+        "name": "B2G1",
+        "comment": "B2G1",
+        "data_type": "numeric"
+      },
+      {
+        "name": "B2G2",
+        "comment": "B2G2",
+        "data_type": "numeric"
+      },
+      {
+        "name": "FBG_A1",
+        "comment": "FBG FBG_A1",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "FBG_A2",
+        "comment": "FBG FBG_A2",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "FBG_B1",
+        "comment": "FBG FBG_B1",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "FBG_D1",
+        "comment": "FBG FBG_D1",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "FBG_F1",
+        "comment": "FBG FBG_F1",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "FBG_F2",
+        "comment": "FBG FBG_F2",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "FBG_G1",
+        "comment": "FBG FBG_G1",
+        "data_type": "wavelength"
+      },
+      {
+        "name": "FBG_G2",
+        "comment": "FBG FBG_G2",
+        "data_type": "wavelength"
+      }
+    ]
+  }
+]

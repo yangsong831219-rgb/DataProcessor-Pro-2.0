@@ -1,0 +1,575 @@
+================================================================================
+        DataProcessor Pro 2.0 功能说明文档
+================================================================================
+版本: 2.0 (恢复版本)
+生成时间: 2026-05-25
+项目路径: D:\桌面文件\软件项目_qt6
+
+================================================================================
+                        一、软件整体架构
+================================================================================
+
+技术栈: PyQt6 + Pandas + NumPy + SciPy + Matplotlib + python-docx + python-pptx + LangChain
+
+主窗口结构 (QMainWindow):
+├── 菜单栏 (Menu Bar)
+│   ├── 全局配置: 保存配置(Ctrl+Shift+S) / 读取配置 / 重置配置
+│   ├── 文件: 打开文件(Ctrl+O) / 保存数据(Ctrl+S) / 导出报告 / 退出(Ctrl+Q)
+├── 主工作区 (QStackedWidget + 左侧导航)
+│   ├── 数据文件 (create_data_tab)
+│   ├── 数据清洗 (create_cleaning_tab)
+│   ├── 光纤公式配置 (create_sensor_tab)
+│   ├── 数据分析 (create_analysis_tab)
+│   └── 信息整合 (create_report_tab) - 左侧菜单 + 右侧内容面板
+│       ├── Word模板 (create_word_template_page)
+│       ├── PPT模板 (create_ppt_template_page)
+│       ├── 项目内容 (create_project_content_page)
+│       ├── Word报告生成 (create_word_report_page)
+│       ├── PPT报告生成 (create_ppt_report_page)
+│       ├── AI诊断 (create_ai_diagnosis_page)
+│       ├── 项目资料管理 (create_project_manage_page)
+│       ├── 知识库管理 (create_wiki_page)
+│       └── 技能插件中心 (create_skill_center_page)
+└── 状态栏 (QStatusBar)
+
+================================================================================
+                        二、主程序 main.py
+================================================================================
+
+文件位置: D:\桌面文件\软件项目_qt6\main.py
+行数: 约4000+行
+
+2.1 主要类
+-------------------------------------------------------------------------------
+
+DataTemplate (数据模板类)
+    位置: 第43行
+    功能: 定义数据文件格式模板
+    属性: id, name, file_format, delimiter, skip_rows, columns
+    方法: to_dict()
+    用途: 解析不同格式的传感器数据文件
+
+CleaningRule (清洗规则类)
+    位置: 第72行
+    功能: 定义数据清洗规则
+    属性: name, rule_type, enabled, threshold, fill_method, fill_value
+    规则类型: 'adjacent_diff', 'nan', 'range', 'negative', 'zero'
+    填充方式: 'linear', 'mean', 'forward', 'backward', 'custom'
+
+FBG (光纤布拉格光栅类)
+    位置: 第163行
+    功能: 定义FBG传感器参数
+    属性: id, channel, wavelength_min, wavelength_max
+    方法: is_valid(wavelength)
+
+Sensor (传感器类)
+    位置: 第180行
+    功能: 定义传感器及物理量计算公式
+    属性: id, sensor_type, formula, constants, active
+    类型参数(TYPE_PARAMS): strain/temperature/displacement/inclination/pressure
+    方法: get_unit(), get_name()
+
+SensorSystem (传感器系统类)
+    位置: 第225行
+    功能: 管理FBG和传感器，执行物理量计算
+    方法:
+        - __init__(): 初始化
+        - set_reference_row(row_index): 设置参考行
+        - add_fbg(fbg): 添加FBG
+        - add_sensor(sensor): 添加传感器
+        - calculate(df, fbg_columns): 执行计算
+        - _evaluate_sensor_formula(): 公式引擎
+
+DataProcessorWindow (主窗口类)
+    位置: 第493行
+    功能: PyQt6主窗口，包含所有UI和业务逻辑
+
+2.2 UI页面创建方法
+-------------------------------------------------------------------------------
+
+init_ui()
+    位置: 第541行
+    功能: 初始化主窗口UI，创建所有标签页和导航
+    调用: create_data_tab, create_cleaning_tab, create_sensor_tab,
+          create_analysis_tab, create_report_tab
+
+create_data_tab() - 数据文件页
+    位置: 第629行
+    功能: 导入/导出CSV/Excel/TXT，显示数据表格
+    组件:
+        - 文件导入按钮 (导入CSV/Excel/TXT)
+        - 数据预览表格 (QTableWidget)
+        - 清除数据按钮
+
+create_cleaning_tab() - 数据清洗页
+    位置: 第652行
+    功能: 异常值检测、缺失值填充、可视化
+    组件:
+        - 清洗规则配置
+        - 滤波参数设置 (滤波器类型/截止频率/阶数)
+        - 数据可视化图表 (matplotlib)
+        - 开始滤波/基线校准/去除异常值按钮
+
+create_sensor_tab() - 光纤公式配置页
+    位置: 第729行
+    功能: FBG配置、传感器管理、物理量计算
+    组件:
+        - FBG表格管理 (添加/编辑/删除)
+        - 传感器表格管理 (添加/编辑/删除/复制)
+        - 计算所有传感器按钮
+        - 导出CSV/TXT/XLSX按钮
+    对话框:
+        - FBGEditDialog (FBG编辑)
+        - SensorEditDialog (传感器编辑，含系数管理)
+
+create_analysis_tab() - 数据分析页
+    位置: 第1099行
+    功能: 时域/频域分析、统计指标、图表展示
+    组件:
+        - 数据源选择 (原始数据/物理量)
+        - 数据范围选择 (序号/时间范围)
+        - Matplotlib图表 (带工具栏)
+        - 统计信息面板 (最大值/最小值/均值/标准差/峰峰值/RMS)
+        - 曲线对比功能
+        - 信号处理 (FFT/滤波)
+        - 图表导出 (PNG)
+
+create_report_tab() - 信息整合页
+    位置: 第1255行
+    功能: 左侧菜单 + 右侧QStackedWidget内容面板
+    子页面: Word模板/PPT模板/项目内容/Word报告生成/PPT报告生成/
+            AI诊断/项目资料管理/知识库管理/技能插件中心
+
+create_word_template_page() - Word模板页
+    位置: 第1322行
+    功能: 选择.docx模板文件，预览模板内容
+    组件:
+        - 模板路径显示
+        - 选择/清除模板按钮
+        - AI分析模板特征
+
+create_word_report_page() - Word报告生成页
+    位置: 第1490行
+    功能: 配置报告标题、需求文件、模板、项目资料，生成Word报告
+    注意: 已修复，使用WordBuilder，generate_word_report未修改
+
+create_ppt_report_page() - PPT报告生成页
+    位置: 第1547行
+    功能: 配置幻灯片标题、内容、模板，生成PPT报告
+
+create_ai_diagnosis_page() - AI诊断页
+    位置: 第1614行
+    功能: AI模型选择、需求配置、AI诊断、多智能体诊断
+    组件:
+        - 需求文件列表
+        - 本地模型选择 (GGUF文件)
+        - 诊断结果文本区
+        - 运行AI诊断按钮 (蓝色)
+        - 运行多智能体诊断按钮 (绿色)
+        - AI交互问答区
+
+create_project_manage_page() - 项目资料管理页
+    位置: 第1733行
+    功能: 管理已导入的项目资料
+    组件:
+        - 资料统计 (文件数/总大小)
+        - 文件列表
+        - 刷新/清空按钮
+
+create_wiki_page() - 知识库管理页
+    位置: 第1820行
+    功能: Wiki页面CRUD、搜索、上传文件
+    组件:
+        - 左侧: 页面列表、新建/删除按钮、搜索框、上传按钮
+        - 右侧: 标题输入、内容编辑器、搜索结果区
+        - 使用说明按钮
+    后端: WikiFileSystem
+
+create_skill_center_page() - 技能插件中心页
+    位置: 第1987行
+    功能: 内置技能管理、GitHub技能加载、Agent日志
+    组件:
+        - 内置技能表格 (技能名称/功能说明/启用复选框)
+        - GitHub加载区 (owner/repo/path/branch/token)
+        - Agent思考日志 (彩色编码: 绿/蓝/橙/紫/红)
+        - 使用说明按钮
+
+2.3 AI相关方法
+-------------------------------------------------------------------------------
+
+run_ai_diagnosis()
+    位置: 第2274行
+    功能: 基于Ollama的AI诊断分析
+    流程: 获取数据统计 → 读取需求文件 → 构建提示词 → 流式显示结果
+
+run_multi_agent_diagnosis()
+    位置: 第2393行 (新增)
+    功能: 运行CrewAI/LangGraph多智能体工作流
+    流程: 获取数据 → 调用run_multi_agent() → 显示三阶段报告
+
+ai_chat_query()
+    位置: 第2523行
+    功能: AI交互问答
+
+select_local_model() / unload_local_model()
+    位置: 第2601行 / 第2621行
+    功能: 本地GGUF模型管理
+
+check_ollama_status() / _on_ollama_status_result()
+    位置: 第2672行 / 第2680行
+    功能: Ollama服务状态检测
+
+generate_ai_diagnosis()
+    位置: 第2760行
+    功能: AI诊断生成（使用Ollama）
+
+custom_ai_query()
+    位置: 第2864行
+    功能: 自定义AI查询
+
+2.4 数据处理方法
+-------------------------------------------------------------------------------
+
+parse_file(file_path, template)
+    位置: 第418行
+    功能: 统一文件解析入口
+    支持格式: ENLIGHT/CSV/TXT/XLSX
+
+clean_data(df, rules)
+    位置: 第154行
+    功能: 完整清洗流水线 (detect_anomalies + fill_missing)
+
+detect_anomalies(df, rules)
+    位置: 第84行
+    功能: 异常值检测引擎
+
+fill_missing(df, rules)
+    位置: 第125行
+    功能: 缺失值填充引擎
+
+time_domain_analysis(data)
+    位置: 第348行
+    功能: 时域分析 (均值/最大值/最小值/RMS/标准差)
+
+frequency_domain_analysis(data)
+    位置: 第360行
+    功能: 频域分析 (FFT频谱计算)
+
+apply_filter(data, filter_type, cutoff_hz, sampling_rate)
+    位置: 第374行
+    功能: 巴特沃斯数字滤波
+
+calculate_statistics(data)
+    位置: 第3037行
+    功能: 计算统计指标
+
+compare_curves()
+    位置: 第3204行
+    功能: 曲线对比
+
+================================================================================
+                        三、后端模块 py/
+================================================================================
+
+文件位置: D:\桌面文件\软件项目_qt6\py\
+
+3.1 analyzer.py - 数据分析模块
+-------------------------------------------------------------------------------
+函数: apply_filter(data, filter_type, cutoff_hz, sampling_rate)
+    功能: 应用巴特沃斯滤波器进行物理降噪
+    参数: data列表, filter_type(lowpass/highpass/bandpass/bandstop),
+          cutoff_hz截止频率, sampling_rate采样率
+
+3.2 cleaner.py - 数据清洗模块
+-------------------------------------------------------------------------------
+函数: detect_anomalies(df, rules), fill_missing(df, rules), clean_data(df, rules)
+    功能: 数据清洗流水线，检测异常值和填充缺失值
+
+3.3 formula.py - 公式计算模块
+-------------------------------------------------------------------------------
+函数: calculate(formula_str, columns, params)
+    功能: 执行自定义公式列计算
+    支持: 多列运算、常量参数
+
+3.4 processor.py - 数据处理模块
+-------------------------------------------------------------------------------
+函数: (基础数据处理工具)
+
+3.5 template.py - 数据模板模块
+-------------------------------------------------------------------------------
+函数: (数据模板管理工具)
+
+3.6 wiki_system.py - 知识库系统
+-------------------------------------------------------------------------------
+类: WikiFileSystem
+
+主要方法:
+    - __init__(base_dir=None): 初始化wiki_vault目录
+    - read_wiki_map() → str: 读取索引表JSON
+    - update_wiki_map(page_name, path, tags, summary) → str: 更新索引
+    - read_wiki_page(page_name) → str: 读取页面内容
+    - write_wiki_page(page_name, content, author) → str: 写入页面
+    - delete_wiki_page(page_name) → str: 删除页面
+    - upload_file_to_wiki(source_path, target_name) → str: 上传文件
+    - delete_file_from_wiki(page_name) → str: 删除文件
+    - read_wiki_file_binary(page_name) → tuple: 读取二进制文件
+    - list_pages() → str: 列出所有页面
+    - search_pages(keyword) → str: 搜索页面
+
+存储结构:
+    wiki_vault/
+    ├── pages/           # Markdown文件存储
+    └── wiki_map.json    # 索引表
+
+3.7 ollama_client.py - Ollama本地模型客户端
+-------------------------------------------------------------------------------
+类: OllamaClient, OllamaGenerateThread, OllamaStatusThread
+
+OllamaClient主要方法:
+    - is_available() → bool: 检查服务可用性
+    - is_model_loaded(model) → bool: 检查模型是否加载
+    - get_model_load_time(model) → float: 估算加载时间
+    - start_service() / stop_service() → bool: 启停服务
+    - unload_model() → bool: 卸载模型
+    - generate(prompt, keep_alive, timeout) → str: 同步生成
+    - generate_diagnosis(sensor_id, stats, all_data) → str: 诊断摘要
+    - generate_report_summary(data_info, stats) → str: 报告摘要
+
+OllamaGenerateThread (QThread):
+    信号: token_received(str), finished(str), error(str)
+    功能: 流式API调用，批处理token发射
+
+OllamaStatusThread (QThread):
+    信号: status_result(bool), models_list(list), model_loaded(str, bool)
+    功能: 后台检测Ollama服务状态
+
+3.8 local_llm_manager.py - 本地LLM管理器
+-------------------------------------------------------------------------------
+类: LocalLLMManager (单例模式)
+
+主要方法:
+    - load_model(model_path, n_ctx, n_gpu_layers) → bool
+    - unload_model() → bool
+    - is_model_loaded() → bool
+    - get_current_model_path() → str
+    - generate_stream(prompt, max_tokens, temp) → generator
+    - generate(prompt, max_tokens, temp) → str
+
+全局单例: get_global_llm_manager()
+
+检查: is_llama_cpp_available() → bool
+
+3.9 llama_generate_thread.py - 本地LLM推理线程
+-------------------------------------------------------------------------------
+类: LlamaGenerateThread (QThread)
+    功能: 基于LocalLLMManager的流式推理线程
+    信号: token_received, finished, error
+
+3.10 multi_agent.py - 多智能体审查系统 (CrewAI/LangGraph)
+-------------------------------------------------------------------------------
+类/函数:
+
+MultiAgentState (TypedDict)
+    状态字段: messages, current_csv_path, execution_logs,
+              audit_result, data_scientist_report, chief_scientist_report,
+              rejection_count, task_status
+
+get_llm(model_name) → ChatOpenAI
+    功能: 获取LLM实例，支持DeepSeek API
+
+Node函数:
+    - data_scientist_node(state) → 数据科学家节点
+    - auditor_node(state) → 审查员节点
+    - chief_scientist_node(state) → 首席专家节点
+
+create_multi_agent_graph() → workflow.compile()
+    功能: 构建LangGraph工作流
+
+run_multi_agent(user_input, csv_path) → dict
+    返回: data_scientist_report, audit_result, chief_scientist_report, final_report
+
+工具 (@tool):
+    - apply_butterworth_filter(file_path, cutoff_hz, order, filter_type)
+    - execute_custom_formula(file_path, formula_str, params)
+    - read_wiki_page(page_name)
+    - write_wiki_page(page_name, content)
+    - list_wiki_pages()
+    - search_wiki_pages(keyword)
+
+Agent提示词:
+    - DATA_SCIENTIST_PROMPT: 数据科学家角色
+    - DATA_AUDITOR_PROMPT: 审查员角色
+    - CHIEF_SCIENTIST_PROMPT: 首席专家角色
+
+3.11 github_skill_loader.py - GitHub技能加载器
+-------------------------------------------------------------------------------
+类: GithubSkillLoader
+    功能: 从GitHub仓库加载AI技能插件
+
+3.12 agent_skill_hub.py - Agent技能中心
+-------------------------------------------------------------------------------
+类: AgentSkillHub
+    功能: 管理AI Agent技能插件
+
+3.13 agent_graph.py / agent_worker.py / agent_skill_hub.py
+-------------------------------------------------------------------------------
+Agent系统核心组件
+
+3.14 online_llm_thread.py - 在线LLM推理线程
+-------------------------------------------------------------------------------
+类: OnlineLLMThread (QThread)
+    功能: 基于OpenAI兼容API的流式推理
+    信号: token_received, finished, error
+
+================================================================================
+                        四、报告生成模块 py/report_builder/
+================================================================================
+
+文件位置: D:\桌面文件\软件项目_qt6\py\report_builder\
+
+注意: 此目录在恢复版本中未被修改，保持原状
+
+模块:
+    models.py        - 数据模型 (ReportSpec, Section, ContentBlock, FileItem, ReportConfig)
+    word_builder.py  - Word文档构建器
+    ppt_builder.py   - PPT构建器
+    template_engine.py - 模板引擎
+    flow_controller.py - 报告流程控制器
+
+详细说明见 "功能说明.txt" 和 "软件功能说明.txt"
+
+================================================================================
+                        五、UI设计规范
+================================================================================
+
+颜色方案:
+- 主色调: #1890ff (蓝色)
+- 成功色: #52c41a (绿色)
+- 警告色: #faad14 (橙色)
+- 危险色: #ff4d4f (红色)
+- 背景色: #f5f5f5 (浅灰)
+- 文字色: #333 (深灰)
+
+按钮样式:
+- 主要按钮: background-color: #1890ff; color: white
+- 成功按钮: background-color: #52c41a; color: white
+- 危险按钮: background-color: #ff4d4f; color: white
+- 警告按钮: background-color: #faad14; color: white
+
+字体:
+- 标题: 16px bold
+- 小组标题: 14px bold
+- 正文: 12px
+- 小字: 11px
+
+间距:
+- 页面边距: 10px
+- 组件间距: 10px
+- 内边距: 8px/12px
+
+================================================================================
+                        六、数据处理流水线
+================================================================================
+
+原始数据文件
+    │
+    ▼
+[1] parse_file - 按模板解析 → DataFrame
+    │
+    ▼
+[2] clean_data
+    ├── detect_anomalies - 标记异常列
+    └── fill_missing - 填充缺失值
+    │
+    ▼
+[3] SensorSystem.calculate
+    ├── FBG波长 → 差值(W-W0)
+    └── 公式计算 → 物理量
+    │
+    ▼
+[4] 数据分析
+    ├── 时域分析 (统计指标)
+    ├── 频域分析 (FFT频谱)
+    ├── 数字滤波 (低通/高通/带通)
+    └── 曲线对比
+    │
+    ▼
+[5] AI诊断 / 报告生成
+    ├── AI分析数据异常原因
+    ├── AI交互问答
+    ├── Word报告 (模板 + 数据 + 图表)
+    ├── PPT报告 (模板 + 数据 + 图表)
+    └── 多智能体诊断 (CrewAI/LangGraph)
+
+================================================================================
+                        七、快捷键
+================================================================================
+
+Ctrl+O        - 打开文件
+Ctrl+S        - 保存数据
+Ctrl+Shift+S  - 保存全局配置
+Ctrl+Q        - 退出程序
+
+================================================================================
+                        八、配置文件
+================================================================================
+
+ai_models_config.json - AI模型配置 (API Key等敏感信息)
+ai_presets.json       - 预设模型模板
+recent_files.json     - 最近打开的文件
+
+================================================================================
+                        九、目录结构
+================================================================================
+
+D:\桌面文件\软件项目_qt6\
+├── main.py                          # 主程序入口
+├── create_shortcut.py               # 快捷方式创建脚本
+├── requirements.txt                  # 依赖列表
+├── py/
+│   ├── __init__.py
+│   ├── analyzer.py                  # 数据分析
+│   ├── cleaner.py                   # 数据清洗
+│   ├── formula.py                   # 公式计算
+│   ├── processor.py                 # 数据处理
+│   ├── template.py                  # 模板管理
+│   ├── wiki_system.py               # 知识库系统
+│   ├── ollama_client.py             # Ollama客户端
+│   ├── local_llm_manager.py         # 本地LLM管理
+│   ├── llama_generate_thread.py     # LLM推理线程
+│   ├── online_llm_thread.py          # 在线LLM线程
+│   ├── multi_agent.py               # 多智能体系统
+│   ├── github_skill_loader.py       # GitHub技能加载
+│   ├── agent_skill_hub.py           # Agent技能中心
+│   ├── agent_graph.py               # Agent图
+│   ├── agent_worker.py              # Agent工作器
+│   ├── report_builder/              # 报告生成模块
+│   │   ├── __init__.py
+│   │   ├── models.py
+│   │   ├── word_builder.py
+│   │   ├── ppt_builder.py
+│   │   ├── template_engine.py
+│   │   └── flow_controller.py
+│   └── ...
+├── wiki_vault/                      # 知识库存储目录
+│   ├── pages/
+│   └── wiki_map.json
+├── models/                          # GGUF模型目录
+├── templates/                       # 模板目录
+├── plugins/                         # 插件目录
+└── venv/                            # Python虚拟环境
+
+================================================================================
+                        十、注意事项
+================================================================================
+
+1. AI诊断功能需要配置Ollama或DeepSeek API
+2. GitHub技能加载可能需要代理
+3. 知识库基于本地文件系统，无需额外数据库
+4. 项目资料存储在用户指定目录
+5. py/report_builder/ 目录已修复，请勿随意修改
+6. generate_word_report函数已修复，使用WordBuilder
+
+================================================================================
+                        文档结束
+================================================================================
