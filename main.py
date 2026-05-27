@@ -1216,9 +1216,6 @@ class DataProcessorWindow(QMainWindow):
 
         self.report_tab.setLayout(main_layout)
 
-        # 检查Ollama状态
-        QTimer.singleShot(500, self.check_ollama_status)
-
     def create_word_template_page(self):
         """Word模板配置页面"""
         page = QWidget()
