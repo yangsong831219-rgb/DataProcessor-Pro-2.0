@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pandas as pd
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QPushButton, QLabel, QComboBox, QSpinBox, QListWidget, QListWidgetItem,
@@ -217,7 +218,6 @@ class AnalysisTabWidget(QWidget):
 
     @staticmethod
     def _format_time(t) -> str:
-        import pandas as pd
         if hasattr(t, 'strftime'):
             return t.strftime('%H:%M:%S')
         elif hasattr(t, 'item'):
@@ -293,12 +293,12 @@ class AnalysisTabWidget(QWidget):
 
             ref_value = None
             for v in col_data:
-                if not ((isinstance(v, float) and v != v) or v is None):
-                    ref_value = v
+                if pd.notna(v):
+                    ref_value = float(v)
                     break
 
             if ref_value is not None:
-                plot_data = [v - ref_value if not ((isinstance(v, float) and v != v) or v is None) else None
+                plot_data = [float(v) - ref_value if pd.notna(v) else None
                             for v in col_data]
             else:
                 plot_data = list(col_data)
