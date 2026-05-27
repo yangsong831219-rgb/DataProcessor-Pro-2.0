@@ -185,9 +185,9 @@ class AiDiagnosisWidget(QWidget):
 
     def _build_right_panel(self) -> QWidget:
         panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        self._right_panel_layout = QVBoxLayout(panel)
+        self._right_panel_layout.setContentsMargins(0, 0, 0, 0)
+        self._right_panel_layout.setSpacing(0)
 
         self.ai_terminal_panel = QFrame()
         self.ai_terminal_panel.setStyleSheet(
@@ -201,7 +201,7 @@ class AiDiagnosisWidget(QWidget):
         t_layout.addWidget(self._build_content_splitter(), stretch=1)
         t_layout.addWidget(self._build_bottom_bar())
 
-        layout.addWidget(self.ai_terminal_panel)
+        self._right_panel_layout.addWidget(self.ai_terminal_panel)
         return panel
 
     def _build_title_bar(self) -> QWidget:
@@ -229,16 +229,6 @@ class AiDiagnosisWidget(QWidget):
         )
         self.ai_zen_enter_btn.clicked.connect(self._enter_zen_mode)
         layout.addWidget(self.ai_zen_enter_btn)
-
-        self.ai_zen_exit_btn = QPushButton("↩️ 返回视图")
-        self.ai_zen_exit_btn.setStyleSheet(
-            "QPushButton { background: transparent; color: #1890ff; border: 1px solid #1890ff; "
-            "border-radius: 6px; padding: 6px 14px; font-size: 12px; }"
-            "QPushButton:hover { background: #e6f4ff; }"
-        )
-        self.ai_zen_exit_btn.clicked.connect(self._exit_zen_mode)
-        self.ai_zen_exit_btn.setVisible(False)
-        layout.addWidget(self.ai_zen_exit_btn)
         return self.ai_title_bar
 
     def _build_content_splitter(self) -> QSplitter:
@@ -797,8 +787,8 @@ class AiDiagnosisWidget(QWidget):
         if not main_win:
             return
 
-        self._zen_original_parent = self.ai_terminal_panel.parent()
-        self._zen_original_geometry = self.ai_terminal_panel.geometry()
+        # 从右侧面板布局中取出终端面板（不删除，只是移除）
+        self._right_panel_layout.removeWidget(self.ai_terminal_panel)
 
         # 创建全屏浮层
         self._zen_overlay = QWidget(main_win)
@@ -813,7 +803,9 @@ class AiDiagnosisWidget(QWidget):
         bar = QWidget()
         bar_layout = QHBoxLayout(bar)
         bar_layout.setContentsMargins(0, 0, 0, 0)
-        bar_layout.addWidget(QLabel("🔍 沉浸全屏诊断"))
+        title_label = QLabel("🔍 沉浸全屏诊断")
+        title_label.setStyleSheet("color: white; font-size: 16px; font-weight: bold; background: transparent;")
+        bar_layout.addWidget(title_label)
         bar_layout.addStretch()
         exit_btn = QPushButton("↩️ 退出全屏")
         exit_btn.setStyleSheet(
@@ -827,28 +819,27 @@ class AiDiagnosisWidget(QWidget):
 
         # 移动终端面板到浮层
         self.ai_terminal_panel.setParent(self._zen_overlay)
-        self.ai_terminal_panel.setStyleSheet(
-            self.ai_terminal_panel.styleSheet() + "border-radius: 12px;"
-        )
         overlay_layout.addWidget(self.ai_terminal_panel, stretch=1)
         self.ai_zen_enter_btn.setVisible(False)
-        self.ai_zen_exit_btn.setVisible(True)
 
     def _exit_zen_mode(self) -> None:
-        """退出全屏沉浸模式"""
+        """退出全屏沉浸模式，恢复终端面板到右侧面板"""
         if not hasattr(self, '_zen_overlay'):
             return
+
+        # 先从 overlay 中取出终端面板再删除 overlay
+        self._zen_overlay.layout().removeWidget(self.ai_terminal_panel)
+        self.ai_terminal_panel.setParent(None)
+
         self._zen_overlay.hide()
         self._zen_overlay.deleteLater()
         del self._zen_overlay
 
-        # 将终端面板放回原位
-        right_panel = self.ai_terminal_panel.parent()
-        if right_panel and hasattr(right_panel, 'layout'):
-            right_panel.layout().addWidget(self.ai_terminal_panel)
+        # 将终端面板放回右侧面板布局
+        self.ai_terminal_panel.setParent(self)
+        self._right_panel_layout.addWidget(self.ai_terminal_panel)
 
         self.ai_zen_enter_btn.setVisible(True)
-        self.ai_zen_exit_btn.setVisible(False)
 
     # ═══════════════════════════════════════════════
     # 辅助
