@@ -46,8 +46,10 @@ from py.multi_agent import run_multi_agent, MultiAgentState
 # ============ UI Module Imports ============
 from ui.report_word import WordReportWidget
 from ui.report_ppt import PptReportWidget
+from ui.report_workbench import ReportWorkbenchWidget
 from ui.ai_diagnosis import AiDiagnosisWidget
 from ui.analysis_tab import AnalysisTabWidget
+from ui.global_parameter_dialog import GlobalParameterDialog
 
 
 # ============ Data Templates ============
@@ -183,6 +185,7 @@ class SensorSystem:
         self.fbgs = []        # FBG列表
         self.sensors = []     # 传感器列表
         self.reference_row = 0  # 参考行索引（初始值所在行）
+        self.global_parameters = {}  # 全局变量池 (SSOT)，局部常量可覆盖
 
     def set_reference_row(self, row_index):
         """设置参考行索引"""
@@ -313,7 +316,8 @@ class SensorSystem:
                         sensor.formula,
                         sensor.constants,
                         fbg_delta,
-                        len(df)
+                        len(df),
+                        self.global_parameters,
                     )
                     results[sensor.id] = result
             except Exception as e:
@@ -324,7 +328,8 @@ class SensorSystem:
 
         return results
 
-    def _evaluate_sensor_formula(self, formula, constants, fbg_delta, n_rows):
+    def _evaluate_sensor_formula(self, formula, constants, fbg_delta, n_rows,
+                                 global_params=None):
         """计算传感器公式
 
         公式示例：
@@ -332,12 +337,21 @@ class SensorSystem:
         - "W1 * k1 - W2 * k2"  温补应变 (W1应变, W2温度)
 
         W1, W2 等会被替换为该列的波长差值 (W - W0)
+        常量合并策略: 全局参数打底，局部常量覆盖 (SSOT)
         """
         import re
 
+        # 合并: 全局参数打底，局部常量覆盖 (局部优先)
+        merged = {}
+        if global_params:
+            merged.update(global_params)
+        merged.update(constants or {})
+
         # 用正则按单词边界替换常量（避免 k1 误匹配 k10）
         expr = formula
-        for name, value in constants.items():
+        for name, value in merged.items():
+            if isinstance(value, dict):
+                value = value.get('value', 0)
             expr = re.sub(r'\b' + re.escape(name) + r'\b', f'({value})', expr)
 
         # 检查公式中是否有未定义的常量
@@ -481,6 +495,31 @@ class DataProcessorWindow(QMainWindow):
     def save_ai_models_config(self):
         if hasattr(self, 'ai_diagnosis_widget'):
             self.ai_diagnosis_widget._save_models_config()
+
+    # ── App 本地设置持久化 ──
+
+    @staticmethod
+    def _get_app_settings_path() -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), '.app_settings.json')
+
+    @classmethod
+    def _load_app_settings(cls) -> dict:
+        path = cls._get_app_settings_path()
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    @classmethod
+    def _save_app_setting(cls, key: str, value) -> None:
+        settings = cls._load_app_settings()
+        settings[key] = value
+        path = cls._get_app_settings_path()
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
 
     def refresh_ai_model_selector(self):
         if hasattr(self, 'ai_diagnosis_widget'):
@@ -657,6 +696,11 @@ class DataProcessorWindow(QMainWindow):
 
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
+
+        # Row count info label
+        self.data_info_label = QLabel('')
+        self.data_info_label.setStyleSheet('color: #666; font-size: 12px; padding: 2px 0;')
+        layout.addWidget(self.data_info_label)
 
         # Data table
         self.data_table = QTableWidget()
@@ -837,6 +881,19 @@ class DataProcessorWindow(QMainWindow):
         self.copy_sensor_btn.clicked.connect(self.copy_sensor)
         sensor_btn_layout.addWidget(self.copy_sensor_btn)
 
+        sensor_btn_layout.addStretch()
+
+        self.global_params_btn = QPushButton('⚙️ 全局参数与变量池')
+        self.global_params_btn.setStyleSheet("""
+            QPushButton {
+                background: #722ed1; color: white; border: none; border-radius: 4px;
+                padding: 8px 18px; font-size: 13px; font-weight: bold;
+            }
+            QPushButton:hover { background: #9254de; }
+        """)
+        self.global_params_btn.clicked.connect(self.open_global_parameter_dialog)
+        sensor_btn_layout.addWidget(self.global_params_btn)
+
         sensor_layout.addLayout(sensor_btn_layout)
         sensor_group.setLayout(sensor_layout)
         h_layout.addWidget(sensor_group)
@@ -920,14 +977,26 @@ class DataProcessorWindow(QMainWindow):
     def _auto_populate_fbgs(self, df):
         """从数据文件列名自动识别FBG传感器并填充FBG定义表。
 
-        识别规则：表头以 FBG_ 开头的列 (如 FBG_A1, FBG_B1)。
+        识别规则（按优先级）：
+        1. 表头以 FBG_ 开头的列 (如 FBG_A1, FBG_B1)
+        2. 表头包含"波长"或"wavelength"的列 (如 波长1, Wavelength_1)
+        3. 表头为 W+数字 格式的列 (如 W1, W2)，但要求至少找到2个以上
         ID 按序填充为 W1, W2, ..., 波长列映射到实际列名。
         所有 FBG 波长范围统一设为 1520-1590 nm。
         """
         if df is None or df.empty:
             return 0
 
+        # 按优先级尝试多种识别规则
         fbg_cols = [str(c) for c in df.columns if str(c).upper().startswith('FBG_')]
+        if not fbg_cols:
+            fbg_cols = [str(c) for c in df.columns
+                       if '波长' in str(c) or 'wavelength' in str(c).lower()]
+        if not fbg_cols:
+            w_digit_cols = [str(c) for c in df.columns
+                           if str(c).upper().startswith('W') and str(c)[1:].isdigit()]
+            if len(w_digit_cols) >= 2:
+                fbg_cols = w_digit_cols
         if not fbg_cols:
             return 0
 
@@ -938,7 +1007,6 @@ class DataProcessorWindow(QMainWindow):
 
         self.refresh_fbg_table()
 
-        # 切换到光纤公式配置页，提示用户可以继续添加传感器
         print(f"[FBG自动识别] 从数据文件识别到 {len(fbg_cols)} 个FBG: {fbg_cols}")
         return len(fbg_cols)
 
@@ -1028,6 +1096,40 @@ class DataProcessorWindow(QMainWindow):
             self.sensor_system.add_sensor(copied)
             self.refresh_sensor_table()
 
+    def open_global_parameter_dialog(self):
+        dialog = GlobalParameterDialog(self, self.sensor_system)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.status_bar.showMessage('全局参数已更新')
+        else:
+            self.status_bar.showMessage('全局参数已关闭')
+
+    def _update_sensor_result_table(self, results):
+        """用计算结果填充传感器数据预览表"""
+        if self.current_data is None:
+            return
+        n_sensors = len(results)
+        n_preview_rows = min(100, len(self.current_data))
+
+        self.sensor_result_table.setColumnCount(n_sensors + 1)
+        self.sensor_result_table.setRowCount(n_preview_rows)
+
+        time_col = '时间' if '时间' in self.current_data.columns else self.current_data.columns[0]
+        headers = ['时间'] + list(results.keys())
+        self.sensor_result_table.setHorizontalHeaderLabels(headers)
+
+        for i in range(n_preview_rows):
+            t = self.current_data[time_col].values[i]
+            self.sensor_result_table.setItem(i, 0, QTableWidgetItem(str(t)))
+            for j, sensor_id in enumerate(results.keys()):
+                vals = results[sensor_id]
+                val = vals[i] if i < len(vals) else None
+                if val is not None:
+                    self.sensor_result_table.setItem(i, j + 1, QTableWidgetItem(f'{val:.2f}'))
+                else:
+                    self.sensor_result_table.setItem(i, j + 1, QTableWidgetItem('N/A'))
+
+        self.sensor_result_table.resizeColumnsToContents()
+
     def calculate_sensors(self):
         """计算所有传感器"""
         if self.current_data is None:
@@ -1035,39 +1137,14 @@ class DataProcessorWindow(QMainWindow):
             return
 
         try:
-            # 设置参考行
             ref_row = self.ref_row_spin.value()
             self.sensor_system.set_reference_row(ref_row)
 
             results = self.sensor_system.calculate(self.current_data, self.current_columns)
 
-            # 预览显示：所有传感器结果，每列最多100行
-            n_sensors = len(results)
             n_preview_rows = min(100, len(self.current_data))
-
-            self.sensor_result_table.setColumnCount(n_sensors + 1)
-            self.sensor_result_table.setRowCount(n_preview_rows)
-
-            # 时间列作为第一列
-            time_col = '时间' if '时间' in self.current_data.columns else self.current_data.columns[0]
-            headers = ['时间'] + list(results.keys())
-            self.sensor_result_table.setHorizontalHeaderLabels(headers)
-
-            # 填充数据
-            for i in range(n_preview_rows):
-                # 时间列
-                t = self.current_data[time_col].values[i]
-                self.sensor_result_table.setItem(i, 0, QTableWidgetItem(str(t)))
-                # 各传感器列
-                for j, sensor_id in enumerate(results.keys()):
-                    val = results[sensor_id][i] if i < len(results[sensor_id]) else None
-                    if val is not None:
-                        self.sensor_result_table.setItem(i, j + 1, QTableWidgetItem(f'{val:.2f}'))
-                    else:
-                        self.sensor_result_table.setItem(i, j + 1, QTableWidgetItem('N/A'))
-
-            self.sensor_result_table.resizeColumnsToContents()
-            self.sensor_results = results  # 保存计算结果
+            self._update_sensor_result_table(results)
+            self.sensor_results = results
             self.status_bar.showMessage(f'传感器计算完成，预览显示前{n_preview_rows}行')
 
         except Exception as e:
@@ -1174,9 +1251,9 @@ class DataProcessorWindow(QMainWindow):
         self.info_menu_list = QListWidget()
         self.info_menu_list.setMaximumWidth(180)
         self.info_menu_list.addItem('项目资料管理')
-        self.info_menu_list.addItem('Word报告生成')
-        self.info_menu_list.addItem('PPT报告生成')
+        self.info_menu_list.addItem('报告生成工作台')
         self.info_menu_list.addItem('AI诊断')
+        self.info_menu_list.addItem('网络剪藏')
         self.info_menu_list.addItem('知识库管理')
         self.info_menu_list.addItem('技能插件中心')
         self.info_menu_list.currentRowChanged.connect(self.on_info_menu_changed)
@@ -1194,17 +1271,17 @@ class DataProcessorWindow(QMainWindow):
         project_manage_page = self.create_project_manage_page()
         self.report_content_stack.addWidget(project_manage_page)
 
-        # Word报告生成页面
-        word_report_page = self.create_word_report_page()
-        self.report_content_stack.addWidget(word_report_page)
-
-        # PPT报告生成页面
-        ppt_report_page = self.create_ppt_report_page()
-        self.report_content_stack.addWidget(ppt_report_page)
+        # 报告生成工作台 (合并 Word + PPT)
+        report_workbench = self.create_report_workbench_page()
+        self.report_content_stack.addWidget(report_workbench)
 
         # AI诊断页面
         ai_diagnosis_page = self.create_ai_diagnosis_page()
         self.report_content_stack.addWidget(ai_diagnosis_page)
+
+        # 网络剪藏页面
+        web_clipper_page = self.create_web_clipper_page()
+        self.report_content_stack.addWidget(web_clipper_page)
 
         # 知识库管理页面
         wiki_page = self.create_wiki_page()
@@ -1384,12 +1461,18 @@ class DataProcessorWindow(QMainWindow):
         page.setLayout(layout)
         return page
 
+    def create_report_workbench_page(self):
+        """统一的报告生成工作台 (合并 Word + PPT)"""
+        self.report_workbench_widget = ReportWorkbenchWidget(self)
+        return self.report_workbench_widget
+
     def create_word_report_page(self):
-        """Word报告生成页面"""
+        """[保留] Word报告生成页面"""
         self.word_report_widget = WordReportWidget(self)
         return self.word_report_widget
+
     def create_ppt_report_page(self):
-        """PPT报告生成页面"""
+        """[保留] PPT报告生成页面"""
         self.ppt_report_widget = PptReportWidget(self)
         return self.ppt_report_widget
 
@@ -2037,326 +2120,303 @@ class DataProcessorWindow(QMainWindow):
 
     # ============ 知识库管理页面 ============
     def create_wiki_page(self):
-        """知识库管理页面 - 250:850分割器布局"""
+        """知识库管理页面 — 顶部工具栏 + 中部导航条 + 底部沉浸式分割布局"""
         page = QWidget()
-        main_layout = QHBoxLayout(page)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(14)
+        outer_layout = QVBoxLayout(page)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
 
-        # 创建水平分割器 [250, 850]
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(8)
-        splitter.setStyleSheet("""
-            QSplitter::handle {
-                background: linear-gradient(to bottom, #e0e0e0, #c0c0c0);
-            }
-            QSplitter::handle:hover {
-                background: linear-gradient(to bottom, #1890ff, #40a9ff);
-            }
-        """)
+        # ── 根层切换栈：0=正常布局 / 1=全屏沉浸阅读 ──
+        self.wiki_root_stack = QStackedWidget()
 
-        # =============================================
-        # 左侧面板 (250px) - Wiki列表
-        # =============================================
-        left_panel = QWidget()
-        left_panel.setMinimumWidth(250)
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(12)
+        # ═══════════════════════════════════════════════════════════
+        # Page 0: 正常编辑布局
+        # ═══════════════════════════════════════════════════════════
+        normal_widget = QWidget()
+        normal_layout = QVBoxLayout(normal_widget)
+        normal_layout.setContentsMargins(16, 12, 16, 12)
+        normal_layout.setSpacing(8)
 
-        # ----- 页面列表容器 -----
-        list_group = QGroupBox("知识库页面")
-        list_group.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid #e0e0e0;
-                border-radius: 8px;
-                font-weight: bold;
-                color: #1890ff;
-                padding: 10px;
-                padding-top: 22px;
-                background: white;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-        """)
-        list_inner = QVBoxLayout(list_group)
-        list_inner.setSpacing(10)
+        # ── 1. 顶部工具栏 ──
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(12)
 
-        # 页面列表
-        self.wiki_page_list = QListWidget()
-        self.wiki_page_list.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #ebebeb;
-                border-radius: 4px;
-                background: #fafafa;
-            }
-            QListWidget::item {
-                padding: 10px 12px;
-                border-bottom: 1px solid #f5f5f5;
-            }
-            QListWidget::item:hover {
-                background: #e6f4ff;
-            }
-            QListWidget::item:selected {
-                background: #1890ff;
-                color: white;
-            }
-        """)
-        self.wiki_page_list.itemClicked.connect(self.on_wiki_page_clicked)
-        list_inner.addWidget(self.wiki_page_list)
+        info_label = QLabel(
+            '知识库管理 — 本地化 Markdown 文档系统：'
+            '支持页面创建/编辑/搜索/删除，可上传外部文件，与 AI Agent 技能深度联动'
+        )
+        info_label.setStyleSheet('color: #555; font-size: 13px; padding: 6px 0;')
+        toolbar.addWidget(info_label)
+        toolbar.addStretch()
 
-        # ----- 搜索区域 -----
-        search_layout = QHBoxLayout()
-        search_layout.setSpacing(8)
+        btn_style_primary = """
+            QPushButton {
+                background: #1890ff; color: white; border: none; border-radius: 4px;
+                padding: 7px 16px; font-size: 13px; font-weight: bold;
+            }
+            QPushButton:hover { background: #40a9ff; }
+        """
+        btn_style_secondary = """
+            QPushButton {
+                background: white; color: #555; border: 1px solid #d9d9d9; border-radius: 4px;
+                padding: 7px 14px; font-size: 13px;
+            }
+            QPushButton:hover { color: #1890ff; border-color: #1890ff; }
+        """
+        btn_style_danger = """
+            QPushButton {
+                background: white; color: #ff4d4f; border: 1px solid #ffccc7; border-radius: 4px;
+                padding: 7px 14px; font-size: 13px;
+            }
+            QPushButton:hover { color: white; background: #ff4d4f; border-color: #ff4d4f; }
+        """
+
+        new_page_btn = QPushButton("+ 新建")
+        new_page_btn.setStyleSheet(btn_style_primary)
+        new_page_btn.clicked.connect(self.on_wiki_new_page)
+        toolbar.addWidget(new_page_btn)
+
+        del_page_btn = QPushButton("删除")
+        del_page_btn.setStyleSheet(btn_style_danger)
+        del_page_btn.clicked.connect(self.on_wiki_delete_page)
+        toolbar.addWidget(del_page_btn)
+
+        upload_btn = QPushButton("上传文件")
+        upload_btn.setStyleSheet(btn_style_secondary)
+        upload_btn.clicked.connect(self.on_wiki_upload_file)
+        toolbar.addWidget(upload_btn)
+
+        help_btn = QPushButton("说明")
+        help_btn.setStyleSheet(btn_style_secondary)
+        help_btn.clicked.connect(self.show_wiki_help)
+        toolbar.addWidget(help_btn)
+
+        save_wiki_btn = QPushButton("保存页面")
+        save_wiki_btn.setStyleSheet(btn_style_primary)
+        save_wiki_btn.clicked.connect(self.on_wiki_save)
+        toolbar.addWidget(save_wiki_btn)
+
+        normal_layout.addLayout(toolbar)
+
+        # ── 2. 中部导航条 ──
+        navbar = QHBoxLayout()
+        navbar.setSpacing(10)
 
         self.wiki_search_input = QLineEdit()
         self.wiki_search_input.setPlaceholderText("搜索关键词...")
         self.wiki_search_input.setStyleSheet("""
             QLineEdit {
-                border: 1px solid #d9d9d9;
-                border-radius: 4px;
-                padding: 8px 10px;
-                background: white;
+                border: 1px solid #d9d9d9; border-radius: 4px;
+                padding: 8px 12px; font-size: 13px; background: white;
             }
-            QLineEdit:focus {
-                border-color: #1890ff;
-            }
+            QLineEdit:focus { border-color: #1890ff; }
         """)
-        search_layout.addWidget(self.wiki_search_input, stretch=1)
+        navbar.addWidget(self.wiki_search_input, stretch=1)
 
         wiki_search_btn = QPushButton("搜索")
-        wiki_search_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1890ff;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 14px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #40a9ff;
-            }
-        """)
+        wiki_search_btn.setStyleSheet(btn_style_primary)
         wiki_search_btn.clicked.connect(self.on_wiki_search)
-        search_layout.addWidget(wiki_search_btn)
-        list_inner.addLayout(search_layout)
+        navbar.addWidget(wiki_search_btn)
 
-        # 搜索结果列表
-        self.wiki_search_result = QListWidget()
-        self.wiki_search_result.setMaximumHeight(90)
-        self.wiki_search_result.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #fff3cd;
-                border-radius: 4px;
-                background: #fffbe6;
-            }
-            QListWidget::item {
-                padding: 6px;
-                color: #ad6800;
-            }
-        """)
-        self.wiki_search_result.itemClicked.connect(self.on_wiki_search_result_clicked)
-        list_inner.addWidget(self.wiki_search_result)
-
-        # ----- 新建/删除按钮行 -----
-        action_layout = QHBoxLayout()
-        action_layout.setSpacing(10)
-
-        new_page_btn = QPushButton("新建")
-        new_page_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #52c41a;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #73d13d;
-            }
-        """)
-        new_page_btn.clicked.connect(self.on_wiki_new_page)
-        action_layout.addWidget(new_page_btn)
-
-        del_page_btn = QPushButton("删除")
-        del_page_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #ff4d4f;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #ff7875;
-            }
-        """)
-        del_page_btn.clicked.connect(self.on_wiki_delete_page)
-        action_layout.addWidget(del_page_btn)
-        list_inner.addLayout(action_layout)
-
-        # ----- 上传/说明按钮行 -----
-        extra_layout = QHBoxLayout()
-        extra_layout.setSpacing(10)
-
-        upload_btn = QPushButton("上传文件")
-        upload_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #faad14;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 14px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #ffc53d;
-            }
-        """)
-        upload_btn.clicked.connect(self.on_wiki_upload_file)
-        extra_layout.addWidget(upload_btn)
-
-        help_btn = QPushButton("说明")
-        help_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #722ed1;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 14px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #9254de;
-            }
-        """)
-        help_btn.clicked.connect(self.show_wiki_help)
-        extra_layout.addWidget(help_btn)
-        list_inner.addLayout(extra_layout)
-
-        left_layout.addWidget(list_group)
-
-        # =============================================
-        # 右侧面板 - 编辑器
-        # =============================================
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(14)
-
-        # 编辑器容器
-        editor_group = QGroupBox("编辑内容")
-        editor_group.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid #e0e0e0;
-                border-radius: 8px;
-                font-weight: bold;
-                color: #1890ff;
-                padding: 12px;
-                padding-top: 22px;
-                background: white;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-        """)
-        editor_inner = QVBoxLayout(editor_group)
-        editor_inner.setSpacing(12)
-
-        # ----- 标题行 -----
-        title_layout = QHBoxLayout()
-        title_layout.setSpacing(12)
+        navbar.addSpacing(16)
+        sep = QLabel()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("background: #e8e8e8;")
+        sep.setFixedHeight(28)
+        navbar.addWidget(sep)
+        navbar.addSpacing(16)
 
         title_label = QLabel("页面标题:")
-        title_label.setStyleSheet("font-weight: bold; color: #333;")
-        title_layout.addWidget(title_label)
+        title_label.setStyleSheet("font-weight: bold; color: #333; font-size: 13px;")
+        navbar.addWidget(title_label)
 
         self.wiki_title_input = QLineEdit()
         self.wiki_title_input.setPlaceholderText("输入页面标题...")
         self.wiki_title_input.setStyleSheet("""
             QLineEdit {
-                border: 1px solid #d9d9d9;
-                border-radius: 4px;
-                padding: 10px 14px;
-                font-size: 14px;
-                font-weight: bold;
+                border: 1px solid #d9d9d9; border-radius: 4px;
+                padding: 8px 12px; font-size: 14px; font-weight: bold; background: white;
             }
-            QLineEdit:focus {
-                border-color: #1890ff;
-            }
+            QLineEdit:focus { border-color: #1890ff; }
         """)
         self.wiki_title_input.textChanged.connect(self.on_wiki_title_changed)
-        title_layout.addWidget(self.wiki_title_input, stretch=1)
+        navbar.addWidget(self.wiki_title_input, stretch=2)
 
-        save_wiki_btn = QPushButton("保存页面")
-        save_wiki_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1890ff;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 22px;
-                font-weight: bold;
+        normal_layout.addLayout(navbar)
+
+        # ── 搜索结果列表 ──
+        self.wiki_search_result = QListWidget()
+        self.wiki_search_result.setMaximumHeight(100)
+        self.wiki_search_result.setStyleSheet("""
+            QListWidget {
+                border: 1px solid #ffd666; border-radius: 4px;
+                background: #fffbe6; margin: 0; padding: 4px;
             }
-            QPushButton:hover {
-                background-color: #40a9ff;
+            QListWidget::item {
+                padding: 6px 10px; color: #ad6800; border-bottom: 1px solid #fff1b8;
+            }
+            QListWidget::item:hover { background: #fff1b8; }
+        """)
+        self.wiki_search_result.itemClicked.connect(self.on_wiki_search_result_clicked)
+        self.wiki_search_result.hide()
+        normal_layout.addWidget(self.wiki_search_result)
+
+        # ── 3. 底部沉浸式工作区 ──
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(6)
+        splitter.setStyleSheet("""
+            QSplitter::handle { background: #e8e8e8; border-radius: 2px; }
+            QSplitter::handle:hover { background: #1890ff; }
+        """)
+
+        # 左侧：页面列表
+        left_panel = QWidget()
+        left_panel.setMinimumWidth(180)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 4, 0)
+        left_layout.setSpacing(6)
+
+        page_list_label = QLabel("知识库页面")
+        page_list_label.setStyleSheet(
+            "font-weight: bold; color: #333; font-size: 13px; padding: 2px 0;"
+        )
+        left_layout.addWidget(page_list_label)
+
+        self.wiki_page_list = QListWidget()
+        self.wiki_page_list.setStyleSheet("""
+            QListWidget {
+                border: 1px solid #e0e0e0; border-radius: 4px;
+                background: #fafafa; outline: none;
+            }
+            QListWidget::item {
+                padding: 10px 14px; border-bottom: 1px solid #f0f0f0;
+            }
+            QListWidget::item:hover { background: #e6f4ff; }
+            QListWidget::item:selected {
+                background: #1890ff; color: white; border-radius: 2px;
             }
         """)
-        save_wiki_btn.clicked.connect(self.on_wiki_save)
-        title_layout.addWidget(save_wiki_btn)
-        editor_inner.addLayout(title_layout)
+        self.wiki_page_list.itemClicked.connect(self.on_wiki_page_clicked)
+        left_layout.addWidget(self.wiki_page_list, stretch=1)
 
-        # ----- 内容编辑器 -----
-        content_label = QLabel("页面内容 (支持Markdown)")
-        content_label.setStyleSheet("font-weight: bold; color: #333;")
-        editor_inner.addWidget(content_label)
+        splitter.addWidget(left_panel)
+
+        # 右侧：编辑器
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        editor_header = QHBoxLayout()
+        editor_header.setSpacing(8)
+
+        editor_label = QLabel("页面内容 (支持 Markdown)")
+        editor_label.setStyleSheet("font-weight: bold; color: #333; font-size: 13px;")
+        editor_header.addWidget(editor_label)
+        editor_header.addStretch()
+
+        self.wiki_fullscreen_btn = QPushButton("沉浸阅读")
+        self.wiki_fullscreen_btn.setStyleSheet("""
+            QPushButton {
+                background: white; border: 1px solid #d9d9d9; border-radius: 4px;
+                padding: 5px 14px; font-size: 12px; color: #555;
+            }
+            QPushButton:hover { color: #1890ff; border-color: #1890ff; }
+        """)
+        self.wiki_fullscreen_btn.clicked.connect(self._on_wiki_fullscreen_enter)
+        editor_header.addWidget(self.wiki_fullscreen_btn)
+        right_layout.addLayout(editor_header)
+
+        # 保留旧变量名兼容（内部已不再使用，但其他方法可能引用）
+        self.wiki_content_stack = QStackedWidget()
+        self.wiki_mode_btn = self.wiki_fullscreen_btn  # 兼容旧的引用
 
         self.wiki_content = QTextEdit()
-        self.wiki_content.setPlaceholderText("""使用Markdown格式编写内容...
-
-# 一级标题
-## 二级标题
-- 列表项
-```python
-代码块
-```
-**粗体** *斜体*
-""")
+        self.wiki_content.setPlaceholderText(
+            "# 一级标题\n## 二级标题\n- 列表项\n```python\n代码块\n```\n**粗体** *斜体*"
+        )
         self.wiki_content.setStyleSheet("""
             QTextEdit {
-                border: 1px solid #d9d9d9;
-                border-radius: 6px;
-                padding: 14px;
-                font-family: 'Consolas', monospace;
-                font-size: 13px;
-                line-height: 1.7;
+                border: 1px solid #e0e0e0; border-radius: 4px;
+                padding: 16px; font-family: 'Consolas', 'Microsoft YaHei', monospace;
+                font-size: 13px; line-height: 1.7; background: white;
             }
-            QTextEdit:focus {
-                border-color: #1890ff;
+            QTextEdit:focus { border-color: #1890ff; }
+        """)
+        right_layout.addWidget(self.wiki_content, stretch=1)
+
+        splitter.addWidget(right_panel)
+        splitter.setSizes([260, 840])
+
+        normal_layout.addWidget(splitter, stretch=1)
+
+        self.wiki_root_stack.addWidget(normal_widget)  # index 0
+
+        # ═══════════════════════════════════════════════════════════
+        # Page 1: 全屏沉浸式阅读
+        # ═══════════════════════════════════════════════════════════
+        fullscreen_widget = QWidget()
+        fullscreen_layout = QVBoxLayout(fullscreen_widget)
+        fullscreen_layout.setContentsMargins(0, 0, 0, 0)
+        fullscreen_layout.setSpacing(0)
+
+        # 全屏顶栏
+        fs_topbar = QHBoxLayout()
+        fs_topbar.setContentsMargins(20, 12, 20, 12)
+        fs_topbar.setSpacing(12)
+
+        self.wiki_fs_title = QLabel("")
+        self.wiki_fs_title.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #333;"
+        )
+        fs_topbar.addWidget(self.wiki_fs_title, stretch=1)
+
+        exit_fs_btn = QPushButton("返回编辑")
+        exit_fs_btn.setStyleSheet("""
+            QPushButton {
+                background: #1890ff; color: white; border: none; border-radius: 4px;
+                padding: 7px 18px; font-size: 13px; font-weight: bold;
+            }
+            QPushButton:hover { background: #40a9ff; }
+        """)
+        exit_fs_btn.clicked.connect(self._on_wiki_fullscreen_exit)
+        fs_topbar.addWidget(exit_fs_btn)
+
+        fullscreen_layout.addLayout(fs_topbar)
+
+        # 分隔线
+        fs_sep = QLabel()
+        fs_sep.setFixedHeight(1)
+        fs_sep.setStyleSheet("background: #e8e8e8;")
+        fullscreen_layout.addWidget(fs_sep)
+
+        # 全屏阅读浏览器
+        from PyQt6.QtWidgets import QTextBrowser
+        self.wiki_fullscreen_browser = QTextBrowser()
+        self.wiki_fullscreen_browser.setOpenExternalLinks(True)
+        self.wiki_fullscreen_browser.setStyleSheet("""
+            QTextBrowser {
+                border: none; padding: 0px 4% 24px; background: #fffdf7;
+                font-size: 16px; line-height: 1.9;
             }
         """)
-        editor_inner.addWidget(self.wiki_content, stretch=1)
+        # 禁止横向滚动条，内容自适应容器宽度
+        self.wiki_fullscreen_browser.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.wiki_fullscreen_browser.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        fullscreen_layout.addWidget(self.wiki_fullscreen_browser, stretch=1)
 
-        right_layout.addWidget(editor_group)
+        self.wiki_root_stack.addWidget(fullscreen_widget)  # index 1
+        self.wiki_root_stack.setCurrentIndex(0)
 
-        # 添加到分割器
-        splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([250, 850])
+        outer_layout.addWidget(self.wiki_root_stack)
 
-        main_layout.addWidget(splitter)
-
-        # 初始化Wiki系统
+        # ── 初始化 ──
         self.wiki_fs = WikiFileSystem()
         self.refresh_wiki_pages()
+        # 后台建立向量索引 (首次启动或新页面)
+        self._init_wiki_embeddings()
 
         return page
 
@@ -2370,8 +2430,35 @@ class DataProcessorWindow(QMainWindow):
                 page_name = line[3:].strip()
                 self.wiki_page_list.addItem(page_name)
 
+    def _init_wiki_embeddings(self):
+        """后台线程初始化语义搜索向量索引（静默失败不影响主流程）"""
+        import threading
+
+        def _rebuild():
+            try:
+                # 检查是否已有向量索引
+                self.wiki_fs._ensure_chroma()
+                existing = self.wiki_fs._collection.count()
+                page_count = len(self.wiki_fs._load_map().get("index", {}))
+                if existing >= page_count and page_count > 0:
+                    print(f"[Wiki] 向量索引已就绪: {existing} 条")
+                    return
+                print(f"[Wiki] 向量索引不完整 ({existing}/{page_count})，开始后台重建...")
+                count = self.wiki_fs.rebuild_embeddings()
+                print(f"[Wiki] 向量索引后台重建完成: {count} 页")
+            except ImportError:
+                pass  # 未安装依赖，静默跳过
+            except Exception as e:
+                print(f"[Wiki] 向量索引初始化跳过: {e}")
+
+        t = threading.Thread(target=_rebuild, daemon=True)
+        t.start()
+
     def on_wiki_page_clicked(self, item):
         """点击Wiki页面时加载内容"""
+        # 退出全屏模式
+        if self.wiki_root_stack.currentIndex() == 1:
+            self.wiki_root_stack.setCurrentIndex(0)
         page_name = item.text()
         content = self.wiki_fs.read_wiki_page(page_name)
         if content and not content.startswith('Error:'):
@@ -2381,8 +2468,343 @@ class DataProcessorWindow(QMainWindow):
             self.wiki_title_input.setText(page_name)
             self.wiki_content.clear()
 
+    def _on_wiki_fullscreen_enter(self) -> None:
+        """进入全屏沉浸式阅读"""
+        md_text = self.wiki_content.toPlainText()
+        if not md_text.strip():
+            QMessageBox.information(self, '提示', '请先编写或加载页面内容后再进入沉浸阅读')
+            return
+        html = self._markdown_to_html(md_text)
+        import re as _re
+        from PyQt6.QtGui import QImage, QTextDocument
+        from PyQt6.QtCore import QByteArray, QUrl
+        _wiki_base = str(self.wiki_fs.base_dir.resolve()).replace("\\", "/")
+        # 创建新文档并注册图片资源，避免 setHtml() 替换文档导致资源丢失
+        _doc = QTextDocument()
+        _img_index = 0
+        def _replace_img_src(m):
+            nonlocal _img_index
+            rel = m.group(1)
+            abs_path = _wiki_base + "/" + rel
+            try:
+                # QPixmap 在 Python 3.14 / Windows 含中文路径时崩溃
+                # 使用 Python open + QImage.fromData 绕过 Qt 文件 IO
+                with open(abs_path, "rb") as _f:
+                    _raw = _f.read()
+                img = QImage.fromData(QByteArray(_raw))
+                if img.isNull():
+                    return m.group(0)
+                res_name = f"wiki_img_{_img_index}"
+                _img_index += 1
+                _doc.addResource(QTextDocument.ResourceType.ImageResource, QUrl(res_name), img)
+                return f'src="{res_name}"'
+            except Exception:
+                return m.group(0)
+        html = _re.sub(r'src="(assets/[^"]+\.(?:jpg|jpeg|png|gif|webp|svg|bmp))"', _replace_img_src, html)
+        print(f"[Wiki全屏] 共替换 {_img_index} 张图片为文档资源")
+        html = _re.sub(r'(<br\s*/?>\s*){3,}', '<br/>', html)
+        html = _re.sub(r'<p>\s*</p>', '', html)
+        _doc.setHtml(html)
+        # setHtml 会注入 Qt 默认内联样式 (margin-top:12px; margin-bottom:12px)
+        # 覆盖 CSS 中的 p 边距设置。通过 QTextCursor 直接操作块格式来修正
+        from PyQt6.QtGui import QTextCursor, QTextBlockFormat
+        _cursor = QTextCursor(_doc)
+        _cursor.movePosition(QTextCursor.MoveOperation.Start)
+        _heading_margins = {
+            1: (28, 10), 2: (24, 8), 3: (18, 6),
+        }
+        while True:
+            _block = _cursor.block()
+            _bfmt = _block.blockFormat()
+            _level = _bfmt.headingLevel()
+            if _level in _heading_margins:
+                _bfmt.setTopMargin(_heading_margins[_level][0])
+                _bfmt.setBottomMargin(_heading_margins[_level][1])
+            else:
+                _bfmt.setTopMargin(4)
+                _bfmt.setBottomMargin(4)
+            _cursor.setBlockFormat(_bfmt)
+            if not _cursor.movePosition(QTextCursor.MoveOperation.NextBlock):
+                break
+        # 验证资源在 setHtml 后仍存在
+        for i in range(_img_index):
+            res = _doc.resource(QTextDocument.ResourceType.ImageResource, QUrl(f"wiki_img_{i}"))
+            if res is not None and not res.isNull():
+                print(f"[Wiki全屏] 资源 wiki_img_{i}: {res.size().width()}x{res.size().height()} ✓")
+            else:
+                print(f"[Wiki全屏] 资源 wiki_img_{i}: 丢失! ✗")
+        self.wiki_fullscreen_browser.setDocument(_doc)
+        page_title = self.wiki_title_input.text().strip() or "知识库页面"
+        self.wiki_fs_title.setText(page_title)
+        self.wiki_root_stack.setCurrentIndex(1)
+
+    def _on_wiki_fullscreen_exit(self) -> None:
+        """退出全屏阅读，返回编辑布局"""
+        self.wiki_root_stack.setCurrentIndex(0)
+
+    @staticmethod
+    def _markdown_to_html(md_text: str) -> str:
+        """将 Markdown 转换为 HTML 文章阅读视图。
+
+        提取 YAML front-matter 渲染为文章头部信息栏，
+        正文使用清晰舒适的排版样式，适合长时间阅读。
+        """
+        import re as _re
+
+        # ── 提取 YAML front-matter ──
+        body_text = md_text
+        title = source_url = date_str = ""
+        fm_match = _re.match(r'^---\s*\n(.*?)\n---\s*\n', md_text, _re.DOTALL)
+        if fm_match:
+            fm_content = fm_match.group(1)
+            body_text = md_text[fm_match.end():]
+            for line in fm_content.split("\n"):
+                line = line.strip()
+                if line.startswith("title:"):
+                    title = line[6:].strip().strip('"').strip("'")
+                elif line.startswith("source_url:"):
+                    source_url = line[11:].strip().strip('"').strip("'")
+                elif line.startswith("date:"):
+                    date_str = line[5:].strip().strip('"').strip("'")
+        # 去掉 trafilatura 嵌入的第二层 front-matter 元数据块
+        body_text = _re.sub(r'^\s*---\s*\n.*?\n---\s*\n', '', body_text, flags=_re.DOTALL)
+
+        # ── Markdown → HTML ──
+        # 预处理：合并连续多余空行，避免转换后产生大片空白
+        body_text = _re.sub(r'\n{3,}', '\n\n', body_text)
+        try:
+            import markdown as md_lib
+            html_body = md_lib.markdown(
+                body_text,
+                extensions=["tables"],
+            )
+            # <code> 和 <pre> 在 Python 3.14 + PyQt6 中触发 segfault
+            # 替换为等价的 <span> / <div> 内联样式
+            html_body = _re.sub(
+                r'<code>',
+                '<span style="background:#f0f0f0;padding:2px 6px;border-radius:3px;'
+                'font-family:Consolas,monospace;font-size:0.88em;color:#c7254e;">',
+                html_body,
+            )
+            html_body = html_body.replace('</code>', '</span>')
+            html_body = _re.sub(
+                r'<pre>',
+                '<div style="background:#1e1e1e;color:#d4d4d4;padding:16px 20px;'
+                'border-radius:8px;font-size:13px;line-height:1.55;margin:14px 0;'
+                'white-space:pre-wrap;font-family:Consolas,monospace;">',
+                html_body,
+            )
+            html_body = html_body.replace('</pre>', '</div>')
+            # 图片从 <p> 标签中解套（QTextDocument.setHtml 可能会重新包裹，
+            # 通过 CSS !important 强制压缩段落间距来抵消）
+            html_body = _re.sub(
+                r'<p>\s*(<img[^>]*>)\s*</p>', r'\1', html_body,
+            )
+        except ImportError:
+            html_body = WebClipperWikiHelper._basic_md_to_html(body_text)
+
+        # ── 文章头部信息栏 ──
+        header_html = ""
+        if title or date_str or source_url:
+            header_parts = []
+            if title:
+                header_parts.append(
+                    f'<div class="article-title">{title}</div>'
+                )
+            meta_items = []
+            if date_str:
+                meta_items.append(f'<span class="meta-date">📅 {date_str}</span>')
+            if source_url:
+                display_url = source_url[:80] + "..." if len(source_url) > 80 else source_url
+                meta_items.append(
+                    f'<span class="meta-source">🔗 <a href="{source_url}">原文链接</a></span>'
+                )
+            if meta_items:
+                header_parts.append(
+                    '<div class="article-meta">' + " &nbsp;·&nbsp; ".join(meta_items) + '</div>'
+                )
+            header_html = '<div class="article-header">' + "\n".join(header_parts) + '</div>'
+
+        css = """
+        <style>
+            body { font-family: 'Microsoft YaHei', 'PingFang SC', 'Segoe UI', 'Noto Sans SC', sans-serif;
+                   font-size: 16px; line-height: 1.6; color: #2c2c2c;
+                   width: 100%; padding: 24px 6% 40px;
+                   background: #fffdf7; }
+            /* ── 文章头部 ── */
+            .article-header { background: linear-gradient(135deg, #f8fbff 0%, #eef5ff 100%);
+                   border-left: 4px solid #1890ff; border-radius: 0 8px 8px 0;
+                   padding: 20px 24px; margin-bottom: 32px; }
+            .article-title { font-size: 1.7em; font-weight: bold; color: #111;
+                   line-height: 1.4; margin-bottom: 8px; }
+            .article-meta { font-size: 0.85em; color: #888; }
+            .article-meta a { color: #1890ff; text-decoration: none; }
+            .meta-date, .meta-source { display: inline-block; }
+            /* ── 正文排版 ── */
+            h1 { font-size: 1.55em; margin: 28px 0 10px; padding-bottom: 8px;
+                 border-bottom: 2px solid #1890ff; color: #111; line-height: 1.4; }
+            h2 { font-size: 1.3em; margin: 24px 0 8px; padding-bottom: 6px;
+                 border-bottom: 1px solid #e8e8e8; color: #1a1a1a; }
+            h3 { font-size: 1.12em; margin: 18px 0 6px; color: #333; }
+            p { margin: 4px 0; text-align: justify; }
+            img { display: block; max-width: 100%; height: auto; margin: 0 auto;
+                  border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+            blockquote { border-left: 4px solid #1890ff; margin: 16px 0; padding: 10px 18px;
+                         background: #f0f5ff; color: #555; border-radius: 0 4px 4px 0;
+                         font-style: italic; }
+            code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px;
+                   font-family: 'Consolas', 'Courier New', 'Source Code Pro', monospace;
+                   font-size: 0.88em; color: #c7254e; }
+            pre { background: #1e1e1e; color: #d4d4d4; padding: 16px 20px;
+                  border-radius: 8px; overflow-x: auto; font-size: 13px;
+                  line-height: 1.55; margin: 14px 0; }
+            pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
+            table { border-collapse: collapse; width: 100%; margin: 16px 0;
+                    font-size: 0.95em; }
+            th, td { border: 1px solid #e0e0e0; padding: 10px 14px; text-align: left; }
+            th { background: #f7f7f7; font-weight: 600; color: #333; }
+            tr:nth-child(even) td { background: #fafafa; }
+            a { color: #1890ff; text-decoration: none; border-bottom: 1px dotted #b0d0ff; }
+            a:hover { border-bottom-style: solid; }
+            ul, ol { padding-left: 26px; margin: 10px 0; }
+            li { margin: 5px 0; line-height: 1.7; }
+            hr { border: none; border-top: 1px solid #e8e8e8; margin: 28px 0; }
+            strong { color: #1a1a1a; }
+            em { color: #555; }
+        </style>
+        """
+        return f"<html><head><meta charset='utf-8'>{css}</head><body>{header_html}{html_body}</body></html>"
+
+    @staticmethod
+    def _basic_md_to_html(md_text: str) -> str:
+        """内置轻量 Markdown→HTML 转换器（不依赖外部库）"""
+        import re
+
+        lines = md_text.split("\n")
+        result = []
+        in_code_block = False
+        in_list = False
+        list_type = None
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # 代码块
+            if line.strip().startswith("```"):
+                if in_code_block:
+                    result.append("</code></pre>")
+                    in_code_block = False
+                else:
+                    lang = line.strip()[3:].strip()
+                    result.append(f'<pre><code class="{lang}">')
+                    in_code_block = True
+                i += 1
+                continue
+
+            if in_code_block:
+                result.append(line)
+                i += 1
+                continue
+
+            # 空行 → 结束列表
+            if not line.strip():
+                if in_list:
+                    result.append(f"</{list_type}>")
+                    in_list = False
+                    list_type = None
+                result.append("")
+                i += 1
+                continue
+
+            # 标题
+            h_match = re.match(r"^(#{1,6})\s+(.+)$", line)
+            if h_match:
+                if in_list:
+                    result.append(f"</{list_type}>")
+                    in_list = False
+                    list_type = None
+                level = len(h_match.group(1))
+                result.append(f"<h{level}>{h_match.group(2)}</h{level}>")
+                i += 1
+                continue
+
+            # 无序列表
+            ul_match = re.match(r"^[\-\*]\s+(.+)$", line)
+            if ul_match:
+                if not in_list:
+                    result.append("<ul>")
+                    in_list = True
+                    list_type = "ul"
+                elif list_type != "ul":
+                    result.append(f"</{list_type}><ul>")
+                    list_type = "ul"
+                result.append(f"<li>{ul_match.group(1)}</li>")
+                i += 1
+                continue
+
+            # 有序列表
+            ol_match = re.match(r"^\d+\.\s+(.+)$", line)
+            if ol_match:
+                if not in_list:
+                    result.append("<ol>")
+                    in_list = True
+                    list_type = "ol"
+                elif list_type != "ol":
+                    result.append(f"</{list_type}><ol>")
+                    list_type = "ol"
+                result.append(f"<li>{ol_match.group(1)}</li>")
+                i += 1
+                continue
+
+            # 引用
+            bq_match = re.match(r"^>\s?(.*)$", line)
+            if bq_match:
+                if in_list:
+                    result.append(f"</{list_type}>")
+                    in_list = False
+                    list_type = None
+                result.append(f"<blockquote>{bq_match.group(1)}</blockquote>")
+                i += 1
+                continue
+
+            # 分隔线
+            if re.match(r"^[\-\*_]{3,}$", line.strip()):
+                if in_list:
+                    result.append(f"</{list_type}>")
+                    in_list = False
+                    list_type = None
+                result.append("<hr>")
+                i += 1
+                continue
+
+            # 普通段落
+            if in_list:
+                result.append(f"</{list_type}>")
+                in_list = False
+                list_type = None
+
+            processed = line
+            processed = re.sub(r"\!\[([^\]]*)\]\(([^)]+)\)", r'<img src="\2" alt="\1">', processed)
+            processed = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', processed)
+            processed = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", processed)
+            processed = re.sub(r"\*(.+?)\*", r"<em>\1</em>", processed)
+            processed = re.sub(r"`([^`]+)`", r"<code>\1</code>", processed)
+
+            result.append(f"<p>{processed}</p>")
+            i += 1
+
+        if in_code_block:
+            result.append("</code></pre>")
+        if in_list:
+            result.append(f"</{list_type}>")
+
+        return "\n".join(result)
+
     def on_wiki_new_page(self):
         """新建Wiki页面"""
+        if self.wiki_root_stack.currentIndex() == 1:
+            self.wiki_root_stack.setCurrentIndex(0)
         self.wiki_title_input.clear()
         self.wiki_content.clear()
         self.wiki_title_input.setFocus()
@@ -2416,6 +2838,8 @@ class DataProcessorWindow(QMainWindow):
         """搜索Wiki页面"""
         keyword = self.wiki_search_input.text().strip()
         if not keyword:
+            self.wiki_search_result.clear()
+            self.wiki_search_result.hide()
             return
         self.wiki_search_result.clear()
         results = self.wiki_fs.search_pages(keyword)
@@ -2423,10 +2847,26 @@ class DataProcessorWindow(QMainWindow):
             for line in results.split('\n'):
                 if line.strip():
                     self.wiki_search_result.addItem(line.strip())
+            self.wiki_search_result.show()
+        else:
+            self.wiki_search_result.addItem(f'未找到匹配 "{keyword}" 的页面')
+            self.wiki_search_result.show()
 
     def on_wiki_search_result_clicked(self, item):
         """点击搜索结果"""
-        page_name = item.text()
+        text = item.text()
+        # 忽略"未找到"提示行
+        if text.startswith('未找到'):
+            return
+        # 搜索结果格式为 "- 页面名: 摘要"，解析出页面名
+        if text.startswith('- '):
+            text = text[2:]
+        if ': ' in text:
+            page_name = text.split(': ')[0]
+        elif ':' in text:
+            page_name = text.split(':')[0]
+        else:
+            page_name = text
         content = self.wiki_fs.read_wiki_page(page_name)
         if content and not content.startswith('Error:'):
             self.wiki_title_input.setText(page_name)
@@ -2448,50 +2888,80 @@ class DataProcessorWindow(QMainWindow):
 
     def show_wiki_help(self):
         """显示知识库使用说明"""
-        help_text = """# 知识库使用说明
+        help_text = """# 知识库管理 — 使用说明
 
 ## 功能概述
-知识库是一个基于本地文件系统的文档管理系统，支持 Markdown 格式存储。
 
-## 基本操作
+知识库管理是本软件内置的本地化文档管理系统，专为科研和工程项目中的知识沉淀与快速检索而设计。与云端笔记工具不同，所有数据完全存储在本地文件系统，无需网络连接，保障数据安全。
 
-### 查看页面
-1. 在左侧列表点击页面名称
-2. 右侧将显示页面内容
+核心定位：作为项目的"第二大脑"，将传感器配置经验、数据分析方法、调试记录、公式推导等零散知识系统化组织，形成可搜索、可复用的知识资产。
+
+## 核心特点
+
+1. **纯本地存储** — 所有页面以 Markdown 文件形式保存在 `wiki_vault/pages/` 目录下，索引导入 `wiki_vault/wiki_map.json`，可直接用任何文本编辑器打开
+2. **沉浸式分割布局** — 左侧页面列表可拖拽调整宽度，右侧全功能 Markdown 编辑器，互不干扰
+3. **一键沉浸阅读** — 点击"沉浸阅读"按钮进入全屏阅读模式，自动渲染 Markdown 为精美文章视图，右上角"返回编辑"退出
+4. **顶部统一操作台** — 所有管理按钮（新建、删除、上传、说明、保存）集中在页面顶部工具栏，一目了然
+5. **水平导航搜索条** — 搜索关键词和页面标题输入框位于同一水平线，查找与定义一次完成
+6. **AI 技能联动** — 知识库页面可被 AI Agent 的 read_wiki_page / write_wiki_page / search_wiki_pages 等技能直接读写，实现 AI 辅助知识管理
+
+## 页面管理操作
+
+### 浏览与查看
+- 左侧"知识库页面"列表显示所有已保存页面，点击任意页面名称即可加载
+- 页面标题自动填入中部导航条的标题输入框，内容以 Markdown 原文显示在编辑区
+- 点击"沉浸阅读"按钮 → 全屏渲染 Markdown 为美观的阅读视图（图片、表格、代码高亮）
 
 ### 新建页面
-1. 点击"新建"按钮
-2. 输入页面标题
-3. 编辑内容
-4. 点击"保存页面"
+1. 点击顶部工具栏"+ 新建"按钮 → 标题和内容区清空
+2. 在导航条的"页面标题"输入框中输入标题
+3. 在编辑区编写 Markdown 内容，支持标题、列表、代码块、表格、粗体、斜体等
+4. 点击顶部"保存页面"按钮 → 页面持久化到本地文件
 
-### 编辑页面
-1. 从列表选择页面
-2. 修改标题或内容
-3. 点击"保存页面"保存修改
+### 编辑与更新
+1. 从左侧列表选择已有页面 → 标题和内容自动加载
+2. 直接修改标题或内容 → 点击"保存页面"
+3. 系统自动覆盖原文件
 
 ### 删除页面
-1. 从列表选择页面
-2. 点击"删除"按钮
-3. 确认删除
+1. 选中左侧列表中目标页面
+2. 点击顶部工具栏"删除"按钮 → 确认对话框
+3. 删除操作同时移除本地 .md 文件和索引条目，不可恢复
 
-### 搜索
-1. 在搜索框输入关键词
-2. 点击"搜索"按钮
-3. 结果显示在下方
+### 关键词搜索
+1. 在顶部导航条搜索框输入关键词
+2. 点击"搜索"按钮 → 匹配结果在下拉列表中显示
+3. 点击搜索结果项 → 自动跳转并加载对应页面内容
 
-### 上传文件
-1. 点击"上传文件"按钮
-2. 选择要上传的文件
-3. 文件将自动添加到知识库
+### 上传外部文件
+1. 点击顶部"上传文件"按钮 → 系统文件对话框
+2. 选择任意格式文件（PDF、Word、TXT、图片等）
+3. 文件被复制到知识库并自动注册索引
 
-## 存储位置
-知识库文件存储在: wiki_vault/pages/
-索引文件: wiki_vault/wiki_map.json
+## 存储结构
+
+```
+wiki_vault/
+├── pages/              ← 所有 Markdown 页面文件 (.md)
+│   ├── 传感器配置经验.md
+│   ├── ENLIGHT数据格式说明.md
+│   └── 调试记录_20260527.md
+└── wiki_map.json       ← 页面索引（标题→文件映射）
+```
+
+## 与 AI Agent 的协作
+
+知识库不仅是手动文档工具，更是 AI Agent 的长期记忆载体：
+- **read_wiki_page** — Agent 读取指定页面内容作为推理上下文
+- **write_wiki_page** — Agent 将分析结果、诊断结论自动写入知识库
+- **list_wiki_pages** — Agent 获取所有页面列表
+- **search_wiki_pages** — Agent 按关键词检索相关知识
+
+典型场景：AI 诊断完成后自动将诊断报告写入知识库，下次遇到类似问题时 Agent 可检索历史经验作为参考。
 """
         help_dialog = QDialog(self)
-        help_dialog.setWindowTitle('知识库使用说明')
-        help_dialog.resize(700, 600)
+        help_dialog.setWindowTitle('知识库管理 — 使用说明')
+        help_dialog.resize(800, 700)
 
         layout = QVBoxLayout()
         text_edit = QTextEdit()
@@ -2506,6 +2976,392 @@ class DataProcessorWindow(QMainWindow):
         help_dialog.setLayout(layout)
         help_dialog.exec()
 
+    # ============ 网络剪藏页面 ============
+
+    def create_web_clipper_page(self):
+        """网络剪藏页面 — URL 抓取、图片本地化、视频下载、一键入库"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        # ── 页面标题 ──
+        header = QLabel('网络信息剪藏')
+        header.setStyleSheet('font-size: 18px; font-weight: bold; color: #1890ff; padding: 4px 0;')
+        layout.addWidget(header)
+
+        desc = QLabel('支持微信公众号、学术期刊、Bilibili、YouTube 等平台的图文抓取与多媒体下载，一键存入本地知识库')
+        desc.setWordWrap(True)
+        desc.setStyleSheet('color: #666; font-size: 13px; padding-bottom: 6px;')
+        layout.addWidget(desc)
+
+        # ── URL 输入区 ──
+        url_group = QGroupBox('目标链接')
+        url_group.setStyleSheet("""
+            QGroupBox { border: 1px solid #e0e0e0; border-radius: 8px;
+                font-weight: bold; color: #333; padding: 14px; padding-top: 24px; background: white; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
+        """)
+        url_layout = QVBoxLayout(url_group)
+        url_layout.setSpacing(8)
+
+        url_row = QHBoxLayout()
+        url_row.addWidget(QLabel('URL:'))
+        self.clip_url_input = QLineEdit()
+        self.clip_url_input.setPlaceholderText('粘贴微信公众号 / B站 / YouTube / 学术期刊 链接...')
+        self.clip_url_input.setStyleSheet("""
+            QLineEdit { border: 1px solid #d9d9d9; border-radius: 4px; padding: 10px 12px; font-size: 13px; }
+            QLineEdit:focus { border-color: #1890ff; }
+        """)
+        self.clip_url_input.textChanged.connect(self._on_clip_url_changed)
+        url_row.addWidget(self.clip_url_input, stretch=1)
+
+        paste_btn = QPushButton('粘贴')
+        paste_btn.setStyleSheet("""
+            QPushButton { background: #f0f0f0; border: 1px solid #d9d9d9; border-radius: 4px;
+                padding: 10px 16px; }
+            QPushButton:hover { background: #e0e0e0; }
+        """)
+        paste_btn.clicked.connect(self._on_clip_paste)
+        url_row.addWidget(paste_btn)
+        url_layout.addLayout(url_row)
+
+        # 平台识别标签
+        self.clip_platform_label = QLabel('')
+        self.clip_platform_label.setStyleSheet('color: #999; font-size: 12px;')
+        url_layout.addWidget(self.clip_platform_label)
+
+        # Cookie 提示（仅知乎等需要登录的平台显示）
+        self.clip_cookie_hint = QLabel(
+            '知乎等平台需要登录 Cookie 才能抓取，请在下方"高级选项"中粘贴浏览器 Cookie'
+        )
+        self.clip_cookie_hint.setStyleSheet(
+            'color: #fa8c16; font-size: 12px; padding: 4px 0;'
+        )
+        self.clip_cookie_hint.setWordWrap(True)
+        self.clip_cookie_hint.hide()
+        url_layout.addWidget(self.clip_cookie_hint)
+
+        layout.addWidget(url_group)
+
+        # ── 高级选项 (Cookie) ──
+        self.clip_advanced_group = QGroupBox('高级选项 (Cookie 认证)')
+        self.clip_advanced_group.setStyleSheet("""
+            QGroupBox { border: 1px solid #e0e0e0; border-radius: 6px;
+                font-weight: bold; color: #555; padding: 10px; padding-top: 20px; background: #fafafa; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
+        """)
+        advanced_inner = QVBoxLayout(self.clip_advanced_group)
+        advanced_inner.setSpacing(6)
+
+        cookie_hint = QLabel('粘贴浏览器 Cookie 字符串（从开发者工具 → Network → 请求头 → Cookie 复制）')
+        cookie_hint.setStyleSheet('color: #999; font-size: 11px;')
+        cookie_hint.setWordWrap(True)
+        advanced_inner.addWidget(cookie_hint)
+
+        self.clip_cookie_input = QTextEdit()
+        self.clip_cookie_input.setPlaceholderText('在此粘贴 Cookie...（仅需要登录的网站填写，普通网页留空即可）')
+        self.clip_cookie_input.setMaximumHeight(60)
+        self.clip_cookie_input.setStyleSheet("""
+            QTextEdit { border: 1px solid #d9d9d9; border-radius: 4px; padding: 6px 10px;
+                font-size: 12px; background: white; font-family: 'Consolas', monospace; }
+            QTextEdit:focus { border-color: #1890ff; }
+        """)
+        advanced_inner.addWidget(self.clip_cookie_input)
+
+        # ── Cookie 持久化：启动时加载已保存的 Cookie ──
+        saved_cookie = self._load_app_settings().get('zhihu_cookie', '')
+        if saved_cookie:
+            self.clip_cookie_input.setPlainText(saved_cookie)
+        self.clip_cookie_input.textChanged.connect(self._on_cookie_changed)
+
+        # 默认折叠
+        self.clip_advanced_group.setVisible(False)
+        layout.addWidget(self.clip_advanced_group)
+
+        # ── 展开/折叠高级选项按钮 ──
+        cookie_row = QHBoxLayout()
+        cookie_row.setSpacing(8)
+        self.clip_toggle_advanced_btn = QPushButton('高级选项 ▸')
+        self.clip_toggle_advanced_btn.setStyleSheet("""
+            QPushButton { background: none; border: none; color: #999; font-size: 12px; padding: 2px 0; }
+            QPushButton:hover { color: #1890ff; }
+        """)
+        self.clip_toggle_advanced_btn.clicked.connect(self._on_toggle_advanced)
+        cookie_row.addWidget(self.clip_toggle_advanced_btn)
+        cookie_row.addStretch()
+        layout.addLayout(cookie_row)
+
+        # ── 抓取选项 ──
+        options_row = QHBoxLayout()
+        options_row.setSpacing(16)
+
+        self.clip_download_images_cb = QCheckBox('下载图片到本地')
+        self.clip_download_images_cb.setChecked(True)
+        self.clip_download_images_cb.setStyleSheet('font-size: 13px;')
+        options_row.addWidget(self.clip_download_images_cb)
+
+        self.clip_download_video_cb = QCheckBox('下载视频')
+        self.clip_download_video_cb.setStyleSheet('font-size: 13px;')
+        self.clip_download_video_cb.setEnabled(False)
+        options_row.addWidget(self.clip_download_video_cb)
+
+        options_row.addStretch()
+        layout.addLayout(options_row)
+
+        # ── 操作按钮 ──
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+
+        self.clip_fetch_btn = QPushButton('开始抓取')
+        self.clip_fetch_btn.setStyleSheet("""
+            QPushButton { background-color: #1890ff; color: white; border: none; border-radius: 6px;
+                padding: 12px 32px; font-size: 14px; font-weight: bold; }
+            QPushButton:hover { background-color: #40a9ff; }
+            QPushButton:disabled { background-color: #d9d9d9; color: #999; }
+        """)
+        self.clip_fetch_btn.clicked.connect(self._on_clip_fetch)
+        btn_row.addWidget(self.clip_fetch_btn)
+
+        self.clip_save_btn = QPushButton('保存到知识库')
+        self.clip_save_btn.setStyleSheet("""
+            QPushButton { background-color: #52c41a; color: white; border: none; border-radius: 6px;
+                padding: 12px 28px; font-size: 14px; font-weight: bold; }
+            QPushButton:hover { background-color: #73d13d; }
+            QPushButton:disabled { background-color: #d9d9d9; color: #999; }
+        """)
+        self.clip_save_btn.clicked.connect(self._on_clip_save)
+        self.clip_save_btn.setEnabled(False)
+        btn_row.addWidget(self.clip_save_btn)
+
+        self.clip_clear_btn = QPushButton('清空')
+        self.clip_clear_btn.setStyleSheet("""
+            QPushButton { background: #f0f0f0; border: 1px solid #d9d9d9; border-radius: 6px;
+                padding: 12px 20px; font-size: 13px; }
+            QPushButton:hover { background: #e0e0e0; }
+        """)
+        self.clip_clear_btn.clicked.connect(self._on_clip_clear)
+        btn_row.addWidget(self.clip_clear_btn)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        # ── 状态栏 ──
+        self.clip_status_label = QLabel('就绪 — 粘贴链接后点击"开始抓取"')
+        self.clip_status_label.setStyleSheet(
+            'color: #999; font-size: 12px; padding: 6px 12px; background: #fafafa; border-radius: 4px;'
+        )
+        layout.addWidget(self.clip_status_label)
+
+        # ── 预览区 ──
+        preview_group = QGroupBox('内容预览')
+        preview_group.setStyleSheet("""
+            QGroupBox { border: 1px solid #e0e0e0; border-radius: 8px;
+                font-weight: bold; color: #333; padding: 12px; padding-top: 24px; background: white; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
+        """)
+        preview_layout = QVBoxLayout(preview_group)
+
+        # 预览元信息
+        self.clip_preview_info = QLabel('')
+        self.clip_preview_info.setStyleSheet('color: #1890ff; font-size: 12px; padding: 4px 0;')
+        self.clip_preview_info.setWordWrap(True)
+        preview_layout.addWidget(self.clip_preview_info)
+
+        self.clip_preview_text = QTextEdit()
+        self.clip_preview_text.setReadOnly(True)
+        self.clip_preview_text.setPlaceholderText('抓取的内容将在此预览...')
+        self.clip_preview_text.setStyleSheet("""
+            QTextEdit { border: 1px solid #e0e0e0; border-radius: 4px;
+                padding: 12px; font-size: 13px; line-height: 1.6; background: #fafafa; }
+        """)
+        preview_layout.addWidget(self.clip_preview_text, stretch=1)
+
+        layout.addWidget(preview_group, stretch=1)
+
+        # ── 内部状态 ──
+        self._clipped_title = ''
+        self._clipped_md = ''
+        self._clipped_url = ''
+
+        return page
+
+    # ── 剪藏事件处理 ──
+
+    def _on_clip_url_changed(self, text: str) -> None:
+        """URL 变化时自动识别平台"""
+        text_lower = text.lower()
+        if 'mp.weixin.qq.com' in text_lower:
+            self.clip_platform_label.setText('已识别: 微信公众号')
+            self.clip_platform_label.setStyleSheet('color: #52c41a; font-size: 12px;')
+            self.clip_download_video_cb.setEnabled(False)
+            self.clip_download_video_cb.setChecked(False)
+            self.clip_cookie_hint.hide()
+        elif 'zhihu.com' in text_lower:
+            self.clip_platform_label.setText('已识别: 知乎 — 需粘贴 Cookie')
+            self.clip_platform_label.setStyleSheet('color: #fa8c16; font-size: 12px;')
+            self.clip_download_video_cb.setEnabled(False)
+            self.clip_download_video_cb.setChecked(False)
+            self.clip_cookie_hint.show()
+            # 自动展开高级选项
+            if not self.clip_advanced_group.isVisible():
+                self._on_toggle_advanced()
+        elif 'bilibili.com' in text_lower:
+            self.clip_platform_label.setText('已识别: Bilibili')
+            self.clip_platform_label.setStyleSheet('color: #fa8c16; font-size: 12px;')
+            self.clip_download_video_cb.setEnabled(True)
+            self.clip_cookie_hint.hide()
+        elif 'youtube.com' in text_lower or 'youtu.be' in text_lower:
+            self.clip_platform_label.setText('已识别: YouTube')
+            self.clip_platform_label.setStyleSheet('color: #ff4d4f; font-size: 12px;')
+            self.clip_download_video_cb.setEnabled(True)
+            self.clip_cookie_hint.hide()
+        elif 'arxiv.org' in text_lower or 'doi.org' in text_lower or 'scholar' in text_lower:
+            self.clip_platform_label.setText('已识别: 学术期刊')
+            self.clip_platform_label.setStyleSheet('color: #722ed1; font-size: 12px;')
+            self.clip_download_video_cb.setEnabled(False)
+            self.clip_download_video_cb.setChecked(False)
+            self.clip_cookie_hint.hide()
+        elif not text.strip():
+            self.clip_platform_label.setText('')
+            self.clip_download_video_cb.setEnabled(False)
+            self.clip_download_video_cb.setChecked(False)
+            self.clip_cookie_hint.hide()
+        else:
+            self.clip_platform_label.setText('已识别: 通用网页')
+            self.clip_platform_label.setStyleSheet('color: #999; font-size: 12px;')
+            self.clip_download_video_cb.setEnabled(False)
+            self.clip_download_video_cb.setChecked(False)
+            self.clip_cookie_hint.hide()
+
+    def _on_cookie_changed(self) -> None:
+        """Cookie 变更时自动持久化保存"""
+        cookies = self.clip_cookie_input.toPlainText().strip()
+        self._save_app_setting('zhihu_cookie', cookies)
+
+    def _on_toggle_advanced(self) -> None:
+        """展开/折叠高级选项"""
+        visible = not self.clip_advanced_group.isVisible()
+        self.clip_advanced_group.setVisible(visible)
+        self.clip_toggle_advanced_btn.setText('高级选项 ▾' if visible else '高级选项 ▸')
+
+    def _on_clip_paste(self) -> None:
+        """从剪贴板粘贴 URL"""
+        from PyQt6.QtWidgets import QApplication
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        if text:
+            self.clip_url_input.setText(text.strip())
+
+    def _on_clip_fetch(self) -> None:
+        """执行抓取"""
+        url = self.clip_url_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, '提示', '请输入目标 URL')
+            return
+
+        self.clip_fetch_btn.setEnabled(False)
+        self.clip_status_label.setText('正在抓取网页内容...')
+        self.clip_status_label.setStyleSheet(
+            'color: #faad14; font-size: 12px; padding: 6px 12px; background: #fffbe6; border-radius: 4px;'
+        )
+        QApplication.processEvents()
+
+        try:
+            from py.web_clipper import WebClipper
+
+            clipper = WebClipper()
+            cookies = self.clip_cookie_input.toPlainText().strip()
+            title, md_body = clipper.fetch_article(url, cookies=cookies)
+            self._clipped_title = title
+            self._clipped_md = md_body
+            self._clipped_url = url
+
+            self.clip_preview_info.setText(f'标题: {title}\n来源: {url}')
+            preview_display = md_body[:5000] + ('...' if len(md_body) > 5000 else '')
+            self.clip_preview_text.setPlainText(preview_display)
+
+            self.clip_save_btn.setEnabled(True)
+            self.clip_status_label.setText(f'抓取成功 — 正文 {len(md_body)} 字符')
+            self.clip_status_label.setStyleSheet(
+                'color: #52c41a; font-size: 12px; padding: 6px 12px; background: #f6ffed; border-radius: 4px;'
+            )
+        except Exception as e:
+            import traceback
+            self.clip_status_label.setText(f'抓取失败: {str(e)}')
+            self.clip_status_label.setStyleSheet(
+                'color: #ff4d4f; font-size: 12px; padding: 6px 12px; background: #fff1f0; border-radius: 4px;'
+            )
+            QMessageBox.critical(self, '抓取失败', f'{str(e)}\n\n{traceback.format_exc()}')
+        finally:
+            self.clip_fetch_btn.setEnabled(True)
+
+    def _on_clip_save(self) -> None:
+        """保存到知识库（含图片下载）"""
+        if not self._clipped_md:
+            QMessageBox.warning(self, '提示', '请先抓取网页内容')
+            return
+
+        self.clip_save_btn.setEnabled(False)
+        self.clip_status_label.setText('正在下载图片并保存到知识库...')
+        self.clip_status_label.setStyleSheet(
+            'color: #faad14; font-size: 12px; padding: 6px 12px; background: #fffbe6; border-radius: 4px;'
+        )
+        QApplication.processEvents()
+
+        try:
+            from py.web_clipper import WebClipper
+
+            clipper = WebClipper()
+            md_content = self._clipped_md
+
+            if self.clip_download_images_cb.isChecked():
+                cookies = self.clip_cookie_input.toPlainText().strip()
+                md_content = clipper.download_and_replace_images(md_content, cookies=cookies, referer=self._clipped_url)
+
+            if self.clip_download_video_cb.isChecked():
+                video_path = clipper.download_video(self._clipped_url)
+                if video_path:
+                    md_content += f'\n\n> 视频已下载: {video_path}\n'
+
+            saved_path = clipper.save_to_wiki(self._clipped_url, self._clipped_title, md_content)
+
+            # 更新预览
+            self.clip_preview_text.setPlainText(md_content[:5000] + ('...' if len(md_content) > 5000 else ''))
+            self._clipped_md = md_content
+
+            # 刷新知识库页面列表
+            self.refresh_wiki_pages()
+
+            self.clip_status_label.setText(f'已保存 → {saved_path}')
+            self.clip_status_label.setStyleSheet(
+                'color: #52c41a; font-size: 12px; padding: 6px 12px; background: #f6ffed; border-radius: 4px;'
+            )
+        except Exception as e:
+            import traceback
+            self.clip_status_label.setText(f'保存失败: {str(e)}')
+            self.clip_status_label.setStyleSheet(
+                'color: #ff4d4f; font-size: 12px; padding: 6px 12px; background: #fff1f0; border-radius: 4px;'
+            )
+            QMessageBox.critical(self, '保存失败', f'{str(e)}\n\n{traceback.format_exc()}')
+        finally:
+            self.clip_save_btn.setEnabled(True)
+
+    def _on_clip_clear(self) -> None:
+        """清空抓取内容"""
+        self.clip_url_input.clear()
+        self.clip_preview_text.clear()
+        self.clip_preview_info.clear()
+        self.clip_platform_label.clear()
+        self.clip_status_label.setText('就绪 — 粘贴链接后点击"开始抓取"')
+        self.clip_status_label.setStyleSheet(
+            'color: #999; font-size: 12px; padding: 6px 12px; background: #fafafa; border-radius: 4px;'
+        )
+        self.clip_save_btn.setEnabled(False)
+        self._clipped_title = ''
+        self._clipped_md = ''
+        self._clipped_url = ''
+
     # ============ 技能插件中心页面 ============
     def create_skill_center_page(self):
         """技能插件中心页面"""
@@ -2513,8 +3369,9 @@ class DataProcessorWindow(QMainWindow):
         main_layout = QVBoxLayout()
 
         # 说明标签
-        info_label = QLabel('技能插件中心：管理AI Agent技能，支持从GitHub加载自定义技能')
-        info_label.setStyleSheet('color: #666; padding: 10px;')
+        info_label = QLabel('技能插件中心 — AI Agent 能力调度中枢：管理内置技能与 GitHub 自定义技能的启用/禁用、加载/卸载，支持 Agent 思考日志实时追踪')
+        info_label.setStyleSheet('color: #555; padding: 12px; font-size: 13px; background: #f0f5ff; border-radius: 6px;')
+        info_label.setWordWrap(True)
         main_layout.addWidget(info_label)
 
         # 技能表格区域
@@ -2674,50 +3531,88 @@ class DataProcessorWindow(QMainWindow):
 
     def show_skill_center_help(self):
         """显示技能中心使用说明"""
-        help_text = """# 技能插件中心使用说明
+        help_text = """# 技能插件中心 — 使用说明
 
 ## 功能概述
-技能插件中心允许你管理和加载AI Agent技能，包括内置技能和自定义GitHub技能。
 
-## 内置技能
+技能插件中心是 AI Agent 的能力调度中枢，管理 Agent 可调用的所有技能（Skills）。每项技能都是一个独立的功能模块，Agent 根据任务需求自动选择合适的技能组合来完成任务。用户可以自由启用/禁用内置技能，也可以从 GitHub 加载社区或自定义技能，实现 Agent 能力的灵活扩展。
 
+核心定位：技能 = Agent 的"工具箱"。不同的技能组合决定了 Agent 能解决什么类型的问题。技能中心让你像管理手机 App 一样管理 Agent 的能力。
+
+## 核心特点
+
+1. **内置技能一键开关** — 10 项内置技能以表格管理，勾选即可启用，取消即禁用，无需重启
+2. **GitHub 远程加载** — 支持从任意 GitHub 仓库（公开或私有）下载技能文件，自动注册为可用技能
+3. **Agent 思考日志** — 黑色终端风格实时日志窗口，以颜色编码区分不同类型的 Agent 操作，便于追踪和调试
+4. **技能状态可视化** — "查看已加载"一键列出当前所有技能及启用状态
+5. **模块化架构** — 每项技能独立封装，互不干扰，新增技能不影响已有功能
+6. **与知识库深度集成** — Wiki 系列技能（读/写/列表/搜索）让 Agent 直接操作知识库，形成"学习→记忆→复用"闭环
+
+## 内置技能详解
+
+### 计算与分析类
 | 技能名称 | 功能说明 |
 |---------|---------|
-| Python_REPL | Python沙箱执行器 |
-| arxiv | 学术文献搜索 |
-| ddg_search | 联网搜索 |
-| wikipedia | 维基百科 |
-| apply_butterworth_filter | 巴特沃斯滤波 |
-| execute_custom_formula | 自定义公式 |
-| read_wiki_page | Wiki读 |
-| write_wiki_page | Wiki写 |
-| list_wiki_pages | Wiki列表 |
-| search_wiki_pages | Wiki搜索 |
+| Python_REPL | Python 交互式沙箱执行器，Agent 可编写并运行 Python 代码进行数值计算、数据转换、图表生成等 |
+| execute_custom_formula | 执行用户自定义数学公式，支持变量代入，适用于传感器标定、物理量换算 |
+| apply_butterworth_filter | 巴特沃斯数字滤波器，支持低通/高通/带通/带阻模式，用于信号去噪和平滑处理 |
 
-## 从GitHub加载技能
+### 知识检索类
+| 技能名称 | 功能说明 |
+|---------|---------|
+| arxiv | 学术文献搜索引擎，检索 arXiv 预印本论文，适用于文献调研和理论基础查询 |
+| ddg_search | DuckDuckGo 联网搜索，获取互联网公开信息，不依赖特定搜索引擎 API |
+| wikipedia | 维基百科百科查询，快速获取概念定义、公式、背景知识 |
 
-1. 填写仓库信息：
-   - 仓库所有者
-   - 仓库名称
-   - 文件路径（如 skills/）
-   - 分支（默认 main）
-   - GitHub Token（可选，私有仓库需要）
+### Wiki 知识库操作类
+| 技能名称 | 功能说明 |
+|---------|---------|
+| read_wiki_page | 读取知识库中指定页面的完整内容，作为 Agent 推理的上下文参考 |
+| write_wiki_page | 将 Agent 的分析结果、诊断报告写入知识库，实现自动知识沉淀 |
+| list_wiki_pages | 列出知识库中所有页面标题，供 Agent 了解可用知识范围 |
+| search_wiki_pages | 按关键词模糊搜索知识库内容，Agent 根据相关性筛选参考材料 |
 
-2. 点击"下载并加载技能"
+## 从 GitHub 加载自定义技能
 
-3. 查看已加载技能列表
+### 参数说明
+- **仓库所有者 (Owner):** GitHub 用户名或组织名，如 `anthropics`
+- **仓库名称 (Repo):** 仓库名，如 `claude-code`
+- **文件路径 (Path):** 技能文件在仓库中的目录路径，默认 `skills/`
+- **分支 (Branch):** 目标分支名，默认 `main`，可选 `master`、`dev` 等
+- **GitHub Token:** 个人访问令牌 (Personal Access Token)，公开仓库可不填，私有仓库必填
 
-## Agent日志颜色说明
+### 操作步骤
+1. 确保目标 GitHub 仓库包含符合规范的技能文件（Markdown 格式，含 YAML frontmatter）
+2. 依次填写仓库所有者、仓库名称、文件路径、分支
+3. 私有仓库需填入有效的 GitHub Token（需具备 repo 读取权限）
+4. 点击绿色"下载并加载技能"按钮 → Agent 日志区显示加载进度
+5. 加载成功后技能自动出现在内置技能列表中，可勾选启用
 
-- 绿色：代码执行
-- 蓝色：搜索操作
-- 橙色：AI思考
-- 紫色：Wiki操作
-- 红色：错误
+### Token 获取方式
+访问 GitHub Settings → Developer settings → Personal access tokens → Generate new token (classic)，勾选 `repo` 权限即可。
+
+## Agent 思考日志 — 颜色编码
+
+日志区采用终端深色主题，不同操作以不同颜色标记，便于快速定位：
+
+| 颜色 | 含义 | 典型场景 |
+|------|------|---------|
+| <span style="color: #52c41a;">绿色</span> | 代码/公式执行 | Python 计算、滤波处理、公式求值 |
+| <span style="color: #1890ff;">蓝色</span> | 搜索/查询操作 | 学术搜索、联网搜索、Wiki 检索 |
+| <span style="color: #faad14;">橙色</span> | AI 推理/思考 | Agent 决策链路、任务规划过程 |
+| <span style="color: #9254de;">紫色</span> | Wiki 操作 | 页面读写、列表刷新 |
+| <span style="color: #ff4d4f;">红色</span> | 错误/警告 | 加载失败、执行异常、参数错误 |
+
+## 典型使用场景
+
+1. **数据分析流程:** 启用 Python_REPL + execute_custom_formula + apply_butterworth_filter → Agent 自动完成"读取数据 → 执行公式 → 滤波去噪 → 输出结果"完整链路
+2. **文献辅助:** 启用 arxiv + wikipedia + ddg_search → Agent 以多信源交叉验证方式回答专业问题
+3. **知识沉淀闭环:** 启用 Wiki 系列全套技能 → AI 诊断完成后自动将诊断报告存入知识库，下次遇到相似问题时 Agent 先检索历史经验
+4. **自定义扩展:** 从 GitHub 加载团队内部技能库 → Agent 获得领域专属能力（如特定传感器协议解析）
 """
         help_dialog = QDialog(self)
-        help_dialog.setWindowTitle('技能插件中心使用说明')
-        help_dialog.resize(800, 650)
+        help_dialog.setWindowTitle('技能插件中心 — 使用说明')
+        help_dialog.resize(850, 750)
 
         layout = QVBoxLayout()
         text_edit = QTextEdit()
@@ -2927,6 +3822,7 @@ Only analyze the file list, don't read specific content."""
                 'version': '2.0',
                 'fbgs': [],
                 'sensors': [],
+                'global_parameters': self.sensor_system.global_parameters,
                 'project_files': [],
                 'data_tab': {},
                 'cleaning_tab': {},
@@ -3001,6 +3897,7 @@ Only analyze the file list, don't read specific content."""
                 f'配置已保存到:\n{file_path}\n\n'
                 f'  FBG: {len(config["fbgs"])} 个\n'
                 f'  传感器: {len(config["sensors"])} 个\n'
+                f'  全局参数: {len(config["global_parameters"])} 个\n'
                 f'  {data_info}\n'
                 f'  清洗规则: 已保存\n'
                 f'  分析结果: {result_count} 个结果列')
@@ -3040,12 +3937,39 @@ Only analyze the file list, don't read specific content."""
                 fbg_count += 1
 
             self.sensor_system.sensors.clear()
+
+            # 加载全局参数 (SSOT)，旧配置自动迁移
+            if 'global_parameters' in config:
+                self.sensor_system.global_parameters = config['global_parameters']
+            else:
+                # 自动迁移: 扫描所有传感器，提取同名同值的共用常量
+                const_usage = {}  # name -> [(value, sensor_id), ...]
+                for s in config.get('sensors', []):
+                    for name, value in s.get('constants', {}).items():
+                        const_usage.setdefault(name, []).append((value, s['id']))
+                migrated = {}
+                for name, entries in const_usage.items():
+                    if len(entries) >= 2:
+                        values = [v for v, _ in entries]
+                        if len(set(values)) == 1:
+                            migrated[name] = values[0]
+                if migrated:
+                    print(f"[迁移] 从传感器局部常量提取全局参数: {migrated}")
+                self.sensor_system.global_parameters = migrated
+
             for sensor_data in config.get('sensors', []):
+                sensor_constants = sensor_data.get('constants', {})
+                # 从局部常量中剔除已迁移到全局的参数
+                if self.sensor_system.global_parameters:
+                    sensor_constants = {
+                        k: v for k, v in sensor_constants.items()
+                        if k not in self.sensor_system.global_parameters
+                    }
                 sensor = Sensor(
                     sensor_data['id'],
                     sensor_data['sensor_type'],
                     sensor_data.get('formula'),
-                    sensor_data.get('constants', {}),
+                    sensor_constants,
                     sensor_data.get('active', True),
                     sensor_data.get('decoupling_config'),
                     sensor_data.get('location', ''),
@@ -3091,7 +4015,8 @@ Only analyze the file list, don't read specific content."""
                     self.file_header_lines = data_tab.get('file_header_lines', [])
                     self.current_columns = data_tab.get('current_columns', [str(c) for c in df.columns])
                     self.update_data_table()
-                    self._auto_populate_fbgs(df)
+                    if fbg_count == 0:
+                        self._auto_populate_fbgs(df)
                     self.add_recent_file(data_path, template.id)
                     data_loaded = True
                     messages.append(f'数据文件: {os.path.basename(data_path)} ({len(df)} 行)')
@@ -3116,6 +4041,14 @@ Only analyze the file list, don't read specific content."""
                 except Exception as e:
                     messages.append(f'清洗规则恢复失败: {str(e)}')
 
+            # 数据文件和清洗规则都恢复后，自动应用清洗
+            if data_loaded and cleaning_restored:
+                try:
+                    self.apply_cleaning(silent=True)
+                    messages.append('数据清洗: 已自动应用')
+                except Exception:
+                    pass
+
             # ---- 数据分析模块 ----
             analysis_tab = config.get('analysis_tab', {})
             if analysis_tab:
@@ -3139,6 +4072,7 @@ Only analyze the file list, don't read specific content."""
                         for key, values in saved_results.items():
                             restored_results[key] = [np.nan if v is None else v for v in values]
                         self.sensor_results = restored_results
+                        self._update_sensor_result_table(restored_results)
                         analysis_restored = True
                         messages.append(f'分析结果: {len(restored_results)} 个列')
                     else:
@@ -3607,25 +4541,28 @@ Only analyze the file list, don't read specific content."""
         return True
 
     def _load_file_header_lines(self, file_path, skip_rows):
-        """读取文件的格式头行（数据行之前的所有行，包括列头行）"""
+        """读取文件的格式头行，最多读取前500行以定位数据起始行"""
         try:
             for enc in ('utf-8', 'gbk', 'latin-1'):
                 try:
                     with open(file_path, 'r', encoding=enc) as f:
-                        lines = f.readlines()
+                        head_lines = []
+                        for _ in range(500):
+                            line = f.readline()
+                            if not line:
+                                break
+                            head_lines.append(line)
                     break
                 except UnicodeDecodeError:
                     continue
 
-            # 查找数据起始行：包含Timestamp的行之后的行
             data_start = skip_rows
-            for i, line in enumerate(lines):
+            for i, line in enumerate(head_lines):
                 if 'Timestamp' in line and ('# CH' in line or 'CH' in line):
-                    data_start = i + 1  # 数据从header下一行开始
+                    data_start = i + 1
                     break
 
-            # 格式头 = 数据起始行之前的所有行
-            self.file_header_lines = lines[:data_start] if data_start > 0 else []
+            self.file_header_lines = head_lines[:data_start] if data_start > 0 else []
         except Exception:
             self.file_header_lines = []
 
@@ -3945,42 +4882,53 @@ Only analyze the file list, don't read specific content."""
         except Exception:
             pass
 
+    MAX_DISPLAY_ROWS = 1000
+
     def update_data_table(self):
         if self.current_data is None:
             return
 
-        # 确保data_table存在
         if not hasattr(self, 'data_table') or self.data_table is None:
-            # 创建data_table
             self.data_table = QTableWidget()
             self.data_table.setAlternatingRowColors(True)
-            # 添加到数据标签页
             if hasattr(self, 'data_tab') and self.data_tab.layout():
                 self.data_tab.layout().addWidget(self.data_table)
 
         df = self.current_data
-        self.data_table.setRowCount(len(df))
-        self.data_table.setColumnCount(len(df.columns))
-        self.data_table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+        total_rows = len(df)
+        display_rows = min(total_rows, self.MAX_DISPLAY_ROWS)
+        cols = [str(c) for c in df.columns]
 
-        for i, row in df.iterrows():
-            for j, value in enumerate(row):
-                item = QTableWidgetItem(str(value))
-                self.data_table.setItem(i, j, item)
+        self.data_table.setUpdatesEnabled(False)
+        self.data_table.setRowCount(display_rows)
+        self.data_table.setColumnCount(len(cols))
+        self.data_table.setHorizontalHeaderLabels(cols)
 
+        for j, col_name in enumerate(cols):
+            col_values = df[col_name].values[:display_rows]
+            for i in range(display_rows):
+                self.data_table.setItem(i, j, QTableWidgetItem(str(col_values[i])))
+
+        self.data_table.setUpdatesEnabled(True)
         self.data_table.resizeColumnsToContents()
+
+        if total_rows > self.MAX_DISPLAY_ROWS:
+            self.data_info_label.setText(
+                f'显示前 {self.MAX_DISPLAY_ROWS:,} 行 / 共 {total_rows:,} 行'
+            )
+        else:
+            self.data_info_label.setText(f'共 {total_rows:,} 行')
 
     # ============ Cleaning Operations ============
 
-    def apply_cleaning(self):
+    def apply_cleaning(self, silent=False):
         if self.current_data is None:
-            QMessageBox.warning(self, '警告', '请先加载数据')
-            return
+            if not silent:
+                QMessageBox.warning(self, '警告', '请先加载数据')
+            return False
 
-        # Build rules based on UI settings
         rules = []
 
-        # Rule 1: Adjacent difference detection
         if self.adjacent_enabled.isChecked():
             rules.append(CleaningRule(
                 '相邻差值',
@@ -3991,7 +4939,6 @@ Only analyze the file list, don't read specific content."""
                 self.custom_fill_value.value() if self.fill_method_combo.currentText() == 'custom' else None
             ))
 
-        # Rule 2: NaN detection
         if self.nan_enabled.isChecked():
             rules.append(CleaningRule(
                 '缺失值',
@@ -4003,23 +4950,36 @@ Only analyze the file list, don't read specific content."""
             ))
 
         try:
-            df = clean_data(self.current_data, rules)
+            # 光纤模板仅对波长相关列进行清洗，两种子类型策略不同：
+            #   enlight:      基础 ENLIGHT 模板 → 匹配 "波长" 开头列
+            #   fiber_custom: 公式版自定义模板  → 匹配 "FBG" 开头列
+            col_pattern = None
+            if self.current_template:
+                fmt = getattr(self.current_template, 'file_format', '')
+                if fmt == 'enlight':
+                    col_pattern = r'^波长'
+                elif fmt == 'fiber_custom':
+                    col_pattern = r'^FBG'
+            df = clean_data(self.current_data, rules, column_pattern=col_pattern)
             self.current_data = df
             self.update_data_table()
 
-            # Count anomalies
             anomaly_cols = [col for col in df.columns if col.endswith('_anomaly')]
             total_anomalies = sum(df[col].sum() for col in anomaly_cols)
 
             self.cleaning_result.setText(f'检测到 {total_anomalies} 个异常数据点\n'
                                          f'异常列: {[col.replace("_anomaly", "") for col in anomaly_cols]}')
 
-            self.status_bar.showMessage(f'数据清洗完成，发现 {total_anomalies} 个异常')
-            QMessageBox.information(self, '成功', f'数据清洗完成，发现 {total_anomalies} 个异常')
+            if not silent:
+                self.status_bar.showMessage(f'数据清洗完成，发现 {total_anomalies} 个异常')
+                QMessageBox.information(self, '成功', f'数据清洗完成，发现 {total_anomalies} 个异常')
+            return True
 
         except Exception as e:
             import traceback
-            QMessageBox.critical(self, '错误', f'清洗失败: {str(e)}\n\n{traceback.format_exc()}')
+            if not silent:
+                QMessageBox.critical(self, '错误', f'清洗失败: {str(e)}\n\n{traceback.format_exc()}')
+            return False
 
     def save_data(self):
         if self.current_data is None:
@@ -4181,26 +5141,19 @@ class SensorEditDialog(QDialog):
         self.expr_layout.addWidget(self.expr_input)
         layout.addLayout(self.expr_layout)
 
-        # Constants (hidden for decoupling)
-        self.const_group = QGroupBox('常量')
+        # 全局参数提示 (常量由全局变量池统一管理)
+        self.const_group = QGroupBox('全局参数 (自动注入)')
         const_layout = QVBoxLayout()
 
-        self.const_inputs = {}
-        if sensor and sensor.constants:
-            for name, value in sensor.constants.items():
-                row = QHBoxLayout()
-                row.addWidget(QLabel(f'{name}:'))
-                input_field = QDoubleSpinBox()
-                input_field.setRange(-1e10, 1e10)
-                input_field.setDecimals(2)
-                input_field.setValue(value)
-                row.addWidget(input_field)
-                self.const_inputs[name] = input_field
-                const_layout.addLayout(row)
+        self.global_params_hint = QLabel('')
+        self.global_params_hint.setStyleSheet(
+            'color: #1890ff; font-size: 12px; padding: 8px; background: #e6f7ff; '
+            'border: 1px solid #91d5ff; border-radius: 4px;'
+        )
+        self.global_params_hint.setWordWrap(True)
+        self._update_global_hint()
+        const_layout.addWidget(self.global_params_hint)
 
-        add_const_btn = QPushButton('添加常量')
-        add_const_btn.clicked.connect(self.add_constant)
-        const_layout.addWidget(add_const_btn)
         self.const_group.setLayout(const_layout)
         layout.addWidget(self.const_group)
 
@@ -4314,6 +5267,25 @@ class SensorEditDialog(QDialog):
 
         self.setLayout(layout)
 
+    def _update_global_hint(self):
+        """更新全局参数提示标签"""
+        if not self.parent_window or not hasattr(self.parent_window, 'sensor_system'):
+            self.global_params_hint.setVisible(False)
+            return
+        gp = self.parent_window.sensor_system.global_parameters
+        if not gp:
+            self.global_params_hint.setText('[全局参数池为空]')
+            self.global_params_hint.setVisible(True)
+            return
+        def _fmt(num):
+            return f'{num:.2f}'
+        items = ', '.join(
+            f'{k}={_fmt(v.get("value", 0) if isinstance(v, dict) else v)}'
+            for k, v in gp.items()
+        )
+        self.global_params_hint.setText(f'全局参数 (自动注入): {items}')
+        self.global_params_hint.setVisible(True)
+
     def _on_type_changed(self, text):
         """当传感器类型改变时切换表单显示"""
         is_decoupling = text.startswith('decoupling')
@@ -4323,46 +5295,8 @@ class SensorEditDialog(QDialog):
         self.decoupling_panel.setVisible(is_decoupling)
 
     def _on_formula_changed(self, text):
-        """当公式文本变化时，自动检测 k 变量并创建常量输入框"""
-        import re
-        k_vars = set(re.findall(r'\b[kK]\d+\b', text))
-        # 标准化为小写
-        needed = set()
-        for v in k_vars:
-            needed.add(v.lower())
-
-        # 为缺失的常量自动创建输入框
-        for name in sorted(needed):
-            if name not in self.const_inputs:
-                row = QHBoxLayout()
-                name_label = QLabel(f'{name}:')
-                name_label.setMinimumWidth(40)
-                row.addWidget(name_label)
-                value_input = QDoubleSpinBox()
-                value_input.setRange(-1e10, 1e10)
-                value_input.setDecimals(2)
-                value_input.setValue(1.0)
-                row.addWidget(value_input)
-                self.const_inputs[name] = value_input
-                const_layout = self.const_group.layout()
-                const_layout.insertLayout(const_layout.count() - 1, row)
-
-    def add_constant(self):
-        name = f'k{len(self.const_inputs) + 1}'
-        row = QHBoxLayout()
-        name_label = QLabel(f'{name}:')
-        name_label.setMinimumWidth(40)
-        row.addWidget(name_label)
-
-        value_input = QDoubleSpinBox()
-        value_input.setRange(-1e10, 1e10)
-        value_input.setDecimals(2)
-        value_input.setValue(1.0)
-        row.addWidget(value_input)
-        self.const_inputs[name] = value_input
-
-        const_layout = self.const_group.layout()
-        const_layout.insertLayout(const_layout.count() - 1, row)
+        """公式文本变化时刷新全局参数提示"""
+        self._update_global_hint()
 
     def get_sensor(self):
         sensor_type = self.type_combo.currentText().split(':')[0]
@@ -4385,12 +5319,11 @@ class SensorEditDialog(QDialog):
                 location=self.location_input.text(),
             )
         else:
-            constants = {name: input_field.value() for name, input_field in self.const_inputs.items()}
             return Sensor(
                 self.id_input.text(),
                 sensor_type,
                 self.expr_input.text(),
-                constants,
+                {},  # 常量由全局参数池统一注入，传感器不再持有局部常量
                 self.active_check.isChecked(),
                 location=self.location_input.text(),
             )

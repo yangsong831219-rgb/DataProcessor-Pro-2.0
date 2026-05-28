@@ -198,7 +198,24 @@ class AnalysisTabWidget(QWidget):
 
     # ── 传感器信息辅助 ──
 
+    @staticmethod
+    def _parse_result_key(sensor_id: str):
+        """从传感器结果键中提取 (显示名称, 单位)。
+
+        处理两种格式：
+        - 普通传感器: sensor_id 直接查询 Sensor 对象
+        - 解耦传感器: "S1_应变(με)" → ("应变", "με")
+        """
+        import re
+        m = re.match(r'^(.+)_(应变|温度)\((.+)\)$', sensor_id)
+        if m:
+            return m.group(2), m.group(3)
+        return sensor_id, ''
+
     def _get_sensor_unit(self, sensor_id: str) -> str:
+        display, unit = self._parse_result_key(sensor_id)
+        if unit:
+            return unit
         ss = self._get_sensor_system()
         if ss:
             for sensor in ss.sensors:
@@ -207,6 +224,9 @@ class AnalysisTabWidget(QWidget):
         return ''
 
     def _get_sensor_display_name(self, sensor_id: str) -> str:
+        display, unit = self._parse_result_key(sensor_id)
+        if unit:
+            return display
         ss = self._get_sensor_system()
         if ss:
             for sensor in ss.sensors:
@@ -462,7 +482,8 @@ class AnalysisTabWidget(QWidget):
             else:
                 data_cols = [c for c in current_data.columns
                             if c != '时间' and '计数' not in str(c)
-                            and not str(c).startswith('CH')]
+                            and not str(c).startswith('CH')
+                            and pd.api.types.is_numeric_dtype(current_data[c])]
                 if not data_cols:
                     QMessageBox.warning(self, '警告', '没有可用的数据列')
                     return

@@ -42,7 +42,14 @@ class FormulaEngine:
 
 engine = FormulaEngine()
 
-def calculate(formula: str, columns: dict[str, list[float]], params: dict[str, float]) -> list[float]:
+def calculate(formula: str, columns: dict[str, list[float]], params: dict[str, float],
+              global_params: dict[str, float] = None) -> list[float]:
     engine.columns = columns
-    engine.params = params
+    # SSOT: 全局参数打底，局部常量覆盖 (全局优先)
+    merged = {}
+    if global_params:
+        merged.update(global_params)
+    merged.update(params or {})
+    # 归一化：dict 格式 {value, unit, description} → 浮点数
+    engine.params = {k: (v.get('value', 0) if isinstance(v, dict) else v) for k, v in merged.items()}
     return engine.evaluate(formula)

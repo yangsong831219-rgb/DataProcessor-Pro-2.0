@@ -139,6 +139,12 @@ def _get_local_tools() -> List[BaseTool]:
         wiki = WikiFileSystem()
         return wiki.search_pages(keyword)
 
+    @tool
+    def semantic_search_wiki(query: str, top_k: int = 3) -> str:
+        """语义向量搜索知识库 — 按语义相似度查找最相关的历史案例页面"""
+        wiki = WikiFileSystem()
+        return wiki.semantic_search(query, top_k)
+
     return [
         apply_butterworth_filter,
         execute_custom_formula,
@@ -146,6 +152,7 @@ def _get_local_tools() -> List[BaseTool]:
         write_wiki_page,
         list_wiki_pages,
         search_wiki_pages,
+        semantic_search_wiki,
     ]
 
 

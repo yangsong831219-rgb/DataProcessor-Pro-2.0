@@ -12,3 +12,7 @@ requests>=2.28.0
 # Local LLM (llama-cpp-python) - GPU加速
 # Install with: $env:CMAKE_ARGS="-DGGML_CUDA=on"; pip install llama-cpp-python
 llama-cpp-python>=0.2.0
+
+# 语义搜索 (知识库向量检索引擎)
+chromadb>=0.4.0
+sentence-transformers>=2.2.0

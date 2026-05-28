@@ -7,12 +7,30 @@ from .models import (
     ALLOWED_TEMPLATE_EXTENSIONS_WORD,
     ContentBlock,
     FileItem,
+    GenerationEvent,
+    OutlineSection,
+    PPTReport,
+    PPTSlide,
     ReportConfig,
+    ReportOutline,
     ReportSpec,
     Section,
+    WordReport,
+    WordSection,
+    WordTable,
 )
 
 __all__ = [
+    # New structured models
+    'ReportOutline',
+    'OutlineSection',
+    'WordReport',
+    'WordSection',
+    'WordTable',
+    'PPTReport',
+    'PPTSlide',
+    'GenerationEvent',
+    # Legacy (kept for compatibility)
     'ContentBlock',
     'Section',
     'ReportSpec',
