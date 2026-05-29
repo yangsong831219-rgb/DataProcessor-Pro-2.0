@@ -21,6 +21,12 @@ ai_models_config.json
 # CodeGraph
 .codegraph/
 
+# App settings (may contain cookies/tokens)
+.app_settings.json
+
+# Temp screenshots
+screenshot_temp.png
+
 # OS files
 Thumbs.db
 .DS_Store

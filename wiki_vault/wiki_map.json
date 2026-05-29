@@ -1,5 +1,23 @@
 {
   "version": "1.0",
-  "last_updated": "2026-05-25",
-  "index": {}
+  "last_updated": "2026-05-28",
+  "index": {
+    "Hermes+Obsidian+LLM Wiki搭建本地知识库": {
+      "path": "pages/Hermes+Obsidian+LLM Wiki搭建本地知识库.md",
+      "tags": [],
+      "summary": ""
+    },
+    "首页": {
+      "path": "pages/首页.md",
+      "tags": [],
+      "summary": ""
+    },
+    "如何利用大模型搭建本地知识库？ - 知乎": {
+      "path": "pages/如何利用大模型搭建本地知识库？ - 知乎.md",
+      "tags": [
+        "web_clip"
+      ],
+      "summary": "剪藏自: 如何利用大模型搭建本地知识库？ - 知乎"
+    }
+  }
 }
