@@ -8,14 +8,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import re as _re
 import numpy as np
 import pandas as pd
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QPushButton, QLabel, QComboBox, QSpinBox, QListWidget, QListWidgetItem,
-    QTextEdit, QFileDialog, QMessageBox,
+    QTextEdit, QFileDialog, QMessageBox, QDialog,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.backend_qt import NavigationToolbar2QT
@@ -27,9 +28,17 @@ if TYPE_CHECKING:
 class AnalysisTabWidget(QWidget):
     """数据分析选项卡 — 图表、统计、曲线对比"""
 
+    status_message_requested = pyqtSignal(str)
+    data_refresh_requested = pyqtSignal()
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self._current_data = None
+        self._annotated_cols = None  # 有暗号的列名集合
+        self._sensor_results = {}
+        self._sensor_system = None
         self._setup_ui()
+        self.analysis_sensor_list.itemChanged.connect(self._on_sensor_item_changed)
 
     # ── UI 构建 ──
 
@@ -51,7 +60,7 @@ class AnalysisTabWidget(QWidget):
         source_layout.addWidget(self.analysis_sensor_list)
 
         refresh_btn = QPushButton('刷新')
-        refresh_btn.clicked.connect(self.refresh_analysis_sensors)
+        refresh_btn.clicked.connect(self._on_refresh_clicked)
         source_layout.addWidget(refresh_btn)
 
         source_layout.addStretch()
@@ -90,19 +99,31 @@ class AnalysisTabWidget(QWidget):
         self.chart_figure = Figure(figsize=(8, 4))
         self.chart_canvas = FigureCanvasQTAgg(self.chart_figure)
 
-        chart_layout = QVBoxLayout()
-        self.chart_widget = QWidget()
-        self.chart_widget.setLayout(chart_layout)
-        self.chart_widget.setMinimumHeight(300)
+        self.chart_container = QWidget()
+        self.chart_container_layout = QVBoxLayout(self.chart_container)
+        self.chart_container.setMinimumHeight(300)
 
-        self.chart_toolbar = NavigationToolbar2QT(self.chart_canvas, self.chart_widget)
+        # 工具栏行：Matplotlib 工具栏 + 弹性空间 + 全屏按钮
+        toolbar_row = QHBoxLayout()
+        self.chart_toolbar = NavigationToolbar2QT(self.chart_canvas, self.chart_container)
         self.chart_toolbar.setWindowTitle('图表工具')
+        toolbar_row.addWidget(self.chart_toolbar)
+        toolbar_row.addStretch()
 
-        chart_layout.addWidget(self.chart_toolbar)
-        chart_layout.addWidget(self.chart_canvas)
+        self.fullscreen_btn = QPushButton('⛶ 全屏查看')
+        self.fullscreen_btn.setStyleSheet(
+            "QPushButton { color: #1890ff; border: 1px solid #1890ff;"
+            " border-radius: 3px; padding: 4px 12px; }"
+            "QPushButton:hover { background-color: #e6f7ff; }"
+        )
+        self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
+        toolbar_row.addWidget(self.fullscreen_btn)
+
+        self.chart_container_layout.addLayout(toolbar_row)
+        self.chart_container_layout.addWidget(self.chart_canvas)
 
         self.ax = self.chart_figure.add_subplot(111)
-        layout.addWidget(self.chart_widget)
+        layout.addWidget(self.chart_container)
 
         # ============ 统计信息显示 ============
         stats_group = QGroupBox('统计信息')
@@ -173,28 +194,20 @@ class AnalysisTabWidget(QWidget):
 
         layout.addStretch()
 
-    # ── 主窗口资源访问 ──
+    # ── 依赖注入 (由主窗口调用) ──
 
-    def _main(self):
-        """遍历父链找到 DataProcessorWindow"""
-        w = self.parent()
-        while w is not None:
-            if w.__class__.__name__ == 'DataProcessorWindow':
-                return w
-            w = w.parent()
-        return None
+    def set_current_data(self, df, annotated_cols=None):
+        self._current_data = df
+        self._annotated_cols = annotated_cols
+        # 原始数据模式下自动刷新数据列列表
+        if self.data_source_combo.currentText() == '原始数据':
+            self._refresh_data_column_list()
 
-    def _get_current_data(self):
-        m = self._main()
-        return m.current_data if m else None
+    def set_sensor_system(self, system):
+        self._sensor_system = system
 
-    def _get_sensor_system(self):
-        m = self._main()
-        return m.sensor_system if m else None
-
-    def _get_sensor_results(self):
-        m = self._main()
-        return m.sensor_results if m else {}
+    def set_sensor_results(self, results: dict):
+        self._sensor_results = results
 
     # ── 传感器信息辅助 ──
 
@@ -216,7 +229,7 @@ class AnalysisTabWidget(QWidget):
         display, unit = self._parse_result_key(sensor_id)
         if unit:
             return unit
-        ss = self._get_sensor_system()
+        ss = self._sensor_system
         if ss:
             for sensor in ss.sensors:
                 if sensor.id == sensor_id:
@@ -227,7 +240,7 @@ class AnalysisTabWidget(QWidget):
         display, unit = self._parse_result_key(sensor_id)
         if unit:
             return display
-        ss = self._get_sensor_system()
+        ss = self._sensor_system
         if ss:
             for sensor in ss.sensors:
                 if sensor.id == sensor_id:
@@ -286,10 +299,15 @@ class AnalysisTabWidget(QWidget):
         self.chart_figure.tight_layout()
         self.chart_canvas.draw()
 
-    def _update_chart_multi_columns(self, data_cols, time_data, unit):
+    @staticmethod
+    def _clean_col_name(name: str) -> str:
+        """移除列名中的数字，保留中文和字母。"""
+        return _re.sub(r'\d+', '', name).strip()
+
+    def _update_chart_multi_columns(self, data_cols, time_data):
         self.ax.clear()
         max_points = 1000
-        current_data = self._get_current_data()
+        current_data = self._current_data
         if current_data is None:
             return
 
@@ -306,6 +324,9 @@ class AnalysisTabWidget(QWidget):
             tick_labels = [self._format_time(time_range[i]) for i in tick_indices]
         else:
             tick_labels = None
+
+        # 清理列名（移除数字），用于标题/Y轴
+        display_name = self._clean_col_name(data_cols[0]) if data_cols else '数据'
 
         colors = ['b-', 'g-', 'r-', 'c-', 'm-', 'y-', 'k-', 'orange']
         for i, col in enumerate(data_cols):
@@ -332,7 +353,8 @@ class AnalysisTabWidget(QWidget):
                 plot_time = time_range
 
             color = colors[i % len(colors)]
-            self.ax.plot(plot_time, plot_data_sampled, color, linewidth=1, label=col)
+            self.ax.plot(plot_time, plot_data_sampled, color, linewidth=1,
+                         label=col)
 
         if time_range:
             self.ax.set_xlim([time_range[0], time_range[-1]])
@@ -343,10 +365,11 @@ class AnalysisTabWidget(QWidget):
             self.ax.set_xticks(tick_positions)
             self.ax.set_xticklabels(tick_labels, rotation=45, ha='right')
 
-        self.ax.set_ylabel(f'波长差值 ({unit})')
+        # Y轴标记和图表名称 —— 使用清理后的列名
+        self.ax.set_ylabel(f'{display_name}（με）')
         self.ax.grid(True, alpha=0.3)
         self.ax.legend(loc='upper right', fontsize=8)
-        self.ax.set_title('原始数据 - 波长差值曲线')
+        self.ax.set_title(f'{display_name}时程曲线')
         self.chart_figure.tight_layout()
         self.chart_canvas.draw()
 
@@ -354,7 +377,7 @@ class AnalysisTabWidget(QWidget):
         self.ax.clear()
         max_points = 1000
         colors = ['b-', 'g-', 'r-', 'c-', 'm-', 'y-', 'k-', 'orange']
-        sensor_results = self._get_sensor_results()
+        sensor_results = self._sensor_results
 
         for i, sensor_id in enumerate(sensor_ids):
             if sensor_id not in sensor_results:
@@ -402,6 +425,53 @@ class AnalysisTabWidget(QWidget):
         self.chart_figure.tight_layout()
         self.chart_canvas.draw()
 
+    # ── 全屏查看 ──
+
+    def _toggle_fullscreen(self):
+        """将图表移动到一个全屏 QDialog 中查看，关闭时自动恢复原位。"""
+        if getattr(self, '_fullscreen_dialog', None) is not None:
+            return  # 已有全屏窗口，防止重复
+        dialog = QDialog(self)
+        dialog.setWindowTitle('图表全屏查看')
+        dialog.setWindowFlags(
+            Qt.WindowType.Window | Qt.WindowType.MaximizeUsingFullscreenGeometryHint
+        )
+        dialog.setLayout(QVBoxLayout(dialog))
+        self._fullscreen_dialog = dialog  # 防止 GC
+
+        # 将工具栏和画布移入对话框
+        self.chart_toolbar.setParent(dialog)
+        self.chart_canvas.setParent(dialog)
+        dialog.layout().addWidget(self.chart_toolbar)
+        dialog.layout().addWidget(self.chart_canvas)
+
+        self.fullscreen_btn.setVisible(False)
+
+        # 退出全屏按钮
+        exit_btn = QPushButton('退出全屏')
+        exit_btn.setStyleSheet(
+            "QPushButton { color: #ff4d4f; border: 1px solid #ff4d4f;"
+            " border-radius: 3px; padding: 6px 16px; font-size: 13px; }"
+            "QPushButton:hover { background-color: #fff2f0; }"
+        )
+        exit_btn.clicked.connect(dialog.close)
+        dialog.layout().addWidget(exit_btn)
+
+        def restore():
+            """对话框关闭时，将控件移回原始容器。"""
+            self.chart_toolbar.setParent(self.chart_container)
+            self.chart_canvas.setParent(self.chart_container)
+            # 将工具栏放回 toolbar_row（首位），画布追加到容器末尾
+            toolbar_row = self.chart_container_layout.itemAt(0)
+            if toolbar_row and toolbar_row.layout():
+                toolbar_row.layout().insertWidget(0, self.chart_toolbar)
+            self.chart_container_layout.addWidget(self.chart_canvas)
+            self.fullscreen_btn.setVisible(True)
+            self._fullscreen_dialog = None
+
+        dialog.finished.connect(restore)
+        dialog.showMaximized()
+
     # ── 统计计算 ──
 
     def _calculate_statistics(self, data, sensor_id=None):
@@ -423,7 +493,7 @@ class AnalysisTabWidget(QWidget):
     def _calculate_statistics_for_sensors(self, sensor_ids, start_idx, end_idx):
         if not sensor_ids:
             return
-        sensor_results = self._get_sensor_results()
+        sensor_results = self._sensor_results
 
         self.stats_curve_combo.clear()
         self.compare_combo1.clear()
@@ -439,20 +509,21 @@ class AnalysisTabWidget(QWidget):
 
     # ── 事件处理 ──
 
-    def run_analysis(self):
-        current_data = self._get_current_data()
-        main = self._main()
+    def run_analysis(self, silent=False):
+        current_data = self._current_data
         if current_data is None:
-            QMessageBox.warning(self, '警告', '请先加载数据')
+            if not silent:
+                QMessageBox.warning(self, '警告', '请先加载数据')
             return
 
         try:
             data_source = self.data_source_combo.currentText()
 
             if data_source == '物理量':
-                sensor_results = self._get_sensor_results()
+                sensor_results = self._sensor_results
                 if not sensor_results:
-                    QMessageBox.warning(self, '警告', '请先在光纤公式配置中计算传感器数据')
+                    if not silent:
+                        QMessageBox.warning(self, '警告', '请先在光纤公式配置中计算传感器数据')
                     return
 
                 selected_sensors = []
@@ -463,7 +534,8 @@ class AnalysisTabWidget(QWidget):
                         selected_sensors.append(item.data(Qt.ItemDataRole.UserRole))
 
                 if not selected_sensors:
-                    QMessageBox.warning(self, '警告', '请选择至少一个传感器')
+                    if not silent:
+                        QMessageBox.warning(self, '警告', '请选择至少一个传感器')
                     return
 
                 time_col = '时间' if '时间' in current_data.columns else current_data.columns[0]
@@ -472,7 +544,8 @@ class AnalysisTabWidget(QWidget):
                 start_idx = self.range_start.value()
                 end_idx = min(self.range_end.value(), len(current_data) - 1)
                 if start_idx >= len(current_data):
-                    QMessageBox.warning(self, '警告', '起始索引超出数据范围')
+                    if not silent:
+                        QMessageBox.warning(self, '警告', '起始索引超出数据范围')
                     return
 
                 time_range = time_data[start_idx:end_idx + 1] if len(time_data) > 0 else None
@@ -480,12 +553,24 @@ class AnalysisTabWidget(QWidget):
                 self._calculate_statistics_for_sensors(selected_sensors, start_idx, end_idx)
 
             else:
-                data_cols = [c for c in current_data.columns
-                            if c != '时间' and '计数' not in str(c)
-                            and not str(c).startswith('CH')
-                            and pd.api.types.is_numeric_dtype(current_data[c])]
+                # 从复选框列表读取用户选择的数据列
+                data_cols = []
+                for i in range(self.analysis_sensor_list.count()):
+                    item = self.analysis_sensor_list.item(i)
+                    role = item.data(Qt.ItemDataRole.UserRole)
+                    if role == '__select_all__' or role is None:
+                        continue
+                    if item.checkState() == Qt.CheckState.Checked:
+                        data_cols.append(role)
+                # 如果列表为空，回退到自动检测
                 if not data_cols:
-                    QMessageBox.warning(self, '警告', '没有可用的数据列')
+                    data_cols = [c for c in current_data.columns
+                                if c != '时间' and '计数' not in str(c)
+                                and not str(c).startswith('CH')
+                                and pd.api.types.is_numeric_dtype(current_data[c])]
+                if not data_cols:
+                    if not silent:
+                        QMessageBox.warning(self, '警告', '没有可用的数据列')
                     return
 
                 time_col = '时间' if '时间' in current_data.columns else None
@@ -497,21 +582,63 @@ class AnalysisTabWidget(QWidget):
                 start_idx = self.range_start.value()
                 end_idx = min(self.range_end.value(), len(current_data) - 1)
                 if start_idx >= len(current_data):
-                    QMessageBox.warning(self, '警告', '起始索引超出数据范围')
+                    if not silent:
+                        QMessageBox.warning(self, '警告', '起始索引超出数据范围')
                     return
 
                 time_range = time_data[start_idx:end_idx + 1]
-                self._update_chart_multi_columns(data_cols, time_range, 'nm')
+                self._update_chart_multi_columns(data_cols, time_range)
 
-            if main:
-                main.status_bar.showMessage('分析完成')
+            self.status_message_requested.emit('分析完成')
 
         except Exception as e:
             import traceback
             QMessageBox.critical(self, '错误', f'分析失败: {str(e)}\n\n{traceback.format_exc()}')
 
+    def _on_refresh_clicked(self):
+        """点击刷新按钮：重新读取暗号标注后刷新数据和分析。"""
+        # 通知 main.py 重新推送带暗号标注的分析数据
+        self.data_refresh_requested.emit()
+
+    def _refresh_data_column_list(self):
+        """原始数据模式下，用当前数据的数值列填充分析传感器列表（复选框）。
+
+        只显示有暗号标注的列（self._annotated_cols）；无暗号时显示所有数值列。
+        """
+        self.analysis_sensor_list.clear()
+        if self._current_data is None:
+            self.analysis_sensor_list.setEnabled(False)
+            return
+
+        if self._annotated_cols:
+            data_cols = [c for c in self._current_data.columns
+                         if c in self._annotated_cols
+                         and pd.api.types.is_numeric_dtype(self._current_data[c])]
+        else:
+            data_cols = [c for c in self._current_data.columns
+                         if c != '时间'
+                         and pd.api.types.is_numeric_dtype(self._current_data[c])]
+        if not data_cols:
+            self.analysis_sensor_list.setEnabled(False)
+            return
+
+        select_all_item = QListWidgetItem('【全选】')
+        select_all_item.setFlags(select_all_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        select_all_item.setCheckState(Qt.CheckState.Checked)
+        select_all_item.setData(Qt.ItemDataRole.UserRole, '__select_all__')
+        self.analysis_sensor_list.addItem(select_all_item)
+
+        for col in data_cols:
+            item = QListWidgetItem(col)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setData(Qt.ItemDataRole.UserRole, col)
+            self.analysis_sensor_list.addItem(item)
+
+        self.analysis_sensor_list.setEnabled(True)
+
     def refresh_analysis_sensors(self):
-        sensor_results = self._get_sensor_results()
+        sensor_results = self._sensor_results
         self.analysis_sensor_list.clear()
         if sensor_results:
             select_all_item = QListWidgetItem('【全选】')
@@ -528,7 +655,6 @@ class AnalysisTabWidget(QWidget):
                 self.analysis_sensor_list.addItem(item)
 
             self.analysis_sensor_list.setEnabled(True)
-            self.analysis_sensor_list.itemChanged.connect(self._on_sensor_item_changed)
         else:
             self.analysis_sensor_list.setEnabled(False)
 
@@ -546,15 +672,17 @@ class AnalysisTabWidget(QWidget):
             self.stats_curve_combo.clear()
             self.compare_combo1.clear()
             self.compare_combo2.clear()
-            sensor_results = self._get_sensor_results()
+            sensor_results = self._sensor_results
             if sensor_results:
                 ids = list(sensor_results.keys())
                 self.stats_curve_combo.addItems(ids)
                 self.compare_combo1.addItems(ids)
-                self.compare_combo2.addItems(ids)
+        else:
+            # 切换到原始数据：自动填充数据列列表
+            self._refresh_data_column_list()
 
     def _on_stats_curve_changed(self):
-        sensor_results = self._get_sensor_results()
+        sensor_results = self._sensor_results
         selected = self.stats_curve_combo.currentText()
         if not selected or selected not in sensor_results:
             return
@@ -564,7 +692,7 @@ class AnalysisTabWidget(QWidget):
         self._calculate_statistics(data, selected)
 
     def _compare_curves(self):
-        sensor_results = self._get_sensor_results()
+        sensor_results = self._sensor_results
         curve1 = self.compare_combo1.currentText()
         curve2 = self.compare_combo2.currentText()
 

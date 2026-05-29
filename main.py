@@ -15,12 +15,11 @@ from PyQt6.QtWidgets import (
     QTextEdit, QSplitter, QGridLayout, QStackedWidget, QProgressBar, QFrame,
     QInputDialog, QTreeWidget, QTreeWidgetItem
 )
-from PyQt6.QtCore import Qt, QTimer, QSettings
+from PyQt6.QtCore import Qt, QThread, QTimer, QSettings, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
 
 import pandas as pd
 import numpy as np
-import csv
 from docx import Document
 
 # Matplotlib for charts
@@ -44,407 +43,44 @@ from py.wiki_system import WikiFileSystem
 from py.multi_agent import run_multi_agent, MultiAgentState
 
 # ============ UI Module Imports ============
-from ui.report_word import WordReportWidget
-from ui.report_ppt import PptReportWidget
 from ui.report_workbench import ReportWorkbenchWidget
 from ui.ai_diagnosis import AiDiagnosisWidget
 from ui.analysis_tab import AnalysisTabWidget
 from ui.global_parameter_dialog import GlobalParameterDialog
+from ui.data_tab import DataTabWidget
+from ui.cleaning_tab import CleaningTabWidget
+from ui.sensor_tab import SensorTabWidget
+from ui.project_tab import ProjectManagerWidget
+from ui.wiki_tab import WikiTabWidget
+from ui.clipper_tab import WebClipperWidget
+from ui.skill_tab import AgentSkillWidget
 
+# ============ Report Generation ============
+from core.report_engine import generate_outline, generate_structured_report
 
-# ============ Data Templates ============
-
-class DataTemplate:
-    def __init__(self, id, name, file_format, delimiter='\t', skip_rows=1, columns=None):
-        self.id = id
-        self.name = name
-        self.file_format = file_format
-        self.delimiter = delimiter
-        self.skip_rows = skip_rows
-        self.columns = columns or []
-
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'name': self.name,
-            'file_format': self.file_format,
-            'delimiter': self.delimiter,
-            'skip_rows': self.skip_rows,
-            'columns': [{'name': c['name'], 'comment': c.get('comment', ''), 'data_type': c.get('data_type', 'numeric')} for c in self.columns]
-        }
-
-
-DEFAULT_TEMPLATES = [
-    DataTemplate('enlight_type', 'ENLIGHT (光纤传感)', 'enlight', '\t', 104, [
-        {'name': '时间', 'comment': '时间戳', 'data_type': 'time'},
-    ]),
-    DataTemplate('csv_type', 'CSV 文件', 'csv', ',', 0, []),
-    DataTemplate('txt_type', 'TXT 文件', 'txt', '\t', 0, []),
-    DataTemplate('xlsx_type', 'Excel 文件', 'xlsx', ',', 0, []),
-]
-
-
-# ============ Data Cleaning ============
-
-class CleaningRule:
-    def __init__(self, name, rule_type, enabled=True, threshold=None, fill_method='linear', fill_value=None):
-        self.name = name
-        self.rule_type = rule_type  # 'adjacent_diff', 'nan', 'range', 'negative', 'zero'
-        self.enabled = enabled
-        self.threshold = threshold  # For adjacent_diff: max allowed difference
-        self.min_value = None     # For range: min value
-        self.max_value = None       # For range: max value
-        self.fill_method = fill_method  # 'linear', 'mean', 'forward', 'custom'
-        self.fill_value = fill_value
-
-
-
-# ============ Sensor System ============
-
-class FBG:
-    """FBG光纤光栅定义 - 对应一列原始波长数据"""
-    def __init__(self, id, channel, wavelength_min=None, wavelength_max=None):
-        self.id = id              # FBG ID，如 "W1", "波长1"
-        self.channel = channel    # 对应的波长列名
-        self.wavelength_min = wavelength_min  # 波长下限（用于校验）
-        self.wavelength_max = wavelength_max  # 波长上限（用于校验）
-
-    def is_valid(self, wavelength):
-        """判断波长是否在有效范围内"""
-        if pd.isna(wavelength):
-            return False
-        if self.wavelength_min is not None and self.wavelength_max is not None:
-            return self.wavelength_min <= wavelength <= self.wavelength_max
-        return True
-
-
-class Sensor:
-    """传感器定义"""
-    TYPE_PARAMS = {
-        'strain': {
-            'name': '应变',
-            'unit': 'με',
-            'need_temp_compensation': True,
-        },
-        'temperature': {
-            'name': '温度',
-            'unit': '°C',
-            'need_temp_compensation': False,
-        },
-        'displacement': {
-            'name': '位移',
-            'unit': 'mm',
-            'need_temp_compensation': False,
-        },
-        'inclination': {
-            'name': '倾角',
-            'unit': '°',
-            'need_temp_compensation': False,
-        },
-        'pressure': {
-            'name': '压力',
-            'unit': 'MPa',
-            'need_temp_compensation': False,
-        },
-        'decoupling': {
-            'name': '双参量解耦',
-            'unit': 'με / °C',
-            'need_temp_compensation': False,
-        },
-        'strain_cal': {
-            'name': '应变标定',
-            'unit': 'με',
-            'need_temp_compensation': False,
-        },
-        'temp_cal': {
-            'name': '温度标定',
-            'unit': '°C',
-            'need_temp_compensation': False,
-        },
-    }
-
-    def __init__(self, id, sensor_type, formula=None, constants=None, active=True, decoupling_config=None, location=''):
-        self.id = id
-        self.sensor_type = sensor_type
-        self.formula = formula
-        self.constants = constants or {}
-        self.active = active
-        self.decoupling_config = decoupling_config
-        self.location = location
-
-    def get_unit(self):
-        return self.TYPE_PARAMS.get(self.sensor_type, {}).get('unit', '')
-
-    def get_name(self):
-        return self.TYPE_PARAMS.get(self.sensor_type, {}).get('name', self.sensor_type)
-
-
-class SensorSystem:
-    """传感器系统管理器"""
-    def __init__(self):
-        self.fbgs = []        # FBG列表
-        self.sensors = []     # 传感器列表
-        self.reference_row = 0  # 参考行索引（初始值所在行）
-        self.global_parameters = {}  # 全局变量池 (SSOT)，局部常量可覆盖
-
-    def set_reference_row(self, row_index):
-        """设置参考行索引"""
-        self.reference_row = row_index
-
-    def add_fbg(self, fbg):
-        self.fbgs.append(fbg)
-
-    def add_sensor(self, sensor):
-        self.sensors.append(sensor)
-
-    def calculate(self, df, fbg_columns):
-        """根据原始波长数据计算所有传感器值
-
-        计算逻辑：
-        1. 获取参考行的初始波长值
-        2. 对每一行：物理量 = (当前波长 - 初始波长) × 系数
-        3. 如果公式涉及多列，则分别计算后组合
-        """
-        results = {}
-
-        if len(df) == 0:
-            return results
-
-        ref_row = self.reference_row if self.reference_row < len(df) else 0
-
-        # 构建列数据字典
-        column_data = {}
-        for col in df.columns:
-            column_data[col] = df[col].values
-
-        # 自动匹配FBG通道到实际数据列（波长类列）
-        wavelength_cols = [c for c in df.columns
-                          if '波长' in str(c) or 'wavelength' in str(c).lower()
-                          or str(c).upper().startswith('FBG')
-                          or str(c).upper().startswith('W') and str(c)[1:].isdigit()]
-        if not wavelength_cols:
-            # 找不到明确的波长列时，使用数值列（排除时间列）
-            import pandas.api.types as ptypes
-            wavelength_cols = [c for c in df.columns
-                              if '时间' not in str(c) and 'timestamp' not in str(c).lower()
-                              and ptypes.is_numeric_dtype(df[c])]
-
-        fbg_initial = {}
-        fbg_delta = {}
-
-        print("=" * 60)
-        print("[诊断] FBG通道匹配:")
-        print(f"  DataFrame 列: {list(df.columns)}")
-        print(f"  检测到的波长列: {wavelength_cols}")
-        print(f"  已注册 FBG: {[(f.id, f.channel) for f in self.fbgs]}")
-
-        for i, fbg in enumerate(self.fbgs):
-            # 先尝试按channel精确匹配
-            if fbg.channel in column_data:
-                matched_col = fbg.channel
-            elif i < len(wavelength_cols):
-                # channel不匹配时，按FBG索引自动分配波长列
-                matched_col = wavelength_cols[i]
-                fbg.channel = str(matched_col)
-            else:
-                print(f"  FBG {fbg.id}: 未匹配到任何列!")
-                continue
-
-            col_values = column_data[matched_col]
-            if ref_row < len(col_values):
-                initial = col_values[ref_row]
-            else:
-                initial = col_values[0]
-            fbg_initial[fbg.id] = initial
-
-            # 计算每行与初始值的差值
-            delta = []
-            for w in col_values:
-                if pd.isna(w) or pd.isna(initial):
-                    delta.append(None)
-                else:
-                    delta.append(w - initial)
-            fbg_delta[fbg.id] = delta
-
-            # 同时用 channel（列名）作为别名，兼容公式直接引用列名
-            if str(matched_col) != str(fbg.id):
-                fbg_delta[str(matched_col)] = delta
-
-            # 诊断输出
-            valid_deltas = [d for d in delta if d is not None][:5]
-            print(f"  FBG {fbg.id} → 列 '{matched_col}' | 初始波长: {initial:.6f} | 前5个差值(nm): {[f'{d:.6f}' if d is not None else 'None' for d in valid_deltas]}")
-        print("=" * 60)
-
-        # 兜底：如果 fbg_delta 为空（无已注册 FBG 或通道全不匹配），
-        # 自动从数据列中检测 FBG_ 前缀列，直接构建 fbg_delta
-        if not fbg_delta:
-            auto_cols = [str(c) for c in df.columns if str(c).upper().startswith('FBG_')]
-            if auto_cols:
-                print(f"[自动兜底] fbg_delta 为空，从数据列自动构建: {auto_cols}")
-                for col in auto_cols:
-                    col_values = column_data[col]
-                    if ref_row < len(col_values):
-                        initial = col_values[ref_row]
-                    else:
-                        initial = col_values[0]
-                    delta = []
-                    for w in col_values:
-                        if pd.isna(w) or pd.isna(initial):
-                            delta.append(None)
-                        else:
-                            delta.append(w - initial)
-                    fbg_delta[col] = delta
-                    # 同时用简名 W1, W2, ... 作为别名，兼容使用 W1 的公式
-                    idx = auto_cols.index(col) + 1
-                    fbg_delta[f'W{idx}'] = delta
-                    print(f"  列 '{col}' → fbg_delta['{col}'] + fbg_delta['W{idx}']")
-
-        # 计算每个传感器
-        for sensor in self.sensors:
-            if not sensor.active:
-                continue
-
-            try:
-                if sensor.sensor_type == 'decoupling' and sensor.decoupling_config:
-                    strain_r, temp_r = self._evaluate_decoupling(
-                        sensor.decoupling_config, fbg_delta, len(df)
-                    )
-                    results[f'{sensor.id}_应变(με)'] = strain_r
-                    results[f'{sensor.id}_温度(°C)'] = temp_r
-                else:
-                    result = self._evaluate_sensor_formula(
-                        sensor.formula,
-                        sensor.constants,
-                        fbg_delta,
-                        len(df),
-                        self.global_parameters,
-                    )
-                    results[sensor.id] = result
-            except Exception as e:
-                print(f"计算传感器 {sensor.id} 失败: {e}")
-                import traceback
-                traceback.print_exc()
-                results[sensor.id] = [None] * len(df)
-
-        return results
-
-    def _evaluate_sensor_formula(self, formula, constants, fbg_delta, n_rows,
-                                 global_params=None):
-        """计算传感器公式
-
-        公式示例：
-        - "W1 * k1"  单传感器应变
-        - "W1 * k1 - W2 * k2"  温补应变 (W1应变, W2温度)
-
-        W1, W2 等会被替换为该列的波长差值 (W - W0)
-        常量合并策略: 全局参数打底，局部常量覆盖 (SSOT)
-        """
-        import re
-
-        # 合并: 全局参数打底，局部常量覆盖 (局部优先)
-        merged = {}
-        if global_params:
-            merged.update(global_params)
-        merged.update(constants or {})
-
-        # 用正则按单词边界替换常量（避免 k1 误匹配 k10）
-        expr = formula
-        for name, value in merged.items():
-            if isinstance(value, dict):
-                value = value.get('value', 0)
-            expr = re.sub(r'\b' + re.escape(name) + r'\b', f'({value})', expr)
-
-        # 检查公式中是否有未定义的常量
-        unresolved_k = re.findall(r'\b[kK]\d+\b', expr)
-        if unresolved_k:
-            print(f"警告: 公式中常量 {unresolved_k} 未定义，默认按 1.0 计算。请在传感器配置中添加常量。")
-            for k_var in set(unresolved_k):
-                expr = re.sub(r'\b' + re.escape(k_var) + r'\b', '(1.0)', expr)
-
-        # 计算每行
-        result = []
-        for i in range(n_rows):
-            row_vars = {}
-            for fbg_id, delta in fbg_delta.items():
-                v = delta[i] if i < len(delta) else None
-                if v is None:
-                    row_vars[fbg_id] = float('nan')
-                else:
-                    row_vars[fbg_id] = v
-
-            try:
-                val = eval(expr, {"__builtins__": {}}, row_vars)
-                # NaN 或 inf 统一存为 None (表格显示 N/A)
-                if val is None or (isinstance(val, float) and (val != val or abs(val) == float('inf'))):
-                    result.append(None)
-                else:
-                    result.append(val)
-            except Exception as e:
-                print(f"行 {i} 计算失败: {expr} -> {e}")
-                result.append(None)
-
-        return result
-
-    def _evaluate_decoupling(self, config, fbg_delta, n_rows):
-        """双参量解耦：矢量化矩阵求解应变和温度
-
-        方程:
-          Δλ1 = Ke1 * Δε + KT1 * ΔT
-          Δλ2 = Ke2 * Δε + KT2 * ΔT
-
-        求解:
-          D = Ke1*KT2 - Ke2*KT1
-          Δε = (Δλ1*KT2 - Δλ2*KT1) / D
-          ΔT = (Δλ2*Ke1 - Δλ1*Ke2) / D
-
-        波长差值从 nm 转换为 pm (×1000) 以避免浮点精度丢失。
-        """
-        import numpy as np
-
-        Ke1 = float(config['Ke1'])
-        Ke2 = float(config['Ke2'])
-        KT1 = float(config['KT1'])
-        KT2 = float(config['KT2'])
-
-        # 获取波长差值，nm → pm (×1000)
-        delta_source1 = fbg_delta.get(config['fbg1'], [0.0] * n_rows)
-        delta_source2 = fbg_delta.get(config['fbg2'], [0.0] * n_rows)
-
-        d1 = np.array([v if v is not None else np.nan for v in delta_source1], dtype=np.float64) * 1000.0
-        d2 = np.array([v if v is not None else np.nan for v in delta_source2], dtype=np.float64) * 1000.0
-
-        # 行列式
-        D = Ke1 * KT2 - Ke2 * KT1
-
-        if abs(D) < 1e-9:
-            print(f"[解耦] 传感器行列式接近零 (D={D:.6e})，矩阵不可逆。请确认两个FBG的应变/温度系数有差异。")
-            return (np.full(n_rows, np.nan).tolist(), np.full(n_rows, np.nan).tolist())
-
-        # 矢量化求解
-        strain = (d1 * KT2 - d2 * KT1) / D
-        temp = (d2 * Ke1 - d1 * Ke2) / D
-
-        return (strain.tolist(), temp.tolist())
-
-
-# ENLIGHT template
-ENLIGHT_TEMPLATE = DataTemplate(
-    'enlight_type',
-    'ENLIGHT (光纤传感)',
-    'enlight',  # special format
-    '\t',
-    104,  # skip first 104 lines
-    [
-        {'name': '时间', 'comment': '时间戳', 'data_type': 'time'},
-    ]
+# ============ Core Data Models (SSOT) ============
+from core.models import (
+    DataTemplate, CleaningRule, FBG, GlobalParameter, Sensor, SensorSystem,
+    DEFAULT_TEMPLATES,
 )
 
+# ═══════════════════════════════════════════════
+# 报告输出目录
+# ═══════════════════════════════════════════════
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+REPORT_OUTPUT_DIR = os.path.join(BASE_DIR, 'output_reports')
+
+# ============ App State (SSOT) ============
+from state.app_state import AppState
 
 # ============ Main Window ============
 
 class DataProcessorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # 确保报告输出目录存在
+        os.makedirs(REPORT_OUTPUT_DIR, exist_ok=True)
         self.current_data = None
         self.current_columns = []
         self.sampled_data = None
@@ -453,16 +89,29 @@ class DataProcessorWindow(QMainWindow):
         self.current_template = None
         self.sensor_results = {}  # 存储计算后的传感器物理量
         self.cleaning_rules = [
-            CleaningRule('数值范围', 'range', True, 0, 100, 'linear'),
-            CleaningRule('负数检测', 'negative', True, fill_method='forward'),
+            CleaningRule(name='数值范围', rule_type='range', enabled=True, min_value=0, max_value=100, fill_method='linear'),
+            CleaningRule(name='负数检测', rule_type='negative', enabled=True, fill_method='forward'),
         ]
-        # 项目文件列表 (全局配置保存/加载使用)
-        self.project_files_list = QListWidget()
-        self.project_files_list.setVisible(False)
-
-        # 传感器系统
         self.sensor_system = SensorSystem()
         self.init_sensor_system()
+        
+        # SSOT: 全局应用状态
+        self.state = AppState()
+        self.state = self.state.with_fbgs(self.sensor_system.fbgs)
+        self.state = self.state.with_sensors(self.sensor_system.sensors)
+        # 全局参数 → SSOT
+        initial_gp = {
+            name: GlobalParameter(
+                name=name,
+                value=v if isinstance(v, (int, float)) else v.get('value', 0),
+                unit=v.get('unit', '') if isinstance(v, dict) else '',
+                description=v.get('description', '') if isinstance(v, dict) else '',
+            )
+            for name, v in self.sensor_system.global_parameters.items()
+        }
+        self.state = self.state.with_global_parameters(initial_gp)
+
+        # 传感器系统
 
         # Ollama AI客户端
         try:
@@ -593,19 +242,16 @@ class DataProcessorWindow(QMainWindow):
         self.setCentralWidget(self.central_widget)
 
         # Data tab
-        self.data_tab = QWidget()
-        self.create_data_tab()
-        self.central_widget.addTab(self.data_tab, '数据文件')
+        self.data_tab_widget = DataTabWidget()
+        self.central_widget.addTab(self.data_tab_widget, '数据文件')
 
         # Cleaning tab
-        self.cleaning_tab = QWidget()
-        self.create_cleaning_tab()
-        self.central_widget.addTab(self.cleaning_tab, '数据清洗')
+        self.cleaning_tab_widget = CleaningTabWidget()
+        self.central_widget.addTab(self.cleaning_tab_widget, '数据清洗')
 
         # Sensor tab
-        self.sensor_tab = QWidget()
-        self.create_sensor_tab()
-        self.central_widget.addTab(self.sensor_tab, '光纤公式配置')
+        self.sensor_tab_widget = SensorTabWidget()
+        self.central_widget.addTab(self.sensor_tab_widget, '光纤公式配置')
 
         # Analysis tab
         self.analysis_tab = QWidget()
@@ -616,6 +262,55 @@ class DataProcessorWindow(QMainWindow):
         self.report_tab = QWidget()
         self.create_report_tab()
         self.central_widget.addTab(self.report_tab, '信息整合')
+
+        # ── Signal bindings ──
+        self.data_tab_widget.open_file_requested.connect(self.open_file)
+        self.data_tab_widget.clear_data_requested.connect(self.clear_data)
+        self.data_tab_widget.sample_data_requested.connect(self.sample_data)
+        self.data_tab_widget.save_data_requested.connect(self.save_sampled_data)
+        self.data_tab_widget.save_template_requested.connect(self.save_template_to_file)
+
+        # ── 表格编辑 → 底层 DataFrame 双向同步 ──
+        self.data_tab_widget.data_cell_edited.connect(self._on_data_table_cell_edited)
+
+        self.cleaning_tab_widget.apply_cleaning_requested.connect(
+            lambda c: self.apply_cleaning(config=c)
+        )
+
+        self.sensor_tab_widget.fbg_add_requested.connect(self.add_fbg)
+        self.sensor_tab_widget.fbg_edit_requested.connect(
+            lambda row: self.edit_fbg(row)
+        )
+        self.sensor_tab_widget.fbg_delete_requested.connect(
+            lambda row: self.delete_fbg(row)
+        )
+        self.sensor_tab_widget.sensor_add_requested.connect(self.add_sensor)
+        self.sensor_tab_widget.sensor_edit_requested.connect(
+            lambda row: self.edit_sensor(row)
+        )
+        self.sensor_tab_widget.sensor_delete_requested.connect(
+            lambda row: self.delete_sensor(row)
+        )
+        self.sensor_tab_widget.sensor_copy_requested.connect(
+            lambda row: self.copy_sensor(row)
+        )
+        self.sensor_tab_widget.calculate_requested.connect(
+            lambda ref_row: self.calculate_sensors(ref_row)
+        )
+        self.sensor_tab_widget.save_sensor_requested.connect(
+            lambda name, fmt: self.save_sensor_data(name, fmt)
+        )
+        self.sensor_tab_widget.export_sensor_requested.connect(self.export_sensor_data)
+        self.sensor_tab_widget.global_params_requested.connect(self.open_global_parameter_dialog)
+
+        self.project_tab_widget.project_selected.connect(self.on_project_selected)
+        self.project_tab_widget.new_project_requested.connect(self.on_new_project)
+        self.project_tab_widget.delete_project_requested.connect(self.on_delete_project)
+        self.project_tab_widget.open_project_folder_requested.connect(self.on_open_project_folder)
+        self.project_tab_widget.add_folder_requested.connect(self.on_add_folder_to_project)
+        self.project_tab_widget.add_file_requested.connect(self.on_add_file_to_project)
+        self.project_tab_widget.delete_item_requested.connect(self.on_delete_project_item)
+        self.project_tab_widget.open_item_requested.connect(self.on_open_project_item)
 
         # Status bar
         self.status_bar = QStatusBar()
@@ -669,325 +364,34 @@ class DataProcessorWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-    def create_data_tab(self):
-        layout = QVBoxLayout()
-
-        # Button bar
-        btn_layout = QHBoxLayout()
-        self.open_file_btn = QPushButton('打开文件')
-        self.open_file_btn.clicked.connect(self.open_file)
-        btn_layout.addWidget(self.open_file_btn)
-
-        self.clear_data_btn = QPushButton('清除数据')
-        self.clear_data_btn.clicked.connect(self.clear_data)
-        btn_layout.addWidget(self.clear_data_btn)
-
-        self.sample_data_btn = QPushButton('抽取数据')
-        self.sample_data_btn.clicked.connect(self.sample_data)
-        btn_layout.addWidget(self.sample_data_btn)
-
-        self.save_sampled_btn = QPushButton('保存数据')
-        self.save_sampled_btn.clicked.connect(self.save_sampled_data)
-        btn_layout.addWidget(self.save_sampled_btn)
-
-        self.save_template_btn = QPushButton('保存模板')
-        self.save_template_btn.clicked.connect(self.save_template_to_file)
-        btn_layout.addWidget(self.save_template_btn)
-
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-        # Row count info label
-        self.data_info_label = QLabel('')
-        self.data_info_label.setStyleSheet('color: #666; font-size: 12px; padding: 2px 0;')
-        layout.addWidget(self.data_info_label)
-
-        # Data table
-        self.data_table = QTableWidget()
-        self.data_table.setAlternatingRowColors(True)
-        layout.addWidget(self.data_table)
-
-        self.data_tab.setLayout(layout)
-
-    def create_cleaning_tab(self):
-        layout = QVBoxLayout()
-
-        info_label = QLabel('配置数据清洗规则，然后点击"应用清洗"按钮处理数据')
-        layout.addWidget(info_label)
-
-        # Rule 1: Adjacent Difference Detection
-        rule1_group = QGroupBox('规则1: 相邻数据差值检测')
-        rule1_layout = QVBoxLayout()
-
-        self.adjacent_enabled = QCheckBox('启用相邻数据差值检测')
-        self.adjacent_enabled.setChecked(True)
-        rule1_layout.addWidget(self.adjacent_enabled)
-
-        adj_layout = QHBoxLayout()
-        adj_layout.addWidget(QLabel('差值阈值:'))
-        self.diff_threshold = QDoubleSpinBox()
-        self.diff_threshold.setRange(0, 1e9)
-        self.diff_threshold.setValue(1.0)
-        self.diff_threshold.setDecimals(4)
-        adj_layout.addWidget(self.diff_threshold)
-
-        adj_layout.addWidget(QLabel('(超过此值判断为异常)'))
-        adj_layout.addStretch()
-        rule1_layout.addLayout(adj_layout)
-        rule1_group.setLayout(rule1_layout)
-        layout.addWidget(rule1_group)
-
-        # Rule 2: NaN Detection
-        rule2_group = QGroupBox('规则2: 缺失值检测')
-        rule2_layout = QVBoxLayout()
-
-        self.nan_enabled = QCheckBox('启用缺失值(NaN)检测')
-        self.nan_enabled.setChecked(True)
-        rule2_layout.addWidget(self.nan_enabled)
-
-        nan_layout = QHBoxLayout()
-        nan_layout.addWidget(QLabel('(数据为空或NaN时判断为异常)'))
-        nan_layout.addStretch()
-        rule2_layout.addLayout(nan_layout)
-        rule2_group.setLayout(rule2_layout)
-        layout.addWidget(rule2_group)
-
-        # Fill Method
-        fill_group = QGroupBox('填充方式')
-        fill_layout = QHBoxLayout()
-
-        fill_layout.addWidget(QLabel('选择填充方式:'))
-        self.fill_method_combo = QComboBox()
-        self.fill_method_combo.addItems(['linear', 'mean', 'forward', 'backward', 'custom'])
-        fill_layout.addWidget(self.fill_method_combo)
-
-        self.custom_fill_value = QDoubleSpinBox()
-        self.custom_fill_value.setRange(-1e9, 1e9)
-        self.custom_fill_value.setValue(0)
-        self.custom_fill_value.setDecimals(4)
-        fill_layout.addWidget(QLabel('自定义值:'))
-        fill_layout.addWidget(self.custom_fill_value)
-        fill_layout.addStretch()
-        fill_group.setLayout(fill_layout)
-        layout.addWidget(fill_group)
-
-        # Apply button
-        apply_btn = QPushButton('应用清洗')
-        apply_btn.clicked.connect(self.apply_cleaning)
-        layout.addWidget(apply_btn)
-
-        # Result display
-        self.cleaning_result = QTextEdit()
-        self.cleaning_result.setReadOnly(True)
-        self.cleaning_result.setMaximumHeight(100)
-        layout.addWidget(QLabel('异常检测结果:'))
-        layout.addWidget(self.cleaning_result)
-
-        layout.addStretch()
-        self.cleaning_tab.setLayout(layout)
-
-    def create_sensor_tab(self):
-        """创建传感器配置标签页"""
-        layout = QVBoxLayout()
-
-        info_label = QLabel('配置FBG光纤光栅和传感器参数')
-        layout.addWidget(info_label)
-
-        # 参考行设置
-        ref_layout = QHBoxLayout()
-        ref_layout.addWidget(QLabel('初始值行 (参考行):'))
-        self.ref_row_spin = QSpinBox()
-        self.ref_row_spin.setRange(0, 9999)
-        self.ref_row_spin.setValue(0)
-        self.ref_row_spin.setPrefix('第 ')
-        self.ref_row_spin.setSuffix(' 行')
-        ref_layout.addWidget(self.ref_row_spin)
-        ref_layout.addWidget(QLabel('(波长减初始值再乘系数得到物理量)'))
-        ref_layout.addStretch()
-        layout.addLayout(ref_layout)
-
-        # FBG列表和传感器列表的水平布局
-        h_layout = QHBoxLayout()
-
-        # 左侧：FBG定义
-        fbg_group = QGroupBox('FBG定义 (光纤光栅)')
-        fbg_layout = QVBoxLayout()
-
-        # FBG表格
-        self.fbg_table = QTableWidget()
-        self.fbg_table.setColumnCount(4)
-        self.fbg_table.setHorizontalHeaderLabels(['ID', '波长列', '波长下限', '波长上限'])
-        self.fbg_table.setRowCount(len(self.sensor_system.fbgs))
-        for i, fbg in enumerate(self.sensor_system.fbgs):
-            self.fbg_table.setItem(i, 0, QTableWidgetItem(fbg.id))
-            self.fbg_table.setItem(i, 1, QTableWidgetItem(fbg.channel))
-            self.fbg_table.setItem(i, 2, QTableWidgetItem(str(fbg.wavelength_min or '')))
-            self.fbg_table.setItem(i, 3, QTableWidgetItem(str(fbg.wavelength_max or '')))
-        self.fbg_table.resizeColumnsToContents()
-        fbg_layout.addWidget(self.fbg_table)
-
-        # FBG操作按钮
-        fbg_btn_layout = QHBoxLayout()
-        self.add_fbg_btn = QPushButton('添加FBG')
-        self.add_fbg_btn.clicked.connect(self.add_fbg)
-        fbg_btn_layout.addWidget(self.add_fbg_btn)
-
-        self.edit_fbg_btn = QPushButton('编辑FBG')
-        self.edit_fbg_btn.clicked.connect(self.edit_fbg)
-        fbg_btn_layout.addWidget(self.edit_fbg_btn)
-
-        self.delete_fbg_btn = QPushButton('删除FBG')
-        self.delete_fbg_btn.clicked.connect(self.delete_fbg)
-        fbg_btn_layout.addWidget(self.delete_fbg_btn)
-
-        fbg_layout.addLayout(fbg_btn_layout)
-        fbg_group.setLayout(fbg_layout)
-        h_layout.addWidget(fbg_group)
-
-        # 右侧：传感器定义
-        sensor_group = QGroupBox('传感器定义')
-        sensor_layout = QVBoxLayout()
-
-        # 传感器表格
-        self.sensor_table = QTableWidget()
-        self.sensor_table.setColumnCount(6)
-        self.sensor_table.setHorizontalHeaderLabels(['ID', '物理位置', '类型', '公式', '常量', '启用'])
-        self.sensor_table.setRowCount(len(self.sensor_system.sensors))
-        for i, sensor in enumerate(self.sensor_system.sensors):
-            self.sensor_table.setItem(i, 0, QTableWidgetItem(sensor.id))
-            self.sensor_table.setItem(i, 1, QTableWidgetItem(sensor.get_name()))
-            self.sensor_table.setItem(i, 2, QTableWidgetItem(sensor.formula))
-            const_str = ', '.join([f"{k}={v:.2f}" for k, v in sensor.constants.items()])
-            self.sensor_table.setItem(i, 3, QTableWidgetItem(const_str))
-            self.sensor_table.setItem(i, 4, QTableWidgetItem('是' if sensor.active else '否'))
-        self.sensor_table.resizeColumnsToContents()
-        sensor_layout.addWidget(self.sensor_table)
-
-        # 传感器操作按钮
-        sensor_btn_layout = QHBoxLayout()
-        self.add_sensor_btn = QPushButton('添加传感器')
-        self.add_sensor_btn.clicked.connect(self.add_sensor)
-        sensor_btn_layout.addWidget(self.add_sensor_btn)
-
-        self.edit_sensor_btn = QPushButton('编辑传感器')
-        self.edit_sensor_btn.clicked.connect(self.edit_sensor)
-        sensor_btn_layout.addWidget(self.edit_sensor_btn)
-
-        self.delete_sensor_btn = QPushButton('删除传感器')
-        self.delete_sensor_btn.clicked.connect(self.delete_sensor)
-        sensor_btn_layout.addWidget(self.delete_sensor_btn)
-
-        self.copy_sensor_btn = QPushButton('复制传感器')
-        self.copy_sensor_btn.clicked.connect(self.copy_sensor)
-        sensor_btn_layout.addWidget(self.copy_sensor_btn)
-
-        sensor_btn_layout.addStretch()
-
-        self.global_params_btn = QPushButton('⚙️ 全局参数与变量池')
-        self.global_params_btn.setStyleSheet("""
-            QPushButton {
-                background: #722ed1; color: white; border: none; border-radius: 4px;
-                padding: 8px 18px; font-size: 13px; font-weight: bold;
-            }
-            QPushButton:hover { background: #9254de; }
-        """)
-        self.global_params_btn.clicked.connect(self.open_global_parameter_dialog)
-        sensor_btn_layout.addWidget(self.global_params_btn)
-
-        sensor_layout.addLayout(sensor_btn_layout)
-        sensor_group.setLayout(sensor_layout)
-        h_layout.addWidget(sensor_group)
-
-        layout.addLayout(h_layout)
-
-        # 计算按钮
-        calc_layout = QHBoxLayout()
-        self.calculate_sensors_btn = QPushButton('计算所有传感器')
-        self.calculate_sensors_btn.clicked.connect(self.calculate_sensors)
-        calc_layout.addWidget(self.calculate_sensors_btn)
-
-        self.export_sensor_data_btn = QPushButton('导出传感器数据')
-        self.export_sensor_data_btn.clicked.connect(self.export_sensor_data)
-        calc_layout.addWidget(self.export_sensor_data_btn)
-
-        layout.addLayout(calc_layout)
-
-        # 计算结果预览
-        layout.addWidget(QLabel('传感器数据预览:'))
-        self.sensor_result_table = QTableWidget()
-        self.sensor_result_table.setMaximumHeight(200)
-        layout.addWidget(self.sensor_result_table)
-
-        # 保存选项
-        save_layout = QHBoxLayout()
-        save_layout.addWidget(QLabel('文件名:'))
-        self.sensor_filename_input = QLineEdit()
-        self.sensor_filename_input.setText('sensor_data')
-        save_layout.addWidget(self.sensor_filename_input)
-
-        self.sensor_format_combo = QComboBox()
-        self.sensor_format_combo.addItems(['csv', 'txt', 'xlsx'])
-        save_layout.addWidget(self.sensor_format_combo)
-
-        self.save_sensor_btn = QPushButton('保存传感器数据')
-        self.save_sensor_btn.clicked.connect(self.save_sensor_data)
-        save_layout.addWidget(self.save_sensor_btn)
-
-        save_layout.addStretch()
-        layout.addLayout(save_layout)
-
-        layout.addStretch()
-        self.sensor_tab.setLayout(layout)
-
     def add_fbg(self):
         """添加FBG"""
         dialog = FBGEditDialog(self)
         if dialog.exec():
             fbg = dialog.get_fbg()
             self.sensor_system.add_fbg(fbg)
-            self.refresh_fbg_table()
+            self.sensor_tab_widget.set_fbg_list(self.sensor_system.fbgs)
 
-    def edit_fbg(self):
+    def edit_fbg(self, row: int):
         """编辑选中FBG"""
-        row = self.fbg_table.currentRow()
-        if row >= 0 and row < len(self.sensor_system.fbgs):
+        if 0 <= row < len(self.sensor_system.fbgs):
             fbg = self.sensor_system.fbgs[row]
             dialog = FBGEditDialog(self, fbg)
             if dialog.exec():
                 self.sensor_system.fbgs[row] = dialog.get_fbg()
-                self.refresh_fbg_table()
+                self.sensor_tab_widget.set_fbg_list(self.sensor_system.fbgs)
 
-    def delete_fbg(self):
+    def delete_fbg(self, row: int):
         """删除选中FBG"""
-        row = self.fbg_table.currentRow()
-        if row >= 0 and row < len(self.sensor_system.fbgs):
+        if 0 <= row < len(self.sensor_system.fbgs):
             self.sensor_system.fbgs.pop(row)
-            self.refresh_fbg_table()
-
-    def refresh_fbg_table(self):
-        """刷新FBG表格"""
-        self.fbg_table.setRowCount(len(self.sensor_system.fbgs))
-        for i, fbg in enumerate(self.sensor_system.fbgs):
-            self.fbg_table.setItem(i, 0, QTableWidgetItem(fbg.id))
-            self.fbg_table.setItem(i, 1, QTableWidgetItem(fbg.channel))
-            self.fbg_table.setItem(i, 2, QTableWidgetItem(str(fbg.wavelength_min or '')))
-            self.fbg_table.setItem(i, 3, QTableWidgetItem(str(fbg.wavelength_max or '')))
-        self.fbg_table.resizeColumnsToContents()
+            self.sensor_tab_widget.set_fbg_list(self.sensor_system.fbgs)
 
     def _auto_populate_fbgs(self, df):
-        """从数据文件列名自动识别FBG传感器并填充FBG定义表。
-
-        识别规则（按优先级）：
-        1. 表头以 FBG_ 开头的列 (如 FBG_A1, FBG_B1)
-        2. 表头包含"波长"或"wavelength"的列 (如 波长1, Wavelength_1)
-        3. 表头为 W+数字 格式的列 (如 W1, W2)，但要求至少找到2个以上
-        ID 按序填充为 W1, W2, ..., 波长列映射到实际列名。
-        所有 FBG 波长范围统一设为 1520-1590 nm。
-        """
+        """从数据文件列名自动识别FBG传感器并填充FBG定义表。"""
         if df is None or df.empty:
             return 0
 
-        # 按优先级尝试多种识别规则
         fbg_cols = [str(c) for c in df.columns if str(c).upper().startswith('FBG_')]
         if not fbg_cols:
             fbg_cols = [str(c) for c in df.columns
@@ -1000,39 +404,13 @@ class DataProcessorWindow(QMainWindow):
         if not fbg_cols:
             return 0
 
-        # 清除现有FBG定义，用自动识别的替换
         self.sensor_system.fbgs.clear()
         for i, col in enumerate(fbg_cols):
             self.sensor_system.add_fbg(FBG(f'W{i+1}', col, 1520, 1590))
 
-        self.refresh_fbg_table()
-
+        self.sensor_tab_widget.set_fbg_list(self.sensor_system.fbgs)
         print(f"[FBG自动识别] 从数据文件识别到 {len(fbg_cols)} 个FBG: {fbg_cols}")
         return len(fbg_cols)
-
-    def refresh_sensor_table(self):
-        """刷新传感器表格"""
-        self.sensor_table.setRowCount(len(self.sensor_system.sensors))
-        for i, sensor in enumerate(self.sensor_system.sensors):
-            self.sensor_table.setItem(i, 0, QTableWidgetItem(sensor.id))
-            self.sensor_table.setItem(i, 1, QTableWidgetItem(sensor.location))
-            self.sensor_table.setItem(i, 2, QTableWidgetItem(sensor.get_name()))
-            # 公式列：解耦型显示矩阵配置，普通型显示公式
-            if sensor.sensor_type == 'decoupling' and sensor.decoupling_config:
-                cfg = sensor.decoupling_config
-                formula_str = f'矩阵解耦: {cfg["fbg1"]}/{cfg["fbg2"]}'
-            else:
-                formula_str = sensor.formula
-            self.sensor_table.setItem(i, 3, QTableWidgetItem(formula_str))
-            # 常量列：解耦型显示四个系数，普通型显示常量
-            if sensor.sensor_type == 'decoupling' and sensor.decoupling_config:
-                cfg = sensor.decoupling_config
-                const_str = f'Ke1={cfg["Ke1"]:.2f}, Ke2={cfg["Ke2"]:.2f}, KT1={cfg["KT1"]:.2f}, KT2={cfg["KT2"]:.2f}'
-            else:
-                const_str = ', '.join([f"{k}={v:.2f}" for k, v in sensor.constants.items()])
-            self.sensor_table.setItem(i, 4, QTableWidgetItem(const_str))
-            self.sensor_table.setItem(i, 5, QTableWidgetItem('是' if sensor.active else '否'))
-        self.sensor_table.resizeColumnsToContents()
 
     def add_sensor(self):
         """添加传感器"""
@@ -1040,29 +418,26 @@ class DataProcessorWindow(QMainWindow):
         if dialog.exec():
             sensor = dialog.get_sensor()
             self.sensor_system.add_sensor(sensor)
-            self.refresh_sensor_table()
+            self.sensor_tab_widget.set_sensor_list(self.sensor_system.sensors)
 
-    def edit_sensor(self):
+    def edit_sensor(self, row: int):
         """编辑选中传感器"""
-        row = self.sensor_table.currentRow()
-        if row >= 0 and row < len(self.sensor_system.sensors):
+        if 0 <= row < len(self.sensor_system.sensors):
             sensor = self.sensor_system.sensors[row]
             dialog = SensorEditDialog(self, sensor)
             if dialog.exec():
                 self.sensor_system.sensors[row] = dialog.get_sensor()
-                self.refresh_sensor_table()
+                self.sensor_tab_widget.set_sensor_list(self.sensor_system.sensors)
 
-    def delete_sensor(self):
+    def delete_sensor(self, row: int):
         """删除选中传感器"""
-        row = self.sensor_table.currentRow()
-        if row >= 0 and row < len(self.sensor_system.sensors):
+        if 0 <= row < len(self.sensor_system.sensors):
             self.sensor_system.sensors.pop(row)
-            self.refresh_sensor_table()
+            self.sensor_tab_widget.set_sensor_list(self.sensor_system.sensors)
 
-    def copy_sensor(self):
+    def copy_sensor(self, row: int):
         """复制选中传感器，自动递增ID和公式中的W编号"""
-        row = self.sensor_table.currentRow()
-        if row >= 0 and row < len(self.sensor_system.sensors):
+        if 0 <= row < len(self.sensor_system.sensors):
             original = self.sensor_system.sensors[row]
 
             # 从原始ID提取数字，创建新ID
@@ -1094,75 +469,105 @@ class DataProcessorWindow(QMainWindow):
                 original.active
             )
             self.sensor_system.add_sensor(copied)
-            self.refresh_sensor_table()
+            self.sensor_tab_widget.set_sensor_list(self.sensor_system.sensors)
 
     def open_global_parameter_dialog(self):
-        dialog = GlobalParameterDialog(self, self.sensor_system)
+        dialog = GlobalParameterDialog(self)
+        dialog.set_parameters(self.state.global_parameters)
+
+        def _on_param_updated(name: str, entry: dict):
+            # 更新 AppState (SSOT)
+            gp = GlobalParameter(
+                name=name,
+                value=entry.get('value', 0),
+                unit=entry.get('unit', ''),
+                description=entry.get('description', ''),
+            )
+            new_params = dict(self.state.global_parameters)
+            new_params[name] = gp
+            self.state = self.state.with_global_parameters(new_params)
+
+            # 同步到 SensorSystem（公式计算引擎使用）
+            self.sensor_system.global_parameters[name] = {
+                'value': entry.get('value', 0),
+                'unit': entry.get('unit', ''),
+                'description': entry.get('description', ''),
+            }
+
+            # 自动重算
+            self._recalc_after_global_param_update()
+
+        def _on_param_deleted(name: str):
+            new_params = dict(self.state.global_parameters)
+            new_params.pop(name, None)
+            self.state = self.state.with_global_parameters(new_params)
+            self.sensor_system.global_parameters.pop(name, None)
+            self._recalc_after_global_param_update()
+
+        dialog.param_updated.connect(_on_param_updated)
+        dialog.param_deleted.connect(_on_param_deleted)
+
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.status_bar.showMessage('全局参数已更新')
         else:
             self.status_bar.showMessage('全局参数已关闭')
 
-    def _update_sensor_result_table(self, results):
-        """用计算结果填充传感器数据预览表"""
-        if self.current_data is None:
-            return
-        n_sensors = len(results)
-        n_preview_rows = min(100, len(self.current_data))
+    def _recalc_after_global_param_update(self):
+        """全局参数变更后自动重新计算传感器."""
+        if self.current_data is not None and self.sensor_system.sensors:
+            try:
+                analysis_df, _, _ = self._get_analysis_data()
+                if analysis_df is None or analysis_df.empty:
+                    return
+                results = self.sensor_system.calculate(analysis_df, self.current_columns)
+                self.sensor_results = results
+                self.state = self.state.with_analysis_results(results)
+                self.sensor_tab_widget.set_result_preview(results, analysis_df)
+                self.analysis_tab_widget.set_sensor_results(results)
+                self.refresh_analysis_sensors()
+                self.status_bar.showMessage('全局参数已更新，传感器已重新计算')
+            except Exception as e:
+                print(f'全局参数更新后重算失败: {e}')
 
-        self.sensor_result_table.setColumnCount(n_sensors + 1)
-        self.sensor_result_table.setRowCount(n_preview_rows)
-
-        time_col = '时间' if '时间' in self.current_data.columns else self.current_data.columns[0]
-        headers = ['时间'] + list(results.keys())
-        self.sensor_result_table.setHorizontalHeaderLabels(headers)
-
-        for i in range(n_preview_rows):
-            t = self.current_data[time_col].values[i]
-            self.sensor_result_table.setItem(i, 0, QTableWidgetItem(str(t)))
-            for j, sensor_id in enumerate(results.keys()):
-                vals = results[sensor_id]
-                val = vals[i] if i < len(vals) else None
-                if val is not None:
-                    self.sensor_result_table.setItem(i, j + 1, QTableWidgetItem(f'{val:.2f}'))
-                else:
-                    self.sensor_result_table.setItem(i, j + 1, QTableWidgetItem('N/A'))
-
-        self.sensor_result_table.resizeColumnsToContents()
-
-    def calculate_sensors(self):
+    def calculate_sensors(self, ref_row: int = 0):
         """计算所有传感器"""
         if self.current_data is None:
             QMessageBox.warning(self, '警告', '请先加载数据')
             return
 
         try:
-            ref_row = self.ref_row_spin.value()
             self.sensor_system.set_reference_row(ref_row)
 
-            results = self.sensor_system.calculate(self.current_data, self.current_columns)
+            # 使用跳过暗号行后的清洗数据
+            analysis_df, _, _ = self._get_analysis_data()
+            if analysis_df is None or analysis_df.empty:
+                QMessageBox.warning(self, '警告', '有效数据为空')
+                return
 
-            n_preview_rows = min(100, len(self.current_data))
-            self._update_sensor_result_table(results)
+            results = self.sensor_system.calculate(analysis_df, self.current_columns)
+
+            n_preview_rows = min(100, len(analysis_df))
+            self.sensor_tab_widget.set_result_preview(results, analysis_df)
             self.sensor_results = results
+            self.state = self.state.with_analysis_results(results)
+            self.analysis_tab_widget.set_sensor_results(results)
+            self.refresh_analysis_sensors()
             self.status_bar.showMessage(f'传感器计算完成，预览显示前{n_preview_rows}行')
 
         except Exception as e:
             import traceback
             QMessageBox.critical(self, '错误', f'计算失败: {str(e)}\n\n{traceback.format_exc()}')
 
-    def save_sensor_data(self):
+    def save_sensor_data(self, filename: str = '', fmt: str = 'csv'):
         """保存传感器数据到指定路径"""
         if self.current_data is None:
             QMessageBox.warning(self, '警告', '请先加载数据')
             return
 
-        filename = self.sensor_filename_input.text().strip()
         if not filename:
             QMessageBox.warning(self, '警告', '请输入文件名')
             return
 
-        fmt = self.sensor_format_combo.currentText()
         if fmt == 'csv':
             file_filter = 'CSV Files (*.csv)'
             ext = '.csv'
@@ -1180,14 +585,16 @@ class DataProcessorWindow(QMainWindow):
         )
         if file_path:
             try:
-                ref_row = self.ref_row_spin.value()
+                ref_row = self.sensor_tab_widget.ref_row_spin.value()
                 self.sensor_system.set_reference_row(ref_row)
-                results = self.sensor_system.calculate(self.current_data, self.current_columns)
-
-                time_col = '时间' if '时间' in self.current_data.columns else self.current_data.columns[0]
+                analysis_df, time_col, _ = self._get_analysis_data()
+                if analysis_df is None or analysis_df.empty:
+                    QMessageBox.warning(self, '警告', '有效数据为空')
+                    return
+                results = self.sensor_system.calculate(analysis_df, self.current_columns)
 
                 export_df = pd.DataFrame()
-                export_df['时间'] = self.current_data[time_col]
+                export_df[time_col] = analysis_df[time_col]
                 for sensor_id, values in results.items():
                     export_df[sensor_id] = values
 
@@ -1213,11 +620,14 @@ class DataProcessorWindow(QMainWindow):
         )
         if file_path:
             try:
-                results = self.sensor_system.calculate(self.current_data, self.current_columns)
-                time_col = '时间' if '时间' in self.current_data.columns else self.current_data.columns[0]
+                analysis_df, time_col, _ = self._get_analysis_data()
+                if analysis_df is None or analysis_df.empty:
+                    QMessageBox.warning(self, '警告', '有效数据为空')
+                    return
+                results = self.sensor_system.calculate(analysis_df, self.current_columns)
 
                 export_df = pd.DataFrame()
-                export_df['时间'] = self.current_data[time_col]
+                export_df[time_col] = analysis_df[time_col]
                 for sensor_id, values in results.items():
                     export_df[sensor_id] = values
 
@@ -1267,9 +677,10 @@ class DataProcessorWindow(QMainWindow):
         main_layout.addWidget(self.report_content_stack, 1)
 
 
-        # 项目资料管理页面 (整合了项目内容功能)
-        project_manage_page = self.create_project_manage_page()
-        self.report_content_stack.addWidget(project_manage_page)
+        # 项目资料管理页面
+        self.project_tab_widget = ProjectManagerWidget()
+        self.report_content_stack.addWidget(self.project_tab_widget)
+        self.load_project_list()
 
         # 报告生成工作台 (合并 Word + PPT)
         report_workbench = self.create_report_workbench_page()
@@ -1280,543 +691,243 @@ class DataProcessorWindow(QMainWindow):
         self.report_content_stack.addWidget(ai_diagnosis_page)
 
         # 网络剪藏页面
-        web_clipper_page = self.create_web_clipper_page()
-        self.report_content_stack.addWidget(web_clipper_page)
+        self.clipper_tab_widget = WebClipperWidget()
+        self.report_content_stack.addWidget(self.clipper_tab_widget)
 
         # 知识库管理页面
-        wiki_page = self.create_wiki_page()
-        self.report_content_stack.addWidget(wiki_page)
+        self.wiki_tab_widget = WikiTabWidget()
+        self.report_content_stack.addWidget(self.wiki_tab_widget)
 
         # 技能插件中心页面
-        skill_center_page = self.create_skill_center_page()
-        self.report_content_stack.addWidget(skill_center_page)
+        self.skill_tab_widget = AgentSkillWidget()
+        self.report_content_stack.addWidget(self.skill_tab_widget)
 
         self.report_tab.setLayout(main_layout)
 
-    def create_word_template_page(self):
-        """Word模板配置页面"""
-        page = QWidget()
-        layout = QVBoxLayout()
+        # 加载已保存的 Cookie
+        saved_cookie = self._load_app_settings().get('zhihu_cookie', '')
+        self.clipper_tab_widget.set_cookie(saved_cookie)
+        self.clipper_tab_widget.cookie_changed.connect(
+            lambda c: self._save_app_setting('zhihu_cookie', c)
+        )
+        self.clipper_tab_widget.wiki_page_saved.connect(
+            self.wiki_tab_widget.refresh_wiki_pages
+        )
 
-        # 说明标签
-        info_label = QLabel('Word模板：导入参考模板，主要用于参考报告框架、格式、排版等')
-        info_label.setStyleSheet('color: #666; padding: 10px;')
-        layout.addWidget(info_label)
-
-        # 当前模板状态
-        status_group = QGroupBox('当前模板状态')
-        status_layout = QFormLayout()
-
-        self.word_template_path = QLabel('未选择模板')
-        self.word_template_path.setStyleSheet('color: #999;')
-        status_layout.addRow('模板路径:', self.word_template_path)
-
-        self.word_template_preview = QTextEdit()
-        self.word_template_preview.setReadOnly(True)
-        self.word_template_preview.setMaximumHeight(150)
-        self.word_template_preview.setPlaceholderText('模板预览将显示在这里...')
-        status_layout.addRow('模板内容:', self.word_template_preview)
-
-        status_group.setLayout(status_layout)
-        layout.addWidget(status_group)
-
-        # 操作按钮
-        btn_layout = QHBoxLayout()
-        select_btn = QPushButton('选择Word模板')
-        select_btn.clicked.connect(self.select_word_template)
-        btn_layout.addWidget(select_btn)
-
-        clear_btn = QPushButton('清除模板')
-        clear_btn.clicked.connect(self.clear_word_template)
-        btn_layout.addWidget(clear_btn)
-
-        layout.addLayout(btn_layout)
-
-        # AI模板分析结果
-        ai_group = QGroupBox('AI模板分析结果')
-        ai_layout = QVBoxLayout()
-
-        self.word_template_analysis = QTextEdit()
-        self.word_template_analysis.setReadOnly(True)
-        self.word_template_analysis.setPlaceholderText('AI分析结果将显示在这里...')
-        ai_layout.addWidget(self.word_template_analysis)
-
-        analyze_btn = QPushButton('AI分析模板特征')
-        analyze_btn.clicked.connect(self.analyze_word_template)
-        ai_layout.addWidget(analyze_btn)
-
-        ai_group.setLayout(ai_layout)
-        layout.addWidget(ai_group)
-
-        layout.addStretch()
-        page.setLayout(layout)
-        return page
-
-    def create_ppt_template_page(self):
-        """PPT模板配置页面"""
-        page = QWidget()
-        layout = QVBoxLayout()
-
-        info_label = QLabel('PPT模板：导入参考模板，主要用于参考报告框架、格式、排版等')
-        info_label.setStyleSheet('color: #666; padding: 10px;')
-        layout.addWidget(info_label)
-
-        status_group = QGroupBox('当前模板状态')
-        status_layout = QFormLayout()
-
-        self.ppt_template_path = QLabel('未选择模板')
-        self.ppt_template_path.setStyleSheet('color: #999;')
-        status_layout.addRow('模板路径:', self.ppt_template_path)
-
-        self.ppt_template_preview = QTextEdit()
-        self.ppt_template_preview.setReadOnly(True)
-        self.ppt_template_preview.setMaximumHeight(150)
-        self.ppt_template_preview.setPlaceholderText('模板预览将显示在这里...')
-        status_layout.addRow('模板内容:', self.ppt_template_preview)
-
-        status_group.setLayout(status_layout)
-        layout.addWidget(status_group)
-
-        btn_layout = QHBoxLayout()
-        select_btn = QPushButton('选择PPT模板')
-        select_btn.clicked.connect(self.select_ppt_template)
-        btn_layout.addWidget(select_btn)
-
-        clear_btn = QPushButton('清除模板')
-        clear_btn.clicked.connect(self.clear_ppt_template)
-        btn_layout.addWidget(clear_btn)
-
-        layout.addLayout(btn_layout)
-
-        ai_group = QGroupBox('AI模板分析结果')
-        ai_layout = QVBoxLayout()
-
-        self.ppt_template_analysis = QTextEdit()
-        self.ppt_template_analysis.setReadOnly(True)
-        self.ppt_template_analysis.setPlaceholderText('AI分析结果将显示在这里...')
-        ai_layout.addWidget(self.ppt_template_analysis)
-
-        analyze_btn = QPushButton('AI分析模板特征')
-        analyze_btn.clicked.connect(self.analyze_ppt_template)
-        ai_layout.addWidget(analyze_btn)
-
-        ai_group.setLayout(ai_layout)
-        layout.addWidget(ai_group)
-
-        layout.addStretch()
-        page.setLayout(layout)
-        return page
-
-    def create_project_content_page(self):
-        """项目内容配置页面"""
-        page = QWidget()
-        layout = QVBoxLayout()
-
-        info_label = QLabel('项目内容：导入要生成项目的各种资料，包括文字、图片、图纸等')
-        info_label.setStyleSheet('color: #666; padding: 10px;')
-        layout.addWidget(info_label)
-
-        # 项目资料列表
-        project_group = QGroupBox('项目资料')
-        project_layout = QVBoxLayout()
-
-        self.project_files_list = QListWidget()
-        self.project_files_list.setMaximumHeight(200)
-        project_layout.addWidget(self.project_files_list)
-
-        btn_layout = QHBoxLayout()
-        add_file_btn = QPushButton('添加文件')
-        add_file_btn.clicked.connect(self.add_project_file)
-        btn_layout.addWidget(add_file_btn)
-
-        add_folder_btn = QPushButton('添加文件夹')
-        add_folder_btn.clicked.connect(self.add_project_folder)
-        btn_layout.addWidget(add_folder_btn)
-
-        remove_btn = QPushButton('移除选中')
-        remove_btn.clicked.connect(self.remove_project_file)
-        btn_layout.addWidget(remove_btn)
-
-        project_layout.addLayout(btn_layout)
-        project_group.setLayout(project_layout)
-        layout.addWidget(project_group)
-
-        # AI资料分析
-        ai_group = QGroupBox('AI资料分析')
-        ai_layout = QVBoxLayout()
-
-        self.project_content_analysis = QTextEdit()
-        self.project_content_analysis.setReadOnly(True)
-        self.project_content_analysis.setPlaceholderText('AI分析项目资料结果将显示在这里...')
-        ai_layout.addWidget(self.project_content_analysis)
-
-        analyze_btn = QPushButton('AI分析项目资料')
-        analyze_btn.clicked.connect(self.analyze_project_content)
-        ai_layout.addWidget(analyze_btn)
-
-        ai_group.setLayout(ai_layout)
-        layout.addWidget(ai_group)
-
-        layout.addStretch()
-        page.setLayout(layout)
-        return page
+        self.analysis_tab_widget.set_sensor_system(self.sensor_system)
+        # 分析页"刷新"按钮 → 重新从暗号标注获取分析数据
+        self.analysis_tab_widget.data_refresh_requested.connect(self._on_analysis_refresh_requested)
 
     def create_report_workbench_page(self):
         """统一的报告生成工作台 (合并 Word + PPT)"""
         self.report_workbench_widget = ReportWorkbenchWidget(self)
+        # 信号绑定
+        self.report_workbench_widget.outline_requested.connect(
+            self._handle_outline_generation
+        )
+        self.report_workbench_widget.full_report_requested.connect(
+            self._handle_full_report_generation
+        )
         return self.report_workbench_widget
 
-    def create_word_report_page(self):
-        """[保留] Word报告生成页面"""
-        self.word_report_widget = WordReportWidget(self)
-        return self.word_report_widget
+    # ═══════════════════════════════════════════════
+    # 后台 Worker (QThread)
+    # ═══════════════════════════════════════════════
 
-    def create_ppt_report_page(self):
-        """[保留] PPT报告生成页面"""
-        self.ppt_report_widget = PptReportWidget(self)
-        return self.ppt_report_widget
+    class _ReportWorker(QThread):
+        """通用后台 Worker — 在子线程执行耗时的 AI/渲染任务."""
+
+        finished = pyqtSignal(object)
+        error = pyqtSignal(str)
+
+        def __init__(self, work_fn, args=None, kwargs=None):
+            super().__init__()
+            self._work_fn = work_fn
+            self._args = args or ()
+            self._kwargs = kwargs or {}
+
+        def run(self):
+            try:
+                result = self._work_fn(*self._args, **self._kwargs)
+                self.finished.emit(result)
+            except Exception as e:
+                import traceback
+                self.error.emit(f'{e}\n{traceback.format_exc()}')
+
+    # ═══════════════════════════════════════════════
+    # 大纲生成 — 后台 AI 调用
+    # ═══════════════════════════════════════════════
+
+    def _get_generate_fn(self):
+        """获取 LLM 生成回调.
+
+        优先级: AIClient (DeepSeek) > OllamaClient > 模拟降级.
+        """
+        from core.ai_client import AIClient
+        ai = AIClient.get_instance()
+        if ai.is_available():
+            return ai.generate
+        if self.ollama_client and self.ollama_client.is_available():
+            return self.ollama_client.generate
+        # 降级: 返回模拟生成函数
+        def _fallback(prompt: str) -> str:
+            return (
+                '# 传感器数据分析报告\n\n'
+                '## 数据概述\n'
+                '- 数据来源与采集方式\n'
+                '- 传感器布设方案\n\n'
+                '## 数据质量评估\n'
+                '- 异常值检测结果\n'
+                '- 缺失值统计\n\n'
+                '## 物理量分析\n'
+                '- 应变分析\n'
+                '- 温度分析\n\n'
+                '## 结论与建议\n'
+                '- 主要发现\n'
+                '- 后续工作建议\n'
+            )
+        return _fallback
+
+    def _handle_outline_generation(self, config: dict):
+        """后台生成大纲，完成后填入编辑器."""
+        generate_fn = self._get_generate_fn()
+        self.report_workbench_widget.outline_btn.setEnabled(False)
+        self.report_workbench_widget.outline_btn.setText('⏳ 正在生成大纲...')
+        self.status_bar.showMessage('正在生成大纲...')
+
+        def _on_outline_done(markdown: str):
+            self.report_workbench_widget.set_outline_text(markdown)
+            self.report_workbench_widget.outline_btn.setEnabled(True)
+            self.report_workbench_widget.outline_btn.setText('📝 生成/预览报告大纲')
+            self.status_bar.showMessage('大纲生成完成')
+
+        def _on_outline_error(msg: str):
+            self.report_workbench_widget.outline_btn.setEnabled(True)
+            self.report_workbench_widget.outline_btn.setText('📝 生成/预览报告大纲')
+            self.status_bar.showMessage('大纲生成失败')
+            QMessageBox.critical(self, '大纲生成失败', msg)
+
+        self._outline_worker = self._ReportWorker(
+            generate_outline,
+            args=(config, generate_fn),
+        )
+        self._outline_worker.finished.connect(_on_outline_done)
+        self._outline_worker.error.connect(_on_outline_error)
+        self._outline_worker.start()
+
+    # ═══════════════════════════════════════════════
+    # 完整报告生成 — 后台 AI + 渲染
+    # ═══════════════════════════════════════════════
+
+    def _handle_full_report_generation(self, config: dict, outline: str):
+        """后台生成结构化报告 + 渲染保存 + 自动打开输出目录."""
+        generate_fn = self._get_generate_fn()
+        self.report_workbench_widget.full_report_btn.setEnabled(False)
+        self.report_workbench_widget.outline_btn.setEnabled(False)
+        self.status_bar.showMessage('正在生成完整报告...')
+
+        report_type = config.get('report_type', 'word')
+        ext = '.pptx' if report_type == 'ppt' else '.docx'
+        type_label = 'PPT演示' if report_type == 'ppt' else 'Word报告'
+
+        # 构建输出路径: output_reports/项目名_报告类型_时间戳.ext
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        req_file = config.get('req_file', '')
+        project_name = os.path.splitext(os.path.basename(req_file))[0] if req_file else '数据分析报告'
+        filename = f'{project_name}_{type_label}_{timestamp}{ext}'
+        output_path = os.path.join(REPORT_OUTPUT_DIR, filename)
+
+        template_path = config.get('template_file', '')
+
+        # 项目根目录（用于拼接图片绝对路径）
+        project_dir = os.path.dirname(os.path.abspath(req_file)) if req_file else ''
+
+        # ── Agentic 工具配置（Function Calling） ──
+        from core.tools.chart_tool import (
+            GENERATE_SENSOR_PLOT_TOOL,
+            generate_sensor_plot,
+        )
+
+        state_data = self.state.to_dict()
+        tools_config = {
+            'definitions': [GENERATE_SENSOR_PLOT_TOOL],
+            'executable_map': {
+                'generate_sensor_plot': lambda sid, pt: generate_sensor_plot(
+                    sensor_id=sid,
+                    plot_type=pt,
+                    project_dir=project_dir,
+                    state_data=state_data,
+                ),
+            },
+        }
+
+        def _build_and_save():
+            # 1. AI 生成结构化数据
+            builder_data = generate_structured_report(
+                config, outline, report_type, generate_fn,
+                tools_config=tools_config,
+            )
+            # 2. 调用文件级渲染器直接保存到 output_path
+            if report_type == 'ppt':
+                from py.report_builder.ppt_builder import PPTBuilder
+                from py.report_builder.models import PPTReport
+                report = PPTReport.from_dict(builder_data)
+                builder = PPTBuilder()
+                builder.build_ppt_report(report, template_path, output_path, project_dir=project_dir)
+            else:
+                from py.report_builder.word_builder import WordBuilder
+                from py.report_builder.models import WordReport
+                report = WordReport.from_dict(builder_data)
+                builder = WordBuilder()
+                builder.build_word_report(report, template_path, output_path, project_dir=project_dir)
+            return output_path
+
+        def _on_report_done(path: str):
+            self.report_workbench_widget.full_report_btn.setEnabled(True)
+            self.report_workbench_widget.outline_btn.setEnabled(True)
+            self.status_bar.showMessage(f'报告已保存: {os.path.basename(path)}')
+
+            QMessageBox.information(self, '生成成功', f'报告已保存至:\n{path}')
+            # 自动打开输出目录
+            try:
+                os.startfile(REPORT_OUTPUT_DIR)
+            except Exception:
+                pass
+
+        def _on_report_error(msg: str):
+            self.report_workbench_widget.full_report_btn.setEnabled(True)
+            self.report_workbench_widget.outline_btn.setEnabled(True)
+            self.status_bar.showMessage('报告生成失败')
+            QMessageBox.critical(self, '报告生成失败', msg)
+
+        self._report_worker = self._ReportWorker(_build_and_save)
+        self._report_worker.finished.connect(_on_report_done)
+        self._report_worker.error.connect(_on_report_error)
+        self._report_worker.start()
 
     def create_ai_diagnosis_page(self):
         """AI诊断页面"""
         self.ai_diagnosis_widget = AiDiagnosisWidget(self)
         return self.ai_diagnosis_widget
 
-    def create_project_manage_page(self):
-        """项目资料管理页面 - 整合项目内容管理"""
-        page = QWidget()
-        page.setStyleSheet("background-color: #f0f2f5;")
-        main_layout = QHBoxLayout(page)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(14)
-
-        # ========== 创建水平分割器 ==========
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(8)
-        splitter.setStyleSheet("""
-            QSplitter::handle {
-                background: linear-gradient(to bottom, #e0e0e0, #c0c0c0);
-            }
-            QSplitter::handle:hover {
-                background: linear-gradient(to bottom, #1890ff, #40a9ff);
-            }
-        """)
-
-        # =============================================
-        # 左侧面板 - 项目列表
-        # =============================================
-        left_panel = QWidget()
-        left_panel.setMinimumWidth(280)
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(12)
-
-        # 项目列表容器
-        project_list_group = QGroupBox("项目列表")
-        project_list_group.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid #e0e0e0;
-                border-radius: 8px;
-                font-weight: bold;
-                color: #722ed1;
-                padding: 10px;
-                padding-top: 22px;
-                background: white;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-        """)
-        project_list_inner = QVBoxLayout(project_list_group)
-        project_list_inner.setSpacing(10)
-
-        # 项目列表
-        self.project_list_widget = QListWidget()
-        self.project_list_widget.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #ebebeb;
-                border-radius: 4px;
-                background: #fafafa;
-            }
-            QListWidget::item {
-                padding: 12px;
-                border-bottom: 1px solid #f5f5f5;
-            }
-            QListWidget::item:hover {
-                background: #e6f4ff;
-            }
-            QListWidget::item:selected {
-                background: #722ed1;
-                color: white;
-            }
-        """)
-        self.project_list_widget.itemClicked.connect(self.on_project_selected)
-        project_list_inner.addWidget(self.project_list_widget)
-
-        # 项目操作按钮行
-        project_btn_layout = QHBoxLayout()
-        project_btn_layout.setSpacing(8)
-
-        new_project_btn = QPushButton("新建项目")
-        new_project_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #52c41a;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #73d13d;
-            }
-        """)
-        new_project_btn.clicked.connect(self.on_new_project)
-        project_btn_layout.addWidget(new_project_btn)
-
-        delete_project_btn = QPushButton("删除项目")
-        delete_project_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #ff4d4f;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #ff7875;
-            }
-        """)
-        delete_project_btn.clicked.connect(self.on_delete_project)
-        project_btn_layout.addWidget(delete_project_btn)
-
-        open_project_btn = QPushButton("打开项目")
-        open_project_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1890ff;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 12px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #40a9ff;
-            }
-        """)
-        open_project_btn.clicked.connect(self.on_open_project_folder)
-        project_btn_layout.addWidget(open_project_btn)
-
-        project_list_inner.addLayout(project_btn_layout)
-        left_layout.addWidget(project_list_group)
-
-        # 统计信息
-        stats_group = QGroupBox("项目统计")
-        stats_group.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid #e0e0e0;
-                border-radius: 8px;
-                font-weight: bold;
-                color: #1890ff;
-                padding: 10px;
-                padding-top: 22px;
-                background: white;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-        """)
-        stats_layout = QFormLayout(stats_group)
-        stats_layout.setSpacing(8)
-
-        self.project_stats_label = QLabel("项目数: 0")
-        stats_layout.addRow("项目数:", self.project_stats_label)
-
-        self.project_folders_label = QLabel("子文件夹: 0")
-        stats_layout.addRow("子文件夹:", self.project_folders_label)
-
-        self.project_files_count_label = QLabel("文件数: 0")
-        stats_layout.addRow("文件数:", self.project_files_count_label)
-
-        left_layout.addWidget(stats_group)
-
-        # =============================================
-        # 右侧面板 - 项目内容
-        # =============================================
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(14)
-
-        # 项目内容容器
-        content_group = QGroupBox("项目内容")
-        content_group.setStyleSheet("""
-            QGroupBox {
-                border: 1px solid #e0e0e0;
-                border-radius: 8px;
-                font-weight: bold;
-                color: #1890ff;
-                padding: 10px;
-                padding-top: 22px;
-                background: white;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-        """)
-        content_inner = QVBoxLayout(content_group)
-        content_inner.setSpacing(10)
-
-        # 当前项目标题
-        self.current_project_label = QLabel("请选择一个项目")
-        self.current_project_label.setStyleSheet("""
-            color: #333;
-            font-size: 15px;
-            font-weight: bold;
-            padding: 8px;
-            background: #f5f5f5;
-            border-radius: 4px;
-        """)
-        content_inner.addWidget(self.current_project_label)
-
-        # 文件/文件夹树形列表
-        self.project_tree_widget = QTreeWidget()
-        self.project_tree_widget.setHeaderLabels(["名称", "类型", "大小"])
-        self.project_tree_widget.setStyleSheet("""
-            QTreeWidget {
-                border: 1px solid #ebebeb;
-                border-radius: 4px;
-                background: white;
-            }
-            QTreeWidget::item {
-                padding: 8px;
-            }
-            QTreeWidget::item:hover {
-                background: #e6f4ff;
-            }
-            QTreeWidget::item:selected {
-                background: #1890ff;
-                color: white;
-            }
-        """)
-        self.project_tree_widget.setColumnWidth(0, 200)
-        self.project_tree_widget.setColumnWidth(1, 80)
-        content_inner.addWidget(self.project_tree_widget, stretch=1)
-
-        # 文件操作按钮行
-        file_btn_layout = QHBoxLayout()
-        file_btn_layout.setSpacing(8)
-
-        add_folder_btn = QPushButton("新建文件夹")
-        add_folder_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #52c41a;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 14px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #73d13d;
-            }
-        """)
-        add_folder_btn.clicked.connect(self.on_add_folder_to_project)
-        file_btn_layout.addWidget(add_folder_btn)
-
-        add_file_btn = QPushButton("添加文件")
-        add_file_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1890ff;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 14px;
-                font-weight: bold;
-            }
-            add_file_btn:hover {
-                background-color: #40a9ff;
-            }
-        """)
-        add_file_btn.clicked.connect(self.on_add_file_to_project)
-        file_btn_layout.addWidget(add_file_btn)
-
-        delete_item_btn = QPushButton("删除选中")
-        delete_item_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #ff4d4f;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 14px;
-                font-weight: bold;
-            }
-            delete_item_btn:hover {
-                background-color: #ff7875;
-            }
-        """)
-        delete_item_btn.clicked.connect(self.on_delete_project_item)
-        file_btn_layout.addWidget(delete_item_btn)
-
-        open_item_btn = QPushButton("打开文件")
-        open_item_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #faad14;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 10px 14px;
-                font-weight: bold;
-            }
-            open_item_btn:hover {
-                background-color: #ffc53d;
-            }
-        """)
-        open_item_btn.clicked.connect(self.on_open_project_item)
-        file_btn_layout.addWidget(open_item_btn)
-
-        content_inner.addLayout(file_btn_layout)
-        right_layout.addWidget(content_group)
-
-        # 添加到分割器
-        splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 280)
-        splitter.setStretchFactor(1, 720)
-
-        main_layout.addWidget(splitter)
-
-        # 初始化项目列表
-        self.load_project_list()
-
-        return page
-
     def load_project_list(self):
         """加载项目列表"""
-        self.project_list_widget.clear()
         settings = QSettings('DataProcessor', 'Pro')
         projects_dir = settings.value('projects_directory', '')
 
-        if not projects_dir or not os.path.exists(projects_dir):
-            return
+        items = []
+        if projects_dir and os.path.exists(projects_dir):
+            try:
+                for entry in os.listdir(projects_dir):
+                    if os.path.isdir(os.path.join(projects_dir, entry)):
+                        items.append(entry)
+            except Exception as e:
+                print(f"加载项目列表失败: {e}")
 
-        try:
-            for item in os.listdir(projects_dir):
-                item_path = os.path.join(projects_dir, item)
-                if os.path.isdir(item_path):
-                    self.project_list_widget.addItem(item)
-        except Exception as e:
-            print(f"加载项目列表失败: {e}")
+        self.project_tab_widget.set_project_list(items)
 
-    def on_project_selected(self, item):
+    def on_project_selected(self, project_name: str):
         """选择项目时加载内容"""
-        project_name = item.text()
         settings = QSettings('DataProcessor', 'Pro')
         projects_dir = settings.value('projects_directory', '')
 
@@ -1824,55 +935,8 @@ class DataProcessorWindow(QMainWindow):
             return
 
         self.current_project_path = os.path.join(projects_dir, project_name)
-        self.current_project_label.setText(f"当前项目: {project_name}")
-        self.current_project_label.setStyleSheet("""
-            color: #1890ff;
-            font-size: 15px;
-            font-weight: bold;
-            padding: 8px;
-            background: #e6f4ff;
-            border-radius: 4px;
-        """)
-
-        # 加载项目内容到树形列表
-        self.load_project_tree()
-
-    def load_project_tree(self):
-        """加载项目内容到树形列表"""
-        self.project_tree_widget.clear()
-
-        if not hasattr(self, 'current_project_path') or not os.path.exists(self.current_project_path):
-            return
-
-        try:
-            root = QTreeWidgetItem(self.project_tree_widget, [os.path.basename(self.current_project_path), "文件夹", "-"])
-            self._load_folder_to_tree(self.current_project_path, root)
-            self.project_tree_widget.expandAll()
-        except Exception as e:
-            print(f"加载项目内容失败: {e}")
-
-    def _load_folder_to_tree(self, folder_path, parent_item):
-        """递归加载文件夹到树形列表"""
-        try:
-            for item_name in sorted(os.listdir(folder_path)):
-                item_path = os.path.join(folder_path, item_name)
-                if os.path.isdir(item_path):
-                    folder_item = QTreeWidgetItem(parent_item, [item_name, "文件夹", "-"])
-                    self._load_folder_to_tree(item_path, folder_item)
-                else:
-                    size = os.path.getsize(item_path)
-                    size_str = self._format_size(size)
-                    QTreeWidgetItem(parent_item, [item_name, "文件", size_str])
-        except Exception as e:
-            print(f"加载文件夹失败: {e}")
-
-    def _format_size(self, size):
-        """格式化文件大小"""
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size < 1024.0:
-                return f"{size:.1f} {unit}"
-            size /= 1024.0
-        return f"{size:.1f} TB"
+        self.project_tab_widget.set_current_project_label(project_name, exists=True)
+        self.project_tab_widget.load_project_tree(self.current_project_path)
 
     def on_new_project(self):
         """新建项目"""
@@ -1925,52 +989,34 @@ class DataProcessorWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, '错误', f'创建项目失败: {str(e)}')
 
-    def on_delete_project(self):
+    def on_delete_project(self, project_name: str):
         """删除项目"""
-        current_item = self.project_list_widget.currentItem()
-        if not current_item:
-            QMessageBox.warning(self, '提示', '请先选择要删除的项目')
-            return
-
-        project_name = current_item.text()
         reply = QMessageBox.question(
             self, '确认删除',
             f'确定删除项目 "{project_name}" 吗?\n此操作不可恢复!',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-
         if reply != QMessageBox.StandardButton.Yes:
             return
 
         settings = QSettings('DataProcessor', 'Pro')
         projects_dir = settings.value('projects_directory', '')
-
         if not projects_dir:
             return
 
-        project_path = os.path.join(projects_dir, project_name)
-
         try:
             import shutil
-            shutil.rmtree(project_path)
+            shutil.rmtree(os.path.join(projects_dir, project_name))
             self.load_project_list()
-            self.project_tree_widget.clear()
-            self.current_project_label.setText("请选择一个项目")
-            self.current_project_label.setStyleSheet("""
-                color: #333;
-                font-size: 15px;
-                font-weight: bold;
-                padding: 8px;
-                background: #f5f5f5;
-                border-radius: 4px;
-            """)
+            self.project_tab_widget.clear_tree()
+            self.project_tab_widget.set_current_project_label("")
             QMessageBox.information(self, '成功', f'项目 "{project_name}" 已删除')
         except Exception as e:
             QMessageBox.warning(self, '错误', f'删除项目失败: {str(e)}')
 
     def on_open_project_folder(self):
         """用资源管理器打开项目文件夹"""
-        current_item = self.project_list_widget.currentItem()
+        current_item = self.project_tab_widget.project_list_widget.currentItem()
         if not current_item:
             QMessageBox.warning(self, '提示', '请先选择要打开的项目')
             return
@@ -1978,12 +1024,10 @@ class DataProcessorWindow(QMainWindow):
         project_name = current_item.text()
         settings = QSettings('DataProcessor', 'Pro')
         projects_dir = settings.value('projects_directory', '')
-
         if not projects_dir:
             return
 
         project_path = os.path.join(projects_dir, project_name)
-
         if os.path.exists(project_path):
             os.startfile(project_path)
 
@@ -1997,17 +1041,15 @@ class DataProcessorWindow(QMainWindow):
         if not ok or not folder_name.strip():
             return
 
-        folder_name = folder_name.strip()
-        folder_path = os.path.join(self.current_project_path, folder_name)
-
+        folder_path = os.path.join(self.current_project_path, folder_name.strip())
         if os.path.exists(folder_path):
             QMessageBox.warning(self, '警告', '文件夹已存在!')
             return
 
         try:
             os.makedirs(folder_path)
-            self.load_project_tree()
-            QMessageBox.information(self, '成功', f'文件夹 "{folder_name}" 创建成功!')
+            self.project_tab_widget.load_project_tree(self.current_project_path)
+            QMessageBox.information(self, '成功', f'文件夹 "{folder_name.strip()}" 创建成功!')
         except Exception as e:
             QMessageBox.warning(self, '错误', f'创建文件夹失败: {str(e)}')
 
@@ -2024,37 +1066,31 @@ class DataProcessorWindow(QMainWindow):
             self, '选择要添加的文件', last_dir,
             '所有文件 (*.*);;文档 (*.doc *.docx *.pdf *.txt);;图片 (*.png *.jpg *.jpeg *.gif);;视频 (*.mp4 *.avi *.mov)'
         )
-
         if not file_paths:
             return
 
         try:
             settings.setValue('project_file_last_dir', os.path.dirname(file_paths[0]))
 
-            # 获取当前选中的节点
-            current_item = self.project_tree_widget.currentItem()
+            tree = self.project_tab_widget.project_tree_widget
+            current_item = tree.currentItem()
             target_dir = self.current_project_path
+            if current_item and current_item.text(1) == "文件夹":
+                target_dir = os.path.join(self.current_project_path, current_item.text(0))
 
-            if current_item:
-                item_type = current_item.text(1)
-                if item_type == "文件夹":
-                    target_dir = os.path.join(self.current_project_path, current_item.text(0))
-
-            # 复制文件
             import shutil
-            for file_path in file_paths:
-                file_name = os.path.basename(file_path)
-                dest_path = os.path.join(target_dir, file_name)
-                shutil.copy2(file_path, dest_path)
+            for fp in file_paths:
+                shutil.copy2(fp, os.path.join(target_dir, os.path.basename(fp)))
 
-            self.load_project_tree()
+            self.project_tab_widget.load_project_tree(self.current_project_path)
             QMessageBox.information(self, '成功', f'已添加 {len(file_paths)} 个文件!')
         except Exception as e:
             QMessageBox.warning(self, '错误', f'添加文件失败: {str(e)}')
 
     def on_delete_project_item(self):
         """删除选中的文件或文件夹"""
-        current_item = self.project_tree_widget.currentItem()
+        tree = self.project_tab_widget.project_tree_widget
+        current_item = tree.currentItem()
         if not current_item:
             QMessageBox.warning(self, '提示', '请先选择要删除的内容')
             return
@@ -2071,7 +1107,6 @@ class DataProcessorWindow(QMainWindow):
             f'确定删除 {"文件夹" if item_type == "文件夹" else "文件"} "{item_name}" 吗?\n此操作不可恢复!',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-
         if reply != QMessageBox.StandardButton.Yes:
             return
 
@@ -2083,14 +1118,14 @@ class DataProcessorWindow(QMainWindow):
             else:
                 os.remove(item_path)
 
-            self.load_project_tree()
+            self.project_tab_widget.load_project_tree(self.current_project_path)
             QMessageBox.information(self, '成功', f'"{item_name}" 已删除')
         except Exception as e:
             QMessageBox.warning(self, '错误', f'删除失败: {str(e)}')
 
     def on_open_project_item(self):
         """打开选中的文件"""
-        current_item = self.project_tree_widget.currentItem()
+        current_item = self.project_tab_widget.project_tree_widget.currentItem()
         if not current_item:
             QMessageBox.warning(self, '提示', '请先选择要打开的文件')
             return
@@ -2114,1695 +1149,19 @@ class DataProcessorWindow(QMainWindow):
 
     def clear_all_project_files(self):
         """清空所有项目文件"""
-        self.project_list_widget.clear()
-        self.project_tree_widget.clear()
-        self.current_project_label.setText("请选择一个项目")
+        self.project_tab_widget.set_project_list([])
+        self.project_tab_widget.clear_tree()
+        self.project_tab_widget.set_current_project_label("")
 
-    # ============ 知识库管理页面 ============
-    def create_wiki_page(self):
-        """知识库管理页面 — 顶部工具栏 + 中部导航条 + 底部沉浸式分割布局"""
-        page = QWidget()
-        outer_layout = QVBoxLayout(page)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        outer_layout.setSpacing(0)
+    # ============ [wiki_tab.py] 知识库管理页面已提取 ============
 
-        # ── 根层切换栈：0=正常布局 / 1=全屏沉浸阅读 ──
-        self.wiki_root_stack = QStackedWidget()
+    # ============ [clipper_tab.py] 网络剪藏页面已提取 ============
 
-        # ═══════════════════════════════════════════════════════════
-        # Page 0: 正常编辑布局
-        # ═══════════════════════════════════════════════════════════
-        normal_widget = QWidget()
-        normal_layout = QVBoxLayout(normal_widget)
-        normal_layout.setContentsMargins(16, 12, 16, 12)
-        normal_layout.setSpacing(8)
-
-        # ── 1. 顶部工具栏 ──
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(12)
-
-        info_label = QLabel(
-            '知识库管理 — 本地化 Markdown 文档系统：'
-            '支持页面创建/编辑/搜索/删除，可上传外部文件，与 AI Agent 技能深度联动'
-        )
-        info_label.setStyleSheet('color: #555; font-size: 13px; padding: 6px 0;')
-        toolbar.addWidget(info_label)
-        toolbar.addStretch()
-
-        btn_style_primary = """
-            QPushButton {
-                background: #1890ff; color: white; border: none; border-radius: 4px;
-                padding: 7px 16px; font-size: 13px; font-weight: bold;
-            }
-            QPushButton:hover { background: #40a9ff; }
-        """
-        btn_style_secondary = """
-            QPushButton {
-                background: white; color: #555; border: 1px solid #d9d9d9; border-radius: 4px;
-                padding: 7px 14px; font-size: 13px;
-            }
-            QPushButton:hover { color: #1890ff; border-color: #1890ff; }
-        """
-        btn_style_danger = """
-            QPushButton {
-                background: white; color: #ff4d4f; border: 1px solid #ffccc7; border-radius: 4px;
-                padding: 7px 14px; font-size: 13px;
-            }
-            QPushButton:hover { color: white; background: #ff4d4f; border-color: #ff4d4f; }
-        """
-
-        new_page_btn = QPushButton("+ 新建")
-        new_page_btn.setStyleSheet(btn_style_primary)
-        new_page_btn.clicked.connect(self.on_wiki_new_page)
-        toolbar.addWidget(new_page_btn)
-
-        del_page_btn = QPushButton("删除")
-        del_page_btn.setStyleSheet(btn_style_danger)
-        del_page_btn.clicked.connect(self.on_wiki_delete_page)
-        toolbar.addWidget(del_page_btn)
-
-        upload_btn = QPushButton("上传文件")
-        upload_btn.setStyleSheet(btn_style_secondary)
-        upload_btn.clicked.connect(self.on_wiki_upload_file)
-        toolbar.addWidget(upload_btn)
-
-        help_btn = QPushButton("说明")
-        help_btn.setStyleSheet(btn_style_secondary)
-        help_btn.clicked.connect(self.show_wiki_help)
-        toolbar.addWidget(help_btn)
-
-        save_wiki_btn = QPushButton("保存页面")
-        save_wiki_btn.setStyleSheet(btn_style_primary)
-        save_wiki_btn.clicked.connect(self.on_wiki_save)
-        toolbar.addWidget(save_wiki_btn)
-
-        normal_layout.addLayout(toolbar)
-
-        # ── 2. 中部导航条 ──
-        navbar = QHBoxLayout()
-        navbar.setSpacing(10)
-
-        self.wiki_search_input = QLineEdit()
-        self.wiki_search_input.setPlaceholderText("搜索关键词...")
-        self.wiki_search_input.setStyleSheet("""
-            QLineEdit {
-                border: 1px solid #d9d9d9; border-radius: 4px;
-                padding: 8px 12px; font-size: 13px; background: white;
-            }
-            QLineEdit:focus { border-color: #1890ff; }
-        """)
-        navbar.addWidget(self.wiki_search_input, stretch=1)
-
-        wiki_search_btn = QPushButton("搜索")
-        wiki_search_btn.setStyleSheet(btn_style_primary)
-        wiki_search_btn.clicked.connect(self.on_wiki_search)
-        navbar.addWidget(wiki_search_btn)
-
-        navbar.addSpacing(16)
-        sep = QLabel()
-        sep.setFixedWidth(1)
-        sep.setStyleSheet("background: #e8e8e8;")
-        sep.setFixedHeight(28)
-        navbar.addWidget(sep)
-        navbar.addSpacing(16)
-
-        title_label = QLabel("页面标题:")
-        title_label.setStyleSheet("font-weight: bold; color: #333; font-size: 13px;")
-        navbar.addWidget(title_label)
-
-        self.wiki_title_input = QLineEdit()
-        self.wiki_title_input.setPlaceholderText("输入页面标题...")
-        self.wiki_title_input.setStyleSheet("""
-            QLineEdit {
-                border: 1px solid #d9d9d9; border-radius: 4px;
-                padding: 8px 12px; font-size: 14px; font-weight: bold; background: white;
-            }
-            QLineEdit:focus { border-color: #1890ff; }
-        """)
-        self.wiki_title_input.textChanged.connect(self.on_wiki_title_changed)
-        navbar.addWidget(self.wiki_title_input, stretch=2)
-
-        normal_layout.addLayout(navbar)
-
-        # ── 搜索结果列表 ──
-        self.wiki_search_result = QListWidget()
-        self.wiki_search_result.setMaximumHeight(100)
-        self.wiki_search_result.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #ffd666; border-radius: 4px;
-                background: #fffbe6; margin: 0; padding: 4px;
-            }
-            QListWidget::item {
-                padding: 6px 10px; color: #ad6800; border-bottom: 1px solid #fff1b8;
-            }
-            QListWidget::item:hover { background: #fff1b8; }
-        """)
-        self.wiki_search_result.itemClicked.connect(self.on_wiki_search_result_clicked)
-        self.wiki_search_result.hide()
-        normal_layout.addWidget(self.wiki_search_result)
-
-        # ── 3. 底部沉浸式工作区 ──
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(6)
-        splitter.setStyleSheet("""
-            QSplitter::handle { background: #e8e8e8; border-radius: 2px; }
-            QSplitter::handle:hover { background: #1890ff; }
-        """)
-
-        # 左侧：页面列表
-        left_panel = QWidget()
-        left_panel.setMinimumWidth(180)
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 4, 0)
-        left_layout.setSpacing(6)
-
-        page_list_label = QLabel("知识库页面")
-        page_list_label.setStyleSheet(
-            "font-weight: bold; color: #333; font-size: 13px; padding: 2px 0;"
-        )
-        left_layout.addWidget(page_list_label)
-
-        self.wiki_page_list = QListWidget()
-        self.wiki_page_list.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #e0e0e0; border-radius: 4px;
-                background: #fafafa; outline: none;
-            }
-            QListWidget::item {
-                padding: 10px 14px; border-bottom: 1px solid #f0f0f0;
-            }
-            QListWidget::item:hover { background: #e6f4ff; }
-            QListWidget::item:selected {
-                background: #1890ff; color: white; border-radius: 2px;
-            }
-        """)
-        self.wiki_page_list.itemClicked.connect(self.on_wiki_page_clicked)
-        left_layout.addWidget(self.wiki_page_list, stretch=1)
-
-        splitter.addWidget(left_panel)
-
-        # 右侧：编辑器
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(4, 0, 0, 0)
-        right_layout.setSpacing(8)
-
-        editor_header = QHBoxLayout()
-        editor_header.setSpacing(8)
-
-        editor_label = QLabel("页面内容 (支持 Markdown)")
-        editor_label.setStyleSheet("font-weight: bold; color: #333; font-size: 13px;")
-        editor_header.addWidget(editor_label)
-        editor_header.addStretch()
-
-        self.wiki_fullscreen_btn = QPushButton("沉浸阅读")
-        self.wiki_fullscreen_btn.setStyleSheet("""
-            QPushButton {
-                background: white; border: 1px solid #d9d9d9; border-radius: 4px;
-                padding: 5px 14px; font-size: 12px; color: #555;
-            }
-            QPushButton:hover { color: #1890ff; border-color: #1890ff; }
-        """)
-        self.wiki_fullscreen_btn.clicked.connect(self._on_wiki_fullscreen_enter)
-        editor_header.addWidget(self.wiki_fullscreen_btn)
-        right_layout.addLayout(editor_header)
-
-        # 保留旧变量名兼容（内部已不再使用，但其他方法可能引用）
-        self.wiki_content_stack = QStackedWidget()
-        self.wiki_mode_btn = self.wiki_fullscreen_btn  # 兼容旧的引用
-
-        self.wiki_content = QTextEdit()
-        self.wiki_content.setPlaceholderText(
-            "# 一级标题\n## 二级标题\n- 列表项\n```python\n代码块\n```\n**粗体** *斜体*"
-        )
-        self.wiki_content.setStyleSheet("""
-            QTextEdit {
-                border: 1px solid #e0e0e0; border-radius: 4px;
-                padding: 16px; font-family: 'Consolas', 'Microsoft YaHei', monospace;
-                font-size: 13px; line-height: 1.7; background: white;
-            }
-            QTextEdit:focus { border-color: #1890ff; }
-        """)
-        right_layout.addWidget(self.wiki_content, stretch=1)
-
-        splitter.addWidget(right_panel)
-        splitter.setSizes([260, 840])
-
-        normal_layout.addWidget(splitter, stretch=1)
-
-        self.wiki_root_stack.addWidget(normal_widget)  # index 0
-
-        # ═══════════════════════════════════════════════════════════
-        # Page 1: 全屏沉浸式阅读
-        # ═══════════════════════════════════════════════════════════
-        fullscreen_widget = QWidget()
-        fullscreen_layout = QVBoxLayout(fullscreen_widget)
-        fullscreen_layout.setContentsMargins(0, 0, 0, 0)
-        fullscreen_layout.setSpacing(0)
-
-        # 全屏顶栏
-        fs_topbar = QHBoxLayout()
-        fs_topbar.setContentsMargins(20, 12, 20, 12)
-        fs_topbar.setSpacing(12)
-
-        self.wiki_fs_title = QLabel("")
-        self.wiki_fs_title.setStyleSheet(
-            "font-size: 15px; font-weight: bold; color: #333;"
-        )
-        fs_topbar.addWidget(self.wiki_fs_title, stretch=1)
-
-        exit_fs_btn = QPushButton("返回编辑")
-        exit_fs_btn.setStyleSheet("""
-            QPushButton {
-                background: #1890ff; color: white; border: none; border-radius: 4px;
-                padding: 7px 18px; font-size: 13px; font-weight: bold;
-            }
-            QPushButton:hover { background: #40a9ff; }
-        """)
-        exit_fs_btn.clicked.connect(self._on_wiki_fullscreen_exit)
-        fs_topbar.addWidget(exit_fs_btn)
-
-        fullscreen_layout.addLayout(fs_topbar)
-
-        # 分隔线
-        fs_sep = QLabel()
-        fs_sep.setFixedHeight(1)
-        fs_sep.setStyleSheet("background: #e8e8e8;")
-        fullscreen_layout.addWidget(fs_sep)
-
-        # 全屏阅读浏览器
-        from PyQt6.QtWidgets import QTextBrowser
-        self.wiki_fullscreen_browser = QTextBrowser()
-        self.wiki_fullscreen_browser.setOpenExternalLinks(True)
-        self.wiki_fullscreen_browser.setStyleSheet("""
-            QTextBrowser {
-                border: none; padding: 0px 4% 24px; background: #fffdf7;
-                font-size: 16px; line-height: 1.9;
-            }
-        """)
-        # 禁止横向滚动条，内容自适应容器宽度
-        self.wiki_fullscreen_browser.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.wiki_fullscreen_browser.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        fullscreen_layout.addWidget(self.wiki_fullscreen_browser, stretch=1)
-
-        self.wiki_root_stack.addWidget(fullscreen_widget)  # index 1
-        self.wiki_root_stack.setCurrentIndex(0)
-
-        outer_layout.addWidget(self.wiki_root_stack)
-
-        # ── 初始化 ──
-        self.wiki_fs = WikiFileSystem()
-        self.refresh_wiki_pages()
-        # 后台建立向量索引 (首次启动或新页面)
-        self._init_wiki_embeddings()
-
-        return page
-
-    def refresh_wiki_pages(self):
-        """刷新Wiki页面列表"""
-        self.wiki_page_list.clear()
-        pages = self.wiki_fs.list_pages()
-        # 解析页面列表，提取页面名
-        for line in pages.split('\n'):
-            if line.startswith('## '):
-                page_name = line[3:].strip()
-                self.wiki_page_list.addItem(page_name)
-
-    def _init_wiki_embeddings(self):
-        """后台线程初始化语义搜索向量索引（静默失败不影响主流程）"""
-        import threading
-
-        def _rebuild():
-            try:
-                # 检查是否已有向量索引
-                self.wiki_fs._ensure_chroma()
-                existing = self.wiki_fs._collection.count()
-                page_count = len(self.wiki_fs._load_map().get("index", {}))
-                if existing >= page_count and page_count > 0:
-                    print(f"[Wiki] 向量索引已就绪: {existing} 条")
-                    return
-                print(f"[Wiki] 向量索引不完整 ({existing}/{page_count})，开始后台重建...")
-                count = self.wiki_fs.rebuild_embeddings()
-                print(f"[Wiki] 向量索引后台重建完成: {count} 页")
-            except ImportError:
-                pass  # 未安装依赖，静默跳过
-            except Exception as e:
-                print(f"[Wiki] 向量索引初始化跳过: {e}")
-
-        t = threading.Thread(target=_rebuild, daemon=True)
-        t.start()
-
-    def on_wiki_page_clicked(self, item):
-        """点击Wiki页面时加载内容"""
-        # 退出全屏模式
-        if self.wiki_root_stack.currentIndex() == 1:
-            self.wiki_root_stack.setCurrentIndex(0)
-        page_name = item.text()
-        content = self.wiki_fs.read_wiki_page(page_name)
-        if content and not content.startswith('Error:'):
-            self.wiki_title_input.setText(page_name)
-            self.wiki_content.setPlainText(content)
-        else:
-            self.wiki_title_input.setText(page_name)
-            self.wiki_content.clear()
-
-    def _on_wiki_fullscreen_enter(self) -> None:
-        """进入全屏沉浸式阅读"""
-        md_text = self.wiki_content.toPlainText()
-        if not md_text.strip():
-            QMessageBox.information(self, '提示', '请先编写或加载页面内容后再进入沉浸阅读')
-            return
-        html = self._markdown_to_html(md_text)
-        import re as _re
-        from PyQt6.QtGui import QImage, QTextDocument
-        from PyQt6.QtCore import QByteArray, QUrl
-        _wiki_base = str(self.wiki_fs.base_dir.resolve()).replace("\\", "/")
-        # 创建新文档并注册图片资源，避免 setHtml() 替换文档导致资源丢失
-        _doc = QTextDocument()
-        _img_index = 0
-        def _replace_img_src(m):
-            nonlocal _img_index
-            rel = m.group(1)
-            abs_path = _wiki_base + "/" + rel
-            try:
-                # QPixmap 在 Python 3.14 / Windows 含中文路径时崩溃
-                # 使用 Python open + QImage.fromData 绕过 Qt 文件 IO
-                with open(abs_path, "rb") as _f:
-                    _raw = _f.read()
-                img = QImage.fromData(QByteArray(_raw))
-                if img.isNull():
-                    return m.group(0)
-                res_name = f"wiki_img_{_img_index}"
-                _img_index += 1
-                _doc.addResource(QTextDocument.ResourceType.ImageResource, QUrl(res_name), img)
-                return f'src="{res_name}"'
-            except Exception:
-                return m.group(0)
-        html = _re.sub(r'src="(assets/[^"]+\.(?:jpg|jpeg|png|gif|webp|svg|bmp))"', _replace_img_src, html)
-        print(f"[Wiki全屏] 共替换 {_img_index} 张图片为文档资源")
-        html = _re.sub(r'(<br\s*/?>\s*){3,}', '<br/>', html)
-        html = _re.sub(r'<p>\s*</p>', '', html)
-        _doc.setHtml(html)
-        # setHtml 会注入 Qt 默认内联样式 (margin-top:12px; margin-bottom:12px)
-        # 覆盖 CSS 中的 p 边距设置。通过 QTextCursor 直接操作块格式来修正
-        from PyQt6.QtGui import QTextCursor, QTextBlockFormat
-        _cursor = QTextCursor(_doc)
-        _cursor.movePosition(QTextCursor.MoveOperation.Start)
-        _heading_margins = {
-            1: (28, 10), 2: (24, 8), 3: (18, 6),
-        }
-        while True:
-            _block = _cursor.block()
-            _bfmt = _block.blockFormat()
-            _level = _bfmt.headingLevel()
-            if _level in _heading_margins:
-                _bfmt.setTopMargin(_heading_margins[_level][0])
-                _bfmt.setBottomMargin(_heading_margins[_level][1])
-            else:
-                _bfmt.setTopMargin(4)
-                _bfmt.setBottomMargin(4)
-            _cursor.setBlockFormat(_bfmt)
-            if not _cursor.movePosition(QTextCursor.MoveOperation.NextBlock):
-                break
-        # 验证资源在 setHtml 后仍存在
-        for i in range(_img_index):
-            res = _doc.resource(QTextDocument.ResourceType.ImageResource, QUrl(f"wiki_img_{i}"))
-            if res is not None and not res.isNull():
-                print(f"[Wiki全屏] 资源 wiki_img_{i}: {res.size().width()}x{res.size().height()} ✓")
-            else:
-                print(f"[Wiki全屏] 资源 wiki_img_{i}: 丢失! ✗")
-        self.wiki_fullscreen_browser.setDocument(_doc)
-        page_title = self.wiki_title_input.text().strip() or "知识库页面"
-        self.wiki_fs_title.setText(page_title)
-        self.wiki_root_stack.setCurrentIndex(1)
-
-    def _on_wiki_fullscreen_exit(self) -> None:
-        """退出全屏阅读，返回编辑布局"""
-        self.wiki_root_stack.setCurrentIndex(0)
-
-    @staticmethod
-    def _markdown_to_html(md_text: str) -> str:
-        """将 Markdown 转换为 HTML 文章阅读视图。
-
-        提取 YAML front-matter 渲染为文章头部信息栏，
-        正文使用清晰舒适的排版样式，适合长时间阅读。
-        """
-        import re as _re
-
-        # ── 提取 YAML front-matter ──
-        body_text = md_text
-        title = source_url = date_str = ""
-        fm_match = _re.match(r'^---\s*\n(.*?)\n---\s*\n', md_text, _re.DOTALL)
-        if fm_match:
-            fm_content = fm_match.group(1)
-            body_text = md_text[fm_match.end():]
-            for line in fm_content.split("\n"):
-                line = line.strip()
-                if line.startswith("title:"):
-                    title = line[6:].strip().strip('"').strip("'")
-                elif line.startswith("source_url:"):
-                    source_url = line[11:].strip().strip('"').strip("'")
-                elif line.startswith("date:"):
-                    date_str = line[5:].strip().strip('"').strip("'")
-        # 去掉 trafilatura 嵌入的第二层 front-matter 元数据块
-        body_text = _re.sub(r'^\s*---\s*\n.*?\n---\s*\n', '', body_text, flags=_re.DOTALL)
-
-        # ── Markdown → HTML ──
-        # 预处理：合并连续多余空行，避免转换后产生大片空白
-        body_text = _re.sub(r'\n{3,}', '\n\n', body_text)
-        try:
-            import markdown as md_lib
-            html_body = md_lib.markdown(
-                body_text,
-                extensions=["tables"],
-            )
-            # <code> 和 <pre> 在 Python 3.14 + PyQt6 中触发 segfault
-            # 替换为等价的 <span> / <div> 内联样式
-            html_body = _re.sub(
-                r'<code>',
-                '<span style="background:#f0f0f0;padding:2px 6px;border-radius:3px;'
-                'font-family:Consolas,monospace;font-size:0.88em;color:#c7254e;">',
-                html_body,
-            )
-            html_body = html_body.replace('</code>', '</span>')
-            html_body = _re.sub(
-                r'<pre>',
-                '<div style="background:#1e1e1e;color:#d4d4d4;padding:16px 20px;'
-                'border-radius:8px;font-size:13px;line-height:1.55;margin:14px 0;'
-                'white-space:pre-wrap;font-family:Consolas,monospace;">',
-                html_body,
-            )
-            html_body = html_body.replace('</pre>', '</div>')
-            # 图片从 <p> 标签中解套（QTextDocument.setHtml 可能会重新包裹，
-            # 通过 CSS !important 强制压缩段落间距来抵消）
-            html_body = _re.sub(
-                r'<p>\s*(<img[^>]*>)\s*</p>', r'\1', html_body,
-            )
-        except ImportError:
-            html_body = WebClipperWikiHelper._basic_md_to_html(body_text)
-
-        # ── 文章头部信息栏 ──
-        header_html = ""
-        if title or date_str or source_url:
-            header_parts = []
-            if title:
-                header_parts.append(
-                    f'<div class="article-title">{title}</div>'
-                )
-            meta_items = []
-            if date_str:
-                meta_items.append(f'<span class="meta-date">📅 {date_str}</span>')
-            if source_url:
-                display_url = source_url[:80] + "..." if len(source_url) > 80 else source_url
-                meta_items.append(
-                    f'<span class="meta-source">🔗 <a href="{source_url}">原文链接</a></span>'
-                )
-            if meta_items:
-                header_parts.append(
-                    '<div class="article-meta">' + " &nbsp;·&nbsp; ".join(meta_items) + '</div>'
-                )
-            header_html = '<div class="article-header">' + "\n".join(header_parts) + '</div>'
-
-        css = """
-        <style>
-            body { font-family: 'Microsoft YaHei', 'PingFang SC', 'Segoe UI', 'Noto Sans SC', sans-serif;
-                   font-size: 16px; line-height: 1.6; color: #2c2c2c;
-                   width: 100%; padding: 24px 6% 40px;
-                   background: #fffdf7; }
-            /* ── 文章头部 ── */
-            .article-header { background: linear-gradient(135deg, #f8fbff 0%, #eef5ff 100%);
-                   border-left: 4px solid #1890ff; border-radius: 0 8px 8px 0;
-                   padding: 20px 24px; margin-bottom: 32px; }
-            .article-title { font-size: 1.7em; font-weight: bold; color: #111;
-                   line-height: 1.4; margin-bottom: 8px; }
-            .article-meta { font-size: 0.85em; color: #888; }
-            .article-meta a { color: #1890ff; text-decoration: none; }
-            .meta-date, .meta-source { display: inline-block; }
-            /* ── 正文排版 ── */
-            h1 { font-size: 1.55em; margin: 28px 0 10px; padding-bottom: 8px;
-                 border-bottom: 2px solid #1890ff; color: #111; line-height: 1.4; }
-            h2 { font-size: 1.3em; margin: 24px 0 8px; padding-bottom: 6px;
-                 border-bottom: 1px solid #e8e8e8; color: #1a1a1a; }
-            h3 { font-size: 1.12em; margin: 18px 0 6px; color: #333; }
-            p { margin: 4px 0; text-align: justify; }
-            img { display: block; max-width: 100%; height: auto; margin: 0 auto;
-                  border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-            blockquote { border-left: 4px solid #1890ff; margin: 16px 0; padding: 10px 18px;
-                         background: #f0f5ff; color: #555; border-radius: 0 4px 4px 0;
-                         font-style: italic; }
-            code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px;
-                   font-family: 'Consolas', 'Courier New', 'Source Code Pro', monospace;
-                   font-size: 0.88em; color: #c7254e; }
-            pre { background: #1e1e1e; color: #d4d4d4; padding: 16px 20px;
-                  border-radius: 8px; overflow-x: auto; font-size: 13px;
-                  line-height: 1.55; margin: 14px 0; }
-            pre code { background: none; padding: 0; color: inherit; font-size: inherit; }
-            table { border-collapse: collapse; width: 100%; margin: 16px 0;
-                    font-size: 0.95em; }
-            th, td { border: 1px solid #e0e0e0; padding: 10px 14px; text-align: left; }
-            th { background: #f7f7f7; font-weight: 600; color: #333; }
-            tr:nth-child(even) td { background: #fafafa; }
-            a { color: #1890ff; text-decoration: none; border-bottom: 1px dotted #b0d0ff; }
-            a:hover { border-bottom-style: solid; }
-            ul, ol { padding-left: 26px; margin: 10px 0; }
-            li { margin: 5px 0; line-height: 1.7; }
-            hr { border: none; border-top: 1px solid #e8e8e8; margin: 28px 0; }
-            strong { color: #1a1a1a; }
-            em { color: #555; }
-        </style>
-        """
-        return f"<html><head><meta charset='utf-8'>{css}</head><body>{header_html}{html_body}</body></html>"
-
-    @staticmethod
-    def _basic_md_to_html(md_text: str) -> str:
-        """内置轻量 Markdown→HTML 转换器（不依赖外部库）"""
-        import re
-
-        lines = md_text.split("\n")
-        result = []
-        in_code_block = False
-        in_list = False
-        list_type = None
-
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-
-            # 代码块
-            if line.strip().startswith("```"):
-                if in_code_block:
-                    result.append("</code></pre>")
-                    in_code_block = False
-                else:
-                    lang = line.strip()[3:].strip()
-                    result.append(f'<pre><code class="{lang}">')
-                    in_code_block = True
-                i += 1
-                continue
-
-            if in_code_block:
-                result.append(line)
-                i += 1
-                continue
-
-            # 空行 → 结束列表
-            if not line.strip():
-                if in_list:
-                    result.append(f"</{list_type}>")
-                    in_list = False
-                    list_type = None
-                result.append("")
-                i += 1
-                continue
-
-            # 标题
-            h_match = re.match(r"^(#{1,6})\s+(.+)$", line)
-            if h_match:
-                if in_list:
-                    result.append(f"</{list_type}>")
-                    in_list = False
-                    list_type = None
-                level = len(h_match.group(1))
-                result.append(f"<h{level}>{h_match.group(2)}</h{level}>")
-                i += 1
-                continue
-
-            # 无序列表
-            ul_match = re.match(r"^[\-\*]\s+(.+)$", line)
-            if ul_match:
-                if not in_list:
-                    result.append("<ul>")
-                    in_list = True
-                    list_type = "ul"
-                elif list_type != "ul":
-                    result.append(f"</{list_type}><ul>")
-                    list_type = "ul"
-                result.append(f"<li>{ul_match.group(1)}</li>")
-                i += 1
-                continue
-
-            # 有序列表
-            ol_match = re.match(r"^\d+\.\s+(.+)$", line)
-            if ol_match:
-                if not in_list:
-                    result.append("<ol>")
-                    in_list = True
-                    list_type = "ol"
-                elif list_type != "ol":
-                    result.append(f"</{list_type}><ol>")
-                    list_type = "ol"
-                result.append(f"<li>{ol_match.group(1)}</li>")
-                i += 1
-                continue
-
-            # 引用
-            bq_match = re.match(r"^>\s?(.*)$", line)
-            if bq_match:
-                if in_list:
-                    result.append(f"</{list_type}>")
-                    in_list = False
-                    list_type = None
-                result.append(f"<blockquote>{bq_match.group(1)}</blockquote>")
-                i += 1
-                continue
-
-            # 分隔线
-            if re.match(r"^[\-\*_]{3,}$", line.strip()):
-                if in_list:
-                    result.append(f"</{list_type}>")
-                    in_list = False
-                    list_type = None
-                result.append("<hr>")
-                i += 1
-                continue
-
-            # 普通段落
-            if in_list:
-                result.append(f"</{list_type}>")
-                in_list = False
-                list_type = None
-
-            processed = line
-            processed = re.sub(r"\!\[([^\]]*)\]\(([^)]+)\)", r'<img src="\2" alt="\1">', processed)
-            processed = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', processed)
-            processed = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", processed)
-            processed = re.sub(r"\*(.+?)\*", r"<em>\1</em>", processed)
-            processed = re.sub(r"`([^`]+)`", r"<code>\1</code>", processed)
-
-            result.append(f"<p>{processed}</p>")
-            i += 1
-
-        if in_code_block:
-            result.append("</code></pre>")
-        if in_list:
-            result.append(f"</{list_type}>")
-
-        return "\n".join(result)
-
-    def on_wiki_new_page(self):
-        """新建Wiki页面"""
-        if self.wiki_root_stack.currentIndex() == 1:
-            self.wiki_root_stack.setCurrentIndex(0)
-        self.wiki_title_input.clear()
-        self.wiki_content.clear()
-        self.wiki_title_input.setFocus()
-
-    def on_wiki_delete_page(self):
-        """删除Wiki页面"""
-        current_item = self.wiki_page_list.currentItem()
-        if current_item:
-            page_name = current_item.text()
-            reply = QMessageBox.question(self, '确认', f'确定删除页面 "{page_name}"？',
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self.wiki_fs.delete_wiki_page(page_name)
-                self.refresh_wiki_pages()
-                self.wiki_title_input.clear()
-                self.wiki_content.clear()
-
-    def on_wiki_save(self):
-        """保存Wiki页面"""
-        page_name = self.wiki_title_input.text().strip()
-        if not page_name:
-            QMessageBox.warning(self, '警告', '请输入页面标题')
-            return
-
-        content = self.wiki_content.toPlainText()
-        result = self.wiki_fs.write_wiki_page(page_name, content)
-        self.refresh_wiki_pages()
-        QMessageBox.information(self, '成功', result)
-
-    def on_wiki_search(self):
-        """搜索Wiki页面"""
-        keyword = self.wiki_search_input.text().strip()
-        if not keyword:
-            self.wiki_search_result.clear()
-            self.wiki_search_result.hide()
-            return
-        self.wiki_search_result.clear()
-        results = self.wiki_fs.search_pages(keyword)
-        if results:
-            for line in results.split('\n'):
-                if line.strip():
-                    self.wiki_search_result.addItem(line.strip())
-            self.wiki_search_result.show()
-        else:
-            self.wiki_search_result.addItem(f'未找到匹配 "{keyword}" 的页面')
-            self.wiki_search_result.show()
-
-    def on_wiki_search_result_clicked(self, item):
-        """点击搜索结果"""
-        text = item.text()
-        # 忽略"未找到"提示行
-        if text.startswith('未找到'):
-            return
-        # 搜索结果格式为 "- 页面名: 摘要"，解析出页面名
-        if text.startswith('- '):
-            text = text[2:]
-        if ': ' in text:
-            page_name = text.split(': ')[0]
-        elif ':' in text:
-            page_name = text.split(':')[0]
-        else:
-            page_name = text
-        content = self.wiki_fs.read_wiki_page(page_name)
-        if content and not content.startswith('Error:'):
-            self.wiki_title_input.setText(page_name)
-            self.wiki_content.setPlainText(content)
-
-    def on_wiki_title_changed(self, text):
-        """标题变化"""
-        pass
-
-    def on_wiki_upload_file(self):
-        """上传文件到知识库"""
-        last_dir = QSettings('DataProcessor', 'Pro').value('wiki_upload_last_dir', '')
-        file_path, _ = QFileDialog.getOpenFileName(self, '选择文件', last_dir, 'All Files (*)')
-        if file_path:
-            QSettings('DataProcessor', 'Pro').setValue('wiki_upload_last_dir', os.path.dirname(file_path))
-            result = self.wiki_fs.upload_file_to_wiki(file_path)
-            self.refresh_wiki_pages()
-            QMessageBox.information(self, '成功', result)
-
-    def show_wiki_help(self):
-        """显示知识库使用说明"""
-        help_text = """# 知识库管理 — 使用说明
-
-## 功能概述
-
-知识库管理是本软件内置的本地化文档管理系统，专为科研和工程项目中的知识沉淀与快速检索而设计。与云端笔记工具不同，所有数据完全存储在本地文件系统，无需网络连接，保障数据安全。
-
-核心定位：作为项目的"第二大脑"，将传感器配置经验、数据分析方法、调试记录、公式推导等零散知识系统化组织，形成可搜索、可复用的知识资产。
-
-## 核心特点
-
-1. **纯本地存储** — 所有页面以 Markdown 文件形式保存在 `wiki_vault/pages/` 目录下，索引导入 `wiki_vault/wiki_map.json`，可直接用任何文本编辑器打开
-2. **沉浸式分割布局** — 左侧页面列表可拖拽调整宽度，右侧全功能 Markdown 编辑器，互不干扰
-3. **一键沉浸阅读** — 点击"沉浸阅读"按钮进入全屏阅读模式，自动渲染 Markdown 为精美文章视图，右上角"返回编辑"退出
-4. **顶部统一操作台** — 所有管理按钮（新建、删除、上传、说明、保存）集中在页面顶部工具栏，一目了然
-5. **水平导航搜索条** — 搜索关键词和页面标题输入框位于同一水平线，查找与定义一次完成
-6. **AI 技能联动** — 知识库页面可被 AI Agent 的 read_wiki_page / write_wiki_page / search_wiki_pages 等技能直接读写，实现 AI 辅助知识管理
-
-## 页面管理操作
-
-### 浏览与查看
-- 左侧"知识库页面"列表显示所有已保存页面，点击任意页面名称即可加载
-- 页面标题自动填入中部导航条的标题输入框，内容以 Markdown 原文显示在编辑区
-- 点击"沉浸阅读"按钮 → 全屏渲染 Markdown 为美观的阅读视图（图片、表格、代码高亮）
-
-### 新建页面
-1. 点击顶部工具栏"+ 新建"按钮 → 标题和内容区清空
-2. 在导航条的"页面标题"输入框中输入标题
-3. 在编辑区编写 Markdown 内容，支持标题、列表、代码块、表格、粗体、斜体等
-4. 点击顶部"保存页面"按钮 → 页面持久化到本地文件
-
-### 编辑与更新
-1. 从左侧列表选择已有页面 → 标题和内容自动加载
-2. 直接修改标题或内容 → 点击"保存页面"
-3. 系统自动覆盖原文件
-
-### 删除页面
-1. 选中左侧列表中目标页面
-2. 点击顶部工具栏"删除"按钮 → 确认对话框
-3. 删除操作同时移除本地 .md 文件和索引条目，不可恢复
-
-### 关键词搜索
-1. 在顶部导航条搜索框输入关键词
-2. 点击"搜索"按钮 → 匹配结果在下拉列表中显示
-3. 点击搜索结果项 → 自动跳转并加载对应页面内容
-
-### 上传外部文件
-1. 点击顶部"上传文件"按钮 → 系统文件对话框
-2. 选择任意格式文件（PDF、Word、TXT、图片等）
-3. 文件被复制到知识库并自动注册索引
-
-## 存储结构
-
-```
-wiki_vault/
-├── pages/              ← 所有 Markdown 页面文件 (.md)
-│   ├── 传感器配置经验.md
-│   ├── ENLIGHT数据格式说明.md
-│   └── 调试记录_20260527.md
-└── wiki_map.json       ← 页面索引（标题→文件映射）
-```
-
-## 与 AI Agent 的协作
-
-知识库不仅是手动文档工具，更是 AI Agent 的长期记忆载体：
-- **read_wiki_page** — Agent 读取指定页面内容作为推理上下文
-- **write_wiki_page** — Agent 将分析结果、诊断结论自动写入知识库
-- **list_wiki_pages** — Agent 获取所有页面列表
-- **search_wiki_pages** — Agent 按关键词检索相关知识
-
-典型场景：AI 诊断完成后自动将诊断报告写入知识库，下次遇到类似问题时 Agent 可检索历史经验作为参考。
-"""
-        help_dialog = QDialog(self)
-        help_dialog.setWindowTitle('知识库管理 — 使用说明')
-        help_dialog.resize(800, 700)
-
-        layout = QVBoxLayout()
-        text_edit = QTextEdit()
-        text_edit.setReadOnly(True)
-        text_edit.setPlainText(help_text)
-        layout.addWidget(text_edit)
-
-        close_btn = QPushButton('关闭')
-        close_btn.clicked.connect(help_dialog.close)
-        layout.addWidget(close_btn)
-
-        help_dialog.setLayout(layout)
-        help_dialog.exec()
-
-    # ============ 网络剪藏页面 ============
-
-    def create_web_clipper_page(self):
-        """网络剪藏页面 — URL 抓取、图片本地化、视频下载、一键入库"""
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
-
-        # ── 页面标题 ──
-        header = QLabel('网络信息剪藏')
-        header.setStyleSheet('font-size: 18px; font-weight: bold; color: #1890ff; padding: 4px 0;')
-        layout.addWidget(header)
-
-        desc = QLabel('支持微信公众号、学术期刊、Bilibili、YouTube 等平台的图文抓取与多媒体下载，一键存入本地知识库')
-        desc.setWordWrap(True)
-        desc.setStyleSheet('color: #666; font-size: 13px; padding-bottom: 6px;')
-        layout.addWidget(desc)
-
-        # ── URL 输入区 ──
-        url_group = QGroupBox('目标链接')
-        url_group.setStyleSheet("""
-            QGroupBox { border: 1px solid #e0e0e0; border-radius: 8px;
-                font-weight: bold; color: #333; padding: 14px; padding-top: 24px; background: white; }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
-        """)
-        url_layout = QVBoxLayout(url_group)
-        url_layout.setSpacing(8)
-
-        url_row = QHBoxLayout()
-        url_row.addWidget(QLabel('URL:'))
-        self.clip_url_input = QLineEdit()
-        self.clip_url_input.setPlaceholderText('粘贴微信公众号 / B站 / YouTube / 学术期刊 链接...')
-        self.clip_url_input.setStyleSheet("""
-            QLineEdit { border: 1px solid #d9d9d9; border-radius: 4px; padding: 10px 12px; font-size: 13px; }
-            QLineEdit:focus { border-color: #1890ff; }
-        """)
-        self.clip_url_input.textChanged.connect(self._on_clip_url_changed)
-        url_row.addWidget(self.clip_url_input, stretch=1)
-
-        paste_btn = QPushButton('粘贴')
-        paste_btn.setStyleSheet("""
-            QPushButton { background: #f0f0f0; border: 1px solid #d9d9d9; border-radius: 4px;
-                padding: 10px 16px; }
-            QPushButton:hover { background: #e0e0e0; }
-        """)
-        paste_btn.clicked.connect(self._on_clip_paste)
-        url_row.addWidget(paste_btn)
-        url_layout.addLayout(url_row)
-
-        # 平台识别标签
-        self.clip_platform_label = QLabel('')
-        self.clip_platform_label.setStyleSheet('color: #999; font-size: 12px;')
-        url_layout.addWidget(self.clip_platform_label)
-
-        # Cookie 提示（仅知乎等需要登录的平台显示）
-        self.clip_cookie_hint = QLabel(
-            '知乎等平台需要登录 Cookie 才能抓取，请在下方"高级选项"中粘贴浏览器 Cookie'
-        )
-        self.clip_cookie_hint.setStyleSheet(
-            'color: #fa8c16; font-size: 12px; padding: 4px 0;'
-        )
-        self.clip_cookie_hint.setWordWrap(True)
-        self.clip_cookie_hint.hide()
-        url_layout.addWidget(self.clip_cookie_hint)
-
-        layout.addWidget(url_group)
-
-        # ── 高级选项 (Cookie) ──
-        self.clip_advanced_group = QGroupBox('高级选项 (Cookie 认证)')
-        self.clip_advanced_group.setStyleSheet("""
-            QGroupBox { border: 1px solid #e0e0e0; border-radius: 6px;
-                font-weight: bold; color: #555; padding: 10px; padding-top: 20px; background: #fafafa; }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
-        """)
-        advanced_inner = QVBoxLayout(self.clip_advanced_group)
-        advanced_inner.setSpacing(6)
-
-        cookie_hint = QLabel('粘贴浏览器 Cookie 字符串（从开发者工具 → Network → 请求头 → Cookie 复制）')
-        cookie_hint.setStyleSheet('color: #999; font-size: 11px;')
-        cookie_hint.setWordWrap(True)
-        advanced_inner.addWidget(cookie_hint)
-
-        self.clip_cookie_input = QTextEdit()
-        self.clip_cookie_input.setPlaceholderText('在此粘贴 Cookie...（仅需要登录的网站填写，普通网页留空即可）')
-        self.clip_cookie_input.setMaximumHeight(60)
-        self.clip_cookie_input.setStyleSheet("""
-            QTextEdit { border: 1px solid #d9d9d9; border-radius: 4px; padding: 6px 10px;
-                font-size: 12px; background: white; font-family: 'Consolas', monospace; }
-            QTextEdit:focus { border-color: #1890ff; }
-        """)
-        advanced_inner.addWidget(self.clip_cookie_input)
-
-        # ── Cookie 持久化：启动时加载已保存的 Cookie ──
-        saved_cookie = self._load_app_settings().get('zhihu_cookie', '')
-        if saved_cookie:
-            self.clip_cookie_input.setPlainText(saved_cookie)
-        self.clip_cookie_input.textChanged.connect(self._on_cookie_changed)
-
-        # 默认折叠
-        self.clip_advanced_group.setVisible(False)
-        layout.addWidget(self.clip_advanced_group)
-
-        # ── 展开/折叠高级选项按钮 ──
-        cookie_row = QHBoxLayout()
-        cookie_row.setSpacing(8)
-        self.clip_toggle_advanced_btn = QPushButton('高级选项 ▸')
-        self.clip_toggle_advanced_btn.setStyleSheet("""
-            QPushButton { background: none; border: none; color: #999; font-size: 12px; padding: 2px 0; }
-            QPushButton:hover { color: #1890ff; }
-        """)
-        self.clip_toggle_advanced_btn.clicked.connect(self._on_toggle_advanced)
-        cookie_row.addWidget(self.clip_toggle_advanced_btn)
-        cookie_row.addStretch()
-        layout.addLayout(cookie_row)
-
-        # ── 抓取选项 ──
-        options_row = QHBoxLayout()
-        options_row.setSpacing(16)
-
-        self.clip_download_images_cb = QCheckBox('下载图片到本地')
-        self.clip_download_images_cb.setChecked(True)
-        self.clip_download_images_cb.setStyleSheet('font-size: 13px;')
-        options_row.addWidget(self.clip_download_images_cb)
-
-        self.clip_download_video_cb = QCheckBox('下载视频')
-        self.clip_download_video_cb.setStyleSheet('font-size: 13px;')
-        self.clip_download_video_cb.setEnabled(False)
-        options_row.addWidget(self.clip_download_video_cb)
-
-        options_row.addStretch()
-        layout.addLayout(options_row)
-
-        # ── 操作按钮 ──
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(12)
-
-        self.clip_fetch_btn = QPushButton('开始抓取')
-        self.clip_fetch_btn.setStyleSheet("""
-            QPushButton { background-color: #1890ff; color: white; border: none; border-radius: 6px;
-                padding: 12px 32px; font-size: 14px; font-weight: bold; }
-            QPushButton:hover { background-color: #40a9ff; }
-            QPushButton:disabled { background-color: #d9d9d9; color: #999; }
-        """)
-        self.clip_fetch_btn.clicked.connect(self._on_clip_fetch)
-        btn_row.addWidget(self.clip_fetch_btn)
-
-        self.clip_save_btn = QPushButton('保存到知识库')
-        self.clip_save_btn.setStyleSheet("""
-            QPushButton { background-color: #52c41a; color: white; border: none; border-radius: 6px;
-                padding: 12px 28px; font-size: 14px; font-weight: bold; }
-            QPushButton:hover { background-color: #73d13d; }
-            QPushButton:disabled { background-color: #d9d9d9; color: #999; }
-        """)
-        self.clip_save_btn.clicked.connect(self._on_clip_save)
-        self.clip_save_btn.setEnabled(False)
-        btn_row.addWidget(self.clip_save_btn)
-
-        self.clip_clear_btn = QPushButton('清空')
-        self.clip_clear_btn.setStyleSheet("""
-            QPushButton { background: #f0f0f0; border: 1px solid #d9d9d9; border-radius: 6px;
-                padding: 12px 20px; font-size: 13px; }
-            QPushButton:hover { background: #e0e0e0; }
-        """)
-        self.clip_clear_btn.clicked.connect(self._on_clip_clear)
-        btn_row.addWidget(self.clip_clear_btn)
-
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        # ── 状态栏 ──
-        self.clip_status_label = QLabel('就绪 — 粘贴链接后点击"开始抓取"')
-        self.clip_status_label.setStyleSheet(
-            'color: #999; font-size: 12px; padding: 6px 12px; background: #fafafa; border-radius: 4px;'
-        )
-        layout.addWidget(self.clip_status_label)
-
-        # ── 预览区 ──
-        preview_group = QGroupBox('内容预览')
-        preview_group.setStyleSheet("""
-            QGroupBox { border: 1px solid #e0e0e0; border-radius: 8px;
-                font-weight: bold; color: #333; padding: 12px; padding-top: 24px; background: white; }
-            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
-        """)
-        preview_layout = QVBoxLayout(preview_group)
-
-        # 预览元信息
-        self.clip_preview_info = QLabel('')
-        self.clip_preview_info.setStyleSheet('color: #1890ff; font-size: 12px; padding: 4px 0;')
-        self.clip_preview_info.setWordWrap(True)
-        preview_layout.addWidget(self.clip_preview_info)
-
-        self.clip_preview_text = QTextEdit()
-        self.clip_preview_text.setReadOnly(True)
-        self.clip_preview_text.setPlaceholderText('抓取的内容将在此预览...')
-        self.clip_preview_text.setStyleSheet("""
-            QTextEdit { border: 1px solid #e0e0e0; border-radius: 4px;
-                padding: 12px; font-size: 13px; line-height: 1.6; background: #fafafa; }
-        """)
-        preview_layout.addWidget(self.clip_preview_text, stretch=1)
-
-        layout.addWidget(preview_group, stretch=1)
-
-        # ── 内部状态 ──
-        self._clipped_title = ''
-        self._clipped_md = ''
-        self._clipped_url = ''
-
-        return page
-
-    # ── 剪藏事件处理 ──
-
-    def _on_clip_url_changed(self, text: str) -> None:
-        """URL 变化时自动识别平台"""
-        text_lower = text.lower()
-        if 'mp.weixin.qq.com' in text_lower:
-            self.clip_platform_label.setText('已识别: 微信公众号')
-            self.clip_platform_label.setStyleSheet('color: #52c41a; font-size: 12px;')
-            self.clip_download_video_cb.setEnabled(False)
-            self.clip_download_video_cb.setChecked(False)
-            self.clip_cookie_hint.hide()
-        elif 'zhihu.com' in text_lower:
-            self.clip_platform_label.setText('已识别: 知乎 — 需粘贴 Cookie')
-            self.clip_platform_label.setStyleSheet('color: #fa8c16; font-size: 12px;')
-            self.clip_download_video_cb.setEnabled(False)
-            self.clip_download_video_cb.setChecked(False)
-            self.clip_cookie_hint.show()
-            # 自动展开高级选项
-            if not self.clip_advanced_group.isVisible():
-                self._on_toggle_advanced()
-        elif 'bilibili.com' in text_lower:
-            self.clip_platform_label.setText('已识别: Bilibili')
-            self.clip_platform_label.setStyleSheet('color: #fa8c16; font-size: 12px;')
-            self.clip_download_video_cb.setEnabled(True)
-            self.clip_cookie_hint.hide()
-        elif 'youtube.com' in text_lower or 'youtu.be' in text_lower:
-            self.clip_platform_label.setText('已识别: YouTube')
-            self.clip_platform_label.setStyleSheet('color: #ff4d4f; font-size: 12px;')
-            self.clip_download_video_cb.setEnabled(True)
-            self.clip_cookie_hint.hide()
-        elif 'arxiv.org' in text_lower or 'doi.org' in text_lower or 'scholar' in text_lower:
-            self.clip_platform_label.setText('已识别: 学术期刊')
-            self.clip_platform_label.setStyleSheet('color: #722ed1; font-size: 12px;')
-            self.clip_download_video_cb.setEnabled(False)
-            self.clip_download_video_cb.setChecked(False)
-            self.clip_cookie_hint.hide()
-        elif not text.strip():
-            self.clip_platform_label.setText('')
-            self.clip_download_video_cb.setEnabled(False)
-            self.clip_download_video_cb.setChecked(False)
-            self.clip_cookie_hint.hide()
-        else:
-            self.clip_platform_label.setText('已识别: 通用网页')
-            self.clip_platform_label.setStyleSheet('color: #999; font-size: 12px;')
-            self.clip_download_video_cb.setEnabled(False)
-            self.clip_download_video_cb.setChecked(False)
-            self.clip_cookie_hint.hide()
-
-    def _on_cookie_changed(self) -> None:
-        """Cookie 变更时自动持久化保存"""
-        cookies = self.clip_cookie_input.toPlainText().strip()
-        self._save_app_setting('zhihu_cookie', cookies)
-
-    def _on_toggle_advanced(self) -> None:
-        """展开/折叠高级选项"""
-        visible = not self.clip_advanced_group.isVisible()
-        self.clip_advanced_group.setVisible(visible)
-        self.clip_toggle_advanced_btn.setText('高级选项 ▾' if visible else '高级选项 ▸')
-
-    def _on_clip_paste(self) -> None:
-        """从剪贴板粘贴 URL"""
-        from PyQt6.QtWidgets import QApplication
-        clipboard = QApplication.clipboard()
-        text = clipboard.text()
-        if text:
-            self.clip_url_input.setText(text.strip())
-
-    def _on_clip_fetch(self) -> None:
-        """执行抓取"""
-        url = self.clip_url_input.text().strip()
-        if not url:
-            QMessageBox.warning(self, '提示', '请输入目标 URL')
-            return
-
-        self.clip_fetch_btn.setEnabled(False)
-        self.clip_status_label.setText('正在抓取网页内容...')
-        self.clip_status_label.setStyleSheet(
-            'color: #faad14; font-size: 12px; padding: 6px 12px; background: #fffbe6; border-radius: 4px;'
-        )
-        QApplication.processEvents()
-
-        try:
-            from py.web_clipper import WebClipper
-
-            clipper = WebClipper()
-            cookies = self.clip_cookie_input.toPlainText().strip()
-            title, md_body = clipper.fetch_article(url, cookies=cookies)
-            self._clipped_title = title
-            self._clipped_md = md_body
-            self._clipped_url = url
-
-            self.clip_preview_info.setText(f'标题: {title}\n来源: {url}')
-            preview_display = md_body[:5000] + ('...' if len(md_body) > 5000 else '')
-            self.clip_preview_text.setPlainText(preview_display)
-
-            self.clip_save_btn.setEnabled(True)
-            self.clip_status_label.setText(f'抓取成功 — 正文 {len(md_body)} 字符')
-            self.clip_status_label.setStyleSheet(
-                'color: #52c41a; font-size: 12px; padding: 6px 12px; background: #f6ffed; border-radius: 4px;'
-            )
-        except Exception as e:
-            import traceback
-            self.clip_status_label.setText(f'抓取失败: {str(e)}')
-            self.clip_status_label.setStyleSheet(
-                'color: #ff4d4f; font-size: 12px; padding: 6px 12px; background: #fff1f0; border-radius: 4px;'
-            )
-            QMessageBox.critical(self, '抓取失败', f'{str(e)}\n\n{traceback.format_exc()}')
-        finally:
-            self.clip_fetch_btn.setEnabled(True)
-
-    def _on_clip_save(self) -> None:
-        """保存到知识库（含图片下载）"""
-        if not self._clipped_md:
-            QMessageBox.warning(self, '提示', '请先抓取网页内容')
-            return
-
-        self.clip_save_btn.setEnabled(False)
-        self.clip_status_label.setText('正在下载图片并保存到知识库...')
-        self.clip_status_label.setStyleSheet(
-            'color: #faad14; font-size: 12px; padding: 6px 12px; background: #fffbe6; border-radius: 4px;'
-        )
-        QApplication.processEvents()
-
-        try:
-            from py.web_clipper import WebClipper
-
-            clipper = WebClipper()
-            md_content = self._clipped_md
-
-            if self.clip_download_images_cb.isChecked():
-                cookies = self.clip_cookie_input.toPlainText().strip()
-                md_content = clipper.download_and_replace_images(md_content, cookies=cookies, referer=self._clipped_url)
-
-            if self.clip_download_video_cb.isChecked():
-                video_path = clipper.download_video(self._clipped_url)
-                if video_path:
-                    md_content += f'\n\n> 视频已下载: {video_path}\n'
-
-            saved_path = clipper.save_to_wiki(self._clipped_url, self._clipped_title, md_content)
-
-            # 更新预览
-            self.clip_preview_text.setPlainText(md_content[:5000] + ('...' if len(md_content) > 5000 else ''))
-            self._clipped_md = md_content
-
-            # 刷新知识库页面列表
-            self.refresh_wiki_pages()
-
-            self.clip_status_label.setText(f'已保存 → {saved_path}')
-            self.clip_status_label.setStyleSheet(
-                'color: #52c41a; font-size: 12px; padding: 6px 12px; background: #f6ffed; border-radius: 4px;'
-            )
-        except Exception as e:
-            import traceback
-            self.clip_status_label.setText(f'保存失败: {str(e)}')
-            self.clip_status_label.setStyleSheet(
-                'color: #ff4d4f; font-size: 12px; padding: 6px 12px; background: #fff1f0; border-radius: 4px;'
-            )
-            QMessageBox.critical(self, '保存失败', f'{str(e)}\n\n{traceback.format_exc()}')
-        finally:
-            self.clip_save_btn.setEnabled(True)
-
-    def _on_clip_clear(self) -> None:
-        """清空抓取内容"""
-        self.clip_url_input.clear()
-        self.clip_preview_text.clear()
-        self.clip_preview_info.clear()
-        self.clip_platform_label.clear()
-        self.clip_status_label.setText('就绪 — 粘贴链接后点击"开始抓取"')
-        self.clip_status_label.setStyleSheet(
-            'color: #999; font-size: 12px; padding: 6px 12px; background: #fafafa; border-radius: 4px;'
-        )
-        self.clip_save_btn.setEnabled(False)
-        self._clipped_title = ''
-        self._clipped_md = ''
-        self._clipped_url = ''
-
-    # ============ 技能插件中心页面 ============
-    def create_skill_center_page(self):
-        """技能插件中心页面"""
-        page = QWidget()
-        main_layout = QVBoxLayout()
-
-        # 说明标签
-        info_label = QLabel('技能插件中心 — AI Agent 能力调度中枢：管理内置技能与 GitHub 自定义技能的启用/禁用、加载/卸载，支持 Agent 思考日志实时追踪')
-        info_label.setStyleSheet('color: #555; padding: 12px; font-size: 13px; background: #f0f5ff; border-radius: 6px;')
-        info_label.setWordWrap(True)
-        main_layout.addWidget(info_label)
-
-        # 技能表格区域
-        skill_group = QGroupBox('内置技能')
-        skill_layout = QVBoxLayout()
-
-        self.skill_table = QTableWidget()
-        self.skill_table.setColumnCount(3)
-        self.skill_table.setHorizontalHeaderLabels(['技能名称', '功能说明', '启用'])
-        self.skill_table.setRowCount(10)
-
-        # 内置技能列表
-        built_in_skills = [
-            ('Python_REPL', 'Python沙箱执行器', True),
-            ('arxiv', '学术文献搜索', False),
-            ('ddg_search', '联网搜索', False),
-            ('wikipedia', '维基百科', False),
-            ('apply_butterworth_filter', '巴特沃斯滤波', True),
-            ('execute_custom_formula', '自定义公式', True),
-            ('read_wiki_page', 'Wiki读', True),
-            ('write_wiki_page', 'Wiki写', True),
-            ('list_wiki_pages', 'Wiki列表', True),
-            ('search_wiki_pages', 'Wiki搜索', True),
-        ]
-
-        for i, (name, desc, enabled) in enumerate(built_in_skills):
-            self.skill_table.setItem(i, 0, QTableWidgetItem(name))
-            self.skill_table.setItem(i, 1, QTableWidgetItem(desc))
-            checkbox = QTableWidgetItem()
-            checkbox.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
-            self.skill_table.setItem(i, 2, checkbox)
-
-        self.skill_table.resizeColumnsToContents()
-        skill_layout.addWidget(self.skill_table)
-        skill_group.setLayout(skill_layout)
-        main_layout.addWidget(skill_group)
-
-        # GitHub技能加载区域
-        github_group = QGroupBox('GitHub技能加载')
-        github_layout = QGridLayout()
-
-        github_layout.addWidget(QLabel('仓库所有者:'), 0, 0)
-        self.github_owner_input = QLineEdit()
-        github_layout.addWidget(self.github_owner_input, 0, 1)
-
-        github_layout.addWidget(QLabel('仓库名称:'), 0, 2)
-        self.github_repo_input = QLineEdit()
-        github_layout.addWidget(self.github_repo_input, 0, 3)
-
-        github_layout.addWidget(QLabel('文件路径:'), 1, 0)
-        self.github_path_input = QLineEdit()
-        self.github_path_input.setText('skills/')
-        github_layout.addWidget(self.github_path_input, 1, 1)
-
-        github_layout.addWidget(QLabel('分支:'), 1, 2)
-        self.github_branch_input = QLineEdit()
-        self.github_branch_input.setText('main')
-        github_layout.addWidget(self.github_branch_input, 1, 3)
-
-        github_layout.addWidget(QLabel('GitHub Token:'), 2, 0)
-        self.github_token_input = QLineEdit()
-        self.github_token_input.setEchoMode(QLineEdit.EchoMode.Password)
-        github_layout.addWidget(self.github_token_input, 2, 1, 1, 3)
-
-        btn_row = QHBoxLayout()
-        load_skill_btn = QPushButton('下载并加载技能')
-        load_skill_btn.setStyleSheet('background-color: #52c41a; color: white;')
-        load_skill_btn.clicked.connect(self.on_load_github_skill)
-        btn_row.addWidget(load_skill_btn)
-
-        view_loaded_btn = QPushButton('查看已加载')
-        view_loaded_btn.setStyleSheet('background-color: #1890ff; color: white;')
-        view_loaded_btn.clicked.connect(self.on_view_loaded_skills)
-        btn_row.addWidget(view_loaded_btn)
-
-        clear_all_btn = QPushButton('清除全部')
-        clear_all_btn.setStyleSheet('background-color: #ff4d4f; color: white;')
-        clear_all_btn.clicked.connect(self.on_clear_all_skills)
-        btn_row.addWidget(clear_all_btn)
-
-        github_layout.addLayout(btn_row, 3, 0, 1, 4)
-
-        github_group.setLayout(github_layout)
-        main_layout.addWidget(github_group)
-
-        # Agent思考日志区
-        log_group = QGroupBox('Agent 思考日志')
-        log_layout = QVBoxLayout()
-
-        self.agent_log = QTextEdit()
-        self.agent_log.setReadOnly(True)
-        self.agent_log.setStyleSheet('''
-            QTextEdit { background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas, monospace; }
-        ''')
-        log_layout.addWidget(self.agent_log)
-
-        clear_log_btn = QPushButton('清空日志')
-        clear_log_btn.clicked.connect(lambda: self.agent_log.clear())
-        log_layout.addWidget(clear_log_btn)
-
-        log_group.setLayout(log_layout)
-        main_layout.addWidget(log_group)
-
-        # 使用说明按钮
-        help_btn = QPushButton('使用说明')
-        help_btn.clicked.connect(self.show_skill_center_help)
-        main_layout.addWidget(help_btn)
-
-        page.setLayout(main_layout)
-        return page
-
-    def on_load_github_skill(self):
-        """从GitHub加载技能"""
-        owner = self.github_owner_input.text().strip()
-        repo = self.github_repo_input.text().strip()
-        path = self.github_path_input.text().strip()
-        branch = self.github_branch_input.text().strip() or 'main'
-        token = self.github_token_input.text().strip()
-
-        if not owner or not repo:
-            QMessageBox.warning(self, '警告', '请输入仓库所有者和仓库名称')
-            return
-
-        self.agent_log.append(f'<span style="color: blue;">[INFO]</span> 正在从 GitHub 加载技能...')
-        self.agent_log.append(f'<span style="color: orange;">[LOAD]</span> {owner}/{repo}/{path}@{branch}')
-
-        # 使用GitHub loader如果可用
-        try:
-            from py.github_skill_loader import GithubSkillLoader
-            loader = GithubSkillLoader(token if token else None)
-            self.agent_log.append(f'<span style="color: green;">[OK]</span> 技能加载功能已调用')
-            QMessageBox.information(self, '提示', '技能加载功能已触发，请查看日志')
-        except ImportError:
-            self.agent_log.append(f'<span style="color: red;">[ERROR]</span> github_skill_loader 模块未找到')
-            QMessageBox.warning(self, '警告', '技能加载模块未安装')
-
-    def on_view_loaded_skills(self):
-        """查看已加载的技能"""
-        self.agent_log.append('<span style="color: blue;">[INFO]</span> 已加载技能列表:')
-        # 显示内置技能状态
-        for row in range(self.skill_table.rowCount()):
-            name_item = self.skill_table.item(row, 0)
-            check_item = self.skill_table.item(row, 2)
-            if name_item and check_item:
-                name = name_item.text()
-                enabled = check_item.checkState() == Qt.CheckState.Checked
-                status = '启用' if enabled else '禁用'
-                self.agent_log.append(f'  - {name}: {status}')
-
-    def on_clear_all_skills(self):
-        """清除所有技能"""
-        reply = QMessageBox.question(self, '确认', '确定清除所有已加载的技能？',
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            self.agent_log.append('<span style="color: red;">[WARN]</span> 已清除所有自定义技能')
-            QMessageBox.information(self, '提示', '自定义技能已清除')
-
-    def show_skill_center_help(self):
-        """显示技能中心使用说明"""
-        help_text = """# 技能插件中心 — 使用说明
-
-## 功能概述
-
-技能插件中心是 AI Agent 的能力调度中枢，管理 Agent 可调用的所有技能（Skills）。每项技能都是一个独立的功能模块，Agent 根据任务需求自动选择合适的技能组合来完成任务。用户可以自由启用/禁用内置技能，也可以从 GitHub 加载社区或自定义技能，实现 Agent 能力的灵活扩展。
-
-核心定位：技能 = Agent 的"工具箱"。不同的技能组合决定了 Agent 能解决什么类型的问题。技能中心让你像管理手机 App 一样管理 Agent 的能力。
-
-## 核心特点
-
-1. **内置技能一键开关** — 10 项内置技能以表格管理，勾选即可启用，取消即禁用，无需重启
-2. **GitHub 远程加载** — 支持从任意 GitHub 仓库（公开或私有）下载技能文件，自动注册为可用技能
-3. **Agent 思考日志** — 黑色终端风格实时日志窗口，以颜色编码区分不同类型的 Agent 操作，便于追踪和调试
-4. **技能状态可视化** — "查看已加载"一键列出当前所有技能及启用状态
-5. **模块化架构** — 每项技能独立封装，互不干扰，新增技能不影响已有功能
-6. **与知识库深度集成** — Wiki 系列技能（读/写/列表/搜索）让 Agent 直接操作知识库，形成"学习→记忆→复用"闭环
-
-## 内置技能详解
-
-### 计算与分析类
-| 技能名称 | 功能说明 |
-|---------|---------|
-| Python_REPL | Python 交互式沙箱执行器，Agent 可编写并运行 Python 代码进行数值计算、数据转换、图表生成等 |
-| execute_custom_formula | 执行用户自定义数学公式，支持变量代入，适用于传感器标定、物理量换算 |
-| apply_butterworth_filter | 巴特沃斯数字滤波器，支持低通/高通/带通/带阻模式，用于信号去噪和平滑处理 |
-
-### 知识检索类
-| 技能名称 | 功能说明 |
-|---------|---------|
-| arxiv | 学术文献搜索引擎，检索 arXiv 预印本论文，适用于文献调研和理论基础查询 |
-| ddg_search | DuckDuckGo 联网搜索，获取互联网公开信息，不依赖特定搜索引擎 API |
-| wikipedia | 维基百科百科查询，快速获取概念定义、公式、背景知识 |
-
-### Wiki 知识库操作类
-| 技能名称 | 功能说明 |
-|---------|---------|
-| read_wiki_page | 读取知识库中指定页面的完整内容，作为 Agent 推理的上下文参考 |
-| write_wiki_page | 将 Agent 的分析结果、诊断报告写入知识库，实现自动知识沉淀 |
-| list_wiki_pages | 列出知识库中所有页面标题，供 Agent 了解可用知识范围 |
-| search_wiki_pages | 按关键词模糊搜索知识库内容，Agent 根据相关性筛选参考材料 |
-
-## 从 GitHub 加载自定义技能
-
-### 参数说明
-- **仓库所有者 (Owner):** GitHub 用户名或组织名，如 `anthropics`
-- **仓库名称 (Repo):** 仓库名，如 `claude-code`
-- **文件路径 (Path):** 技能文件在仓库中的目录路径，默认 `skills/`
-- **分支 (Branch):** 目标分支名，默认 `main`，可选 `master`、`dev` 等
-- **GitHub Token:** 个人访问令牌 (Personal Access Token)，公开仓库可不填，私有仓库必填
-
-### 操作步骤
-1. 确保目标 GitHub 仓库包含符合规范的技能文件（Markdown 格式，含 YAML frontmatter）
-2. 依次填写仓库所有者、仓库名称、文件路径、分支
-3. 私有仓库需填入有效的 GitHub Token（需具备 repo 读取权限）
-4. 点击绿色"下载并加载技能"按钮 → Agent 日志区显示加载进度
-5. 加载成功后技能自动出现在内置技能列表中，可勾选启用
-
-### Token 获取方式
-访问 GitHub Settings → Developer settings → Personal access tokens → Generate new token (classic)，勾选 `repo` 权限即可。
-
-## Agent 思考日志 — 颜色编码
-
-日志区采用终端深色主题，不同操作以不同颜色标记，便于快速定位：
-
-| 颜色 | 含义 | 典型场景 |
-|------|------|---------|
-| <span style="color: #52c41a;">绿色</span> | 代码/公式执行 | Python 计算、滤波处理、公式求值 |
-| <span style="color: #1890ff;">蓝色</span> | 搜索/查询操作 | 学术搜索、联网搜索、Wiki 检索 |
-| <span style="color: #faad14;">橙色</span> | AI 推理/思考 | Agent 决策链路、任务规划过程 |
-| <span style="color: #9254de;">紫色</span> | Wiki 操作 | 页面读写、列表刷新 |
-| <span style="color: #ff4d4f;">红色</span> | 错误/警告 | 加载失败、执行异常、参数错误 |
-
-## 典型使用场景
-
-1. **数据分析流程:** 启用 Python_REPL + execute_custom_formula + apply_butterworth_filter → Agent 自动完成"读取数据 → 执行公式 → 滤波去噪 → 输出结果"完整链路
-2. **文献辅助:** 启用 arxiv + wikipedia + ddg_search → Agent 以多信源交叉验证方式回答专业问题
-3. **知识沉淀闭环:** 启用 Wiki 系列全套技能 → AI 诊断完成后自动将诊断报告存入知识库，下次遇到相似问题时 Agent 先检索历史经验
-4. **自定义扩展:** 从 GitHub 加载团队内部技能库 → Agent 获得领域专属能力（如特定传感器协议解析）
-"""
-        help_dialog = QDialog(self)
-        help_dialog.setWindowTitle('技能插件中心 — 使用说明')
-        help_dialog.resize(850, 750)
-
-        layout = QVBoxLayout()
-        text_edit = QTextEdit()
-        text_edit.setReadOnly(True)
-        text_edit.setPlainText(help_text)
-        layout.addWidget(text_edit)
-
-        close_btn = QPushButton('关闭')
-        close_btn.clicked.connect(help_dialog.close)
-        layout.addWidget(close_btn)
-
-        help_dialog.setLayout(layout)
-        help_dialog.exec()
+    # ============ [skill_tab.py] 技能插件中心已提取 ============
 
     def on_info_menu_changed(self, row):
         """切换信息整合功能页面"""
         self.report_content_stack.setCurrentIndex(row)
-
-    # ============ Word模板操作 ============
-    def select_word_template(self):
-        """选择Word模板"""
-        last_dir = QSettings('DataProcessor', 'Pro').value('word_template_last_dir', '')
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, '选择Word模板', last_dir, 'Word Documents (*.docx);;All Files (*)'
-        )
-        if file_path:
-            QSettings('DataProcessor', 'Pro').setValue('word_template_last_dir', os.path.dirname(file_path))
-            self.word_template_path.setText(file_path)
-            self.word_template_path.setStyleSheet('color: #333;')
-            # 预览模板内容
-            try:
-                doc = Document(file_path)
-                preview = '\n'.join([p.text for p in doc.paragraphs if p.text])
-                self.word_template_preview.setText(preview[:2000] if preview else '模板无文本内容')
-            except Exception as e:
-                self.word_template_preview.setText(f'预览失败: {str(e)}')
-
-    def clear_word_template(self):
-        """清除Word模板"""
-        self.word_template_path.setText('未选择模板')
-        self.word_template_path.setStyleSheet('color: #999;')
-        self.word_template_preview.clear()
-        self.word_template_analysis.clear()
-
-    def analyze_word_template(self):
-        """AI分析Word模板特征"""
-        template_path = self.word_template_path.text()
-        if template_path == '未选择模板':
-            QMessageBox.warning(self, '警告', '请先选择Word模板')
-            return
-
-        if not self.ollama_client or not self.ollama_client.is_available():
-            QMessageBox.warning(self, '警告', '请先启动Ollama服务')
-            return
-
-        try:
-            doc = Document(template_path)
-            content = '\n'.join([p.text for p in doc.paragraphs if p.text])
-            prompt = f"""Analyze this Word template features:
-1. Document structure (heading levels, chapter organization)
-2. Format style (paragraph spacing, font styles, alignment)
-3. Content layout (use of tables, images, lists)
-4. Language style (formality, use of professional terms)
-
-Template content:
-{content[:3000]}
-
-Please summarize these features briefly so I can generate new reports based on this template."""
-            self.word_template_analysis.setText('正在分析，请稍候...')
-
-            model_name = self.ai_model_combo.currentText()
-            if not model_name or model_name not in self.ai_models_config:
-                self.word_template_analysis.setText('请先在模型配置中选择一个模型')
-                return
-
-            config = self.ai_models_config[model_name]
-            from py.online_llm_thread import OnlineLlamaGenerateThread
-            self.word_template_thread = OnlineLlamaGenerateThread(
-                prompt=prompt,
-                api_key=config.get('api_key', ''),
-                base_url=config.get('base_url', ''),
-                model_name=config.get('model_name', ''),
-                system_prompt=config.get('system_prompt', '')
-            )
-            self.word_template_thread.finished.connect(lambda r: self.word_template_analysis.setText(r if r else 'AI分析失败'))
-            self.word_template_thread.error.connect(lambda e: self.word_template_analysis.setText(f'分析失败: {e}'))
-            self.word_template_thread.start()
-        except Exception as e:
-            self.word_template_analysis.setText(f'分析失败: {str(e)}')
-
-    # ============ PPT模板操作 ============
-    def select_ppt_template(self):
-        """选择PPT模板"""
-        last_dir = QSettings('DataProcessor', 'Pro').value('ppt_template_last_dir', '')
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, '选择PPT模板', last_dir, 'PowerPoint Files (*.pptx);;All Files (*)'
-        )
-        if file_path:
-            QSettings('DataProcessor', 'Pro').setValue('ppt_template_last_dir', os.path.dirname(file_path))
-            self.ppt_template_path.setText(file_path)
-            self.ppt_template_path.setStyleSheet('color: #333;')
-            self.ppt_template_preview.setText('PPT模板预览功能需要额外库支持，请手动查看原文件')
-
-    def clear_ppt_template(self):
-        """清除PPT模板"""
-        self.ppt_template_path.setText('未选择模板')
-        self.ppt_template_path.setStyleSheet('color: #999;')
-        self.ppt_template_preview.clear()
-        self.ppt_template_analysis.clear()
-
-    def analyze_ppt_template(self):
-        """AI分析PPT模板特征"""
-        template_path = self.ppt_template_path.text()
-        if template_path == '未选择模板':
-            QMessageBox.warning(self, '警告', '请先选择PPT模板')
-            return
-
-        if not self.ollama_client or not self.ollama_client.is_available():
-            QMessageBox.warning(self, '警告', '请先启动Ollama服务')
-            return
-
-        self.ppt_template_analysis.setText('PPT模板分析需要手动描述结构。提示：描述幻灯片数量、每页的标题和内容布局、配色风格等。')
-
-    # ============ 项目内容操作 ============
-    def add_project_file(self):
-        """添加项目文件"""
-        last_dir = QSettings('DataProcessor', 'Pro').value('project_file_last_dir', '')
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self, '添加项目文件', last_dir, 'All Files (*);;Text Files (*.txt);;Image Files (*.png *.jpg *.jpeg);;Word Files (*.docx);;PDF Files (*.pdf)'
-        )
-        if file_paths:
-            QSettings('DataProcessor', 'Pro').setValue('project_file_last_dir', os.path.dirname(file_paths[0]))
-        for path in file_paths:
-            self.project_files_list.addItem(path)
-
-    def add_project_folder(self):
-        """添加项目文件夹"""
-        folder = QFileDialog.getExistingDirectory(self, '选择项目文件夹')
-        if folder:
-            self.project_files_list.addItem(f'[文件夹] {folder}')
-
-    def remove_project_file(self):
-        """移除选中的项目文件"""
-        for item in self.project_files_list.selectedItems():
-            row = self.project_files_list.row(item)
-            self.project_files_list.takeItem(row)
-
-    def analyze_project_content(self):
-        """AI分析项目资料"""
-        count = self.project_files_list.count()
-        if count == 0:
-            QMessageBox.warning(self, '警告', '请先添加项目资料')
-            return
-
-        if not self.ollama_client or not self.ollama_client.is_available():
-            QMessageBox.warning(self, '警告', '请先启动Ollama服务')
-            return
-
-        files = []
-        for i in range(count):
-            files.append(self.project_files_list.item(i).text())
-
-        prompt = f"""Analyze these project files:
-{chr(10).join(files[:20])}
-
-Please summarize:
-1. File type distribution
-2. Main content areas
-3. Key materials for the report
-
-Only analyze the file list, don't read specific content."""
-        self.project_content_analysis.setText('正在分析，请稍候...')
-
-        model_name = self.ai_model_combo.currentText()
-        if not model_name or model_name not in self.ai_models_config:
-            self.project_content_analysis.setText('请先在模型配置中选择一个模型')
-            return
-
-        config = self.ai_models_config[model_name]
-        from py.online_llm_thread import OnlineLlamaGenerateThread
-        self.project_content_thread = OnlineLlamaGenerateThread(
-            prompt=prompt,
-            api_key=config.get('api_key', ''),
-            base_url=config.get('base_url', ''),
-            model_name=config.get('model_name', ''),
-            system_prompt=config.get('system_prompt', '')
-        )
-        self.project_content_thread.finished.connect(lambda r: self.project_content_analysis.setText(r if r else 'AI分析失败'))
-        self.project_content_thread.error.connect(lambda e: self.project_content_analysis.setText(f'分析失败: {e}'))
-        self.project_content_thread.start()
 
     # ============ 全局配置操作 ============
 
@@ -3822,7 +1181,10 @@ Only analyze the file list, don't read specific content."""
                 'version': '2.0',
                 'fbgs': [],
                 'sensors': [],
-                'global_parameters': self.sensor_system.global_parameters,
+                'global_parameters': {
+                    name: {'value': p.value, 'unit': p.unit, 'description': p.description}
+                    for name, p in self.state.global_parameters.items()
+                },
                 'project_files': [],
                 'data_tab': {},
                 'cleaning_tab': {},
@@ -3849,10 +1211,6 @@ Only analyze the file list, don't read specific content."""
                     'location': sensor.location,
                 })
 
-            # ---- 项目文件 ----
-            for i in range(self.project_files_list.count()):
-                config['project_files'].append(self.project_files_list.item(i).text())
-
             # ---- 数据文件模块 ----
             config['data_tab'] = {
                 'file_path': self.sampled_file_path,
@@ -3863,18 +1221,12 @@ Only analyze the file list, don't read specific content."""
             }
 
             # ---- 数据清洗模块 ----
-            config['cleaning_tab'] = {
-                'adjacent_enabled': self.adjacent_enabled.isChecked(),
-                'diff_threshold': self.diff_threshold.value(),
-                'nan_enabled': self.nan_enabled.isChecked(),
-                'fill_method': self.fill_method_combo.currentText(),
-                'custom_fill_value': self.custom_fill_value.value(),
-            }
+            config['cleaning_tab'] = self.cleaning_tab_widget.get_config()
 
             # ---- 数据分析模块 ----
-            # 保存传感器计算结果（处理 NaN）
+            # 保存传感器计算结果（从 SSOT 读取）
             serializable_results = {}
-            for key, values in self.sensor_results.items():
+            for key, values in self.state.analysis_tab.sensor_results.items():
                 arr = np.array(list(values), dtype=np.float64)
                 arr[np.isnan(arr)] = None  # NaN -> null for JSON
                 serializable_results[key] = [None if v is None else float(v) for v in arr]
@@ -3892,7 +1244,7 @@ Only analyze the file list, don't read specific content."""
 
             # 统计摘要
             data_info = f'数据文件: {os.path.basename(self.sampled_file_path) if self.sampled_file_path else "无"}'
-            result_count = len(self.sensor_results)
+            result_count = len(self.state.analysis_tab.sensor_results)
             QMessageBox.information(self, '成功',
                 f'配置已保存到:\n{file_path}\n\n'
                 f'  FBG: {len(config["fbgs"])} 个\n'
@@ -3923,7 +1275,7 @@ Only analyze the file list, don't read specific content."""
             with open(file_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
 
-            fbg_count, sensor_count, file_count = 0, 0, 0
+            fbg_count, sensor_count = 0, 0
             data_loaded, cleaning_restored, analysis_restored = False, False, False
             messages = []
 
@@ -3940,7 +1292,18 @@ Only analyze the file list, don't read specific content."""
 
             # 加载全局参数 (SSOT)，旧配置自动迁移
             if 'global_parameters' in config:
-                self.sensor_system.global_parameters = config['global_parameters']
+                raw = config['global_parameters']
+                self.sensor_system.global_parameters = raw
+                # 同步到 AppState
+                restored_gp = {}
+                for name, entry in raw.items():
+                    restored_gp[name] = GlobalParameter(
+                        name=name,
+                        value=entry.get('value', 0) if isinstance(entry, dict) else float(entry),
+                        unit=entry.get('unit', '') if isinstance(entry, dict) else '',
+                        description=entry.get('description', '') if isinstance(entry, dict) else '',
+                    )
+                self.state = self.state.with_global_parameters(restored_gp)
             else:
                 # 自动迁移: 扫描所有传感器，提取同名同值的共用常量
                 const_usage = {}  # name -> [(value, sensor_id), ...]
@@ -3956,6 +1319,14 @@ Only analyze the file list, don't read specific content."""
                 if migrated:
                     print(f"[迁移] 从传感器局部常量提取全局参数: {migrated}")
                 self.sensor_system.global_parameters = migrated
+                # 迁移结果同步到 AppState
+                restored_gp = {}
+                for name, value in migrated.items():
+                    restored_gp[name] = GlobalParameter(
+                        name=name, value=value if isinstance(value, (int, float)) else 0,
+                        unit='', description='',
+                    )
+                self.state = self.state.with_global_parameters(restored_gp)
 
             for sensor_data in config.get('sensors', []):
                 sensor_constants = sensor_data.get('constants', {})
@@ -3977,18 +1348,9 @@ Only analyze the file list, don't read specific content."""
                 self.sensor_system.add_sensor(sensor)
                 sensor_count += 1
 
-            self.refresh_fbg_table()
-            self.refresh_sensor_table()
+            self.sensor_tab_widget.set_fbg_list(self.sensor_system.fbgs)
+            self.sensor_tab_widget.set_sensor_list(self.sensor_system.sensors)
             messages.append(f'FBG: {fbg_count} 个, 传感器: {sensor_count} 个')
-
-            # ---- 项目文件 ----
-            self.project_files_list.clear()
-            for path in config.get('project_files', []):
-                self.project_files_list.addItem(path)
-                file_count += 1
-            self.refresh_project_files()
-            if file_count:
-                messages.append(f'项目文件: {file_count} 个')
 
             # ---- 数据文件模块 ----
             data_tab = config.get('data_tab', {})
@@ -4014,6 +1376,7 @@ Only analyze the file list, don't read specific content."""
                     self.current_template = template
                     self.file_header_lines = data_tab.get('file_header_lines', [])
                     self.current_columns = data_tab.get('current_columns', [str(c) for c in df.columns])
+                    self._insert_annotation_row_if_timestamp_exists()
                     self.update_data_table()
                     if fbg_count == 0:
                         self._auto_populate_fbgs(df)
@@ -4029,13 +1392,7 @@ Only analyze the file list, don't read specific content."""
             cleaning_tab = config.get('cleaning_tab', {})
             if cleaning_tab:
                 try:
-                    self.adjacent_enabled.setChecked(cleaning_tab.get('adjacent_enabled', True))
-                    self.diff_threshold.setValue(cleaning_tab.get('diff_threshold', 1.0))
-                    self.nan_enabled.setChecked(cleaning_tab.get('nan_enabled', True))
-                    idx = self.fill_method_combo.findText(cleaning_tab.get('fill_method', 'linear'))
-                    if idx >= 0:
-                        self.fill_method_combo.setCurrentIndex(idx)
-                    self.custom_fill_value.setValue(cleaning_tab.get('custom_fill_value', 0))
+                    self.cleaning_tab_widget.set_config(cleaning_tab)
                     cleaning_restored = True
                     messages.append('清洗规则: 已恢复')
                 except Exception as e:
@@ -4065,21 +1422,26 @@ Only analyze the file list, don't read specific content."""
                     if data_loaded and self.current_data is not None:
                         self.range_end.setValue(min(analysis_tab.get('range_end', 999999), len(self.current_data) - 1))
 
-                    # 恢复传感器计算结果
+                    # 恢复传感器计算结果 (同步到 SSOT)
                     saved_results = analysis_tab.get('sensor_results', {})
                     if saved_results:
                         restored_results = {}
                         for key, values in saved_results.items():
                             restored_results[key] = [np.nan if v is None else v for v in values]
                         self.sensor_results = restored_results
-                        self._update_sensor_result_table(restored_results)
+                        self.state = self.state.with_analysis_results(restored_results)
+                        if self.current_data is not None:
+                            analysis_df, _, _ = self._get_analysis_data()
+                            self.sensor_tab_widget.set_result_preview(restored_results, analysis_df)
                         analysis_restored = True
                         messages.append(f'分析结果: {len(restored_results)} 个列')
                     else:
                         self.sensor_results = {}
+                        self.state = self.state.with_analysis_results({})
                 except Exception as e:
                     messages.append(f'分析状态恢复失败: {str(e)}')
                     self.sensor_results = {}
+                    self.state = self.state.with_analysis_results({})
             else:
                 self.sensor_results = {}
 
@@ -4089,9 +1451,9 @@ Only analyze the file list, don't read specific content."""
 
             # ---- 切换到数据文件页展示结果 ----
             if data_loaded:
-                self.central_widget.setCurrentWidget(self.data_tab)
+                self.central_widget.setCurrentWidget(self.data_tab_widget)
             else:
-                self.central_widget.setCurrentWidget(self.sensor_tab)
+                self.central_widget.setCurrentWidget(self.sensor_tab_widget)
 
             QMessageBox.information(self, '成功',
                 f'配置已加载:\n' + '\n'.join(f'  {m}' for m in messages) +
@@ -4110,11 +1472,10 @@ Only analyze the file list, don't read specific content."""
 
         self.sensor_system.fbgs.clear()
         self.sensor_system.sensors.clear()
-        self.project_files_list.clear()
 
-        self.refresh_fbg_table()
-        self.refresh_sensor_table()
-        self.refresh_project_files()
+        self.sensor_tab_widget.set_fbg_list([])
+        self.sensor_tab_widget.set_sensor_list([])
+        self.load_project_list()
 
         QMessageBox.information(self, '成功', '配置已重置')
 
@@ -4204,7 +1565,7 @@ Only analyze the file list, don't read specific content."""
                 # 添加"添加新模板"选项
                 self.template_list.addItem('+ 添加新模板...')
             else:
-                # 其它数据：通用模板 + 自定义模板
+                # 其它数据：自定义模板（非光纤格式）
                 other_templates = [t for t in DEFAULT_TEMPLATES if t.file_format not in ('enlight', 'fiber_custom')]
                 for t in other_templates:
                     self.template_list.addItem(t.name)
@@ -4237,6 +1598,9 @@ Only analyze the file list, don't read specific content."""
 
         if main_dialog.exec() != QDialog.DialogCode.Accepted:
             return
+
+        # 记录用户选择的数据类型
+        selected_file_type = self.file_type_combo.currentText()
 
         # 获取选择的模板名称
         selected_item = self.template_list.currentItem()
@@ -4286,8 +1650,10 @@ Only analyze the file list, don't read specific content."""
                     self.current_columns = [col['name'] for col in selected_template.columns]
                 else:
                     self.current_columns = [str(c) for c in df.columns]
+                self._insert_annotation_row_if_timestamp_exists()
                 self.update_data_table()
-                self._auto_populate_fbgs(df)
+                if selected_file_type == '光纤光栅数据':
+                    self._auto_populate_fbgs(df)
                 self.add_recent_file(sample_path, selected_template.id)
                 self.status_bar.showMessage(f'已加载 {len(df)} 行数据')
                 QMessageBox.information(self, '成功', f'成功加载 {len(df)} 行数据')
@@ -4342,8 +1708,10 @@ Only analyze the file list, don't read specific content."""
             self.current_template = selected_template
             self._load_file_header_lines(file_path, selected_template.skip_rows)
             self.current_columns = [col['name'] for col in selected_template.columns]
+            self._insert_annotation_row_if_timestamp_exists()
             self.update_data_table()
-            self._auto_populate_fbgs(df)
+            if selected_file_type == '光纤光栅数据':
+                self._auto_populate_fbgs(df)
             self.add_recent_file(file_path, selected_template.id)
             self.status_bar.showMessage(f'已加载 {len(df)} 行数据')
             QMessageBox.information(self, '成功', f'成功加载 {len(df)} 行数据')
@@ -4573,8 +1941,7 @@ Only analyze the file list, don't read specific content."""
         self.file_header_lines = []
         self.sampled_file_path = None
         self.current_template = None
-        self.data_table.setRowCount(0)
-        self.data_table.setColumnCount(0)
+        self.data_tab_widget.update_data_table(None)
         self.status_bar.showMessage('数据已清除')
 
     def _find_first_timestamp_row(self, df):
@@ -4884,75 +2251,233 @@ Only analyze the file list, don't read specific content."""
 
     MAX_DISPLAY_ROWS = 1000
 
+    def _on_analysis_refresh_requested(self):
+        """分析页点击"刷新"时：重新从暗号标注获取分析数据并推送到列选择列表。"""
+        analysis_df, _, annotated_cols = self._get_analysis_data()
+        if analysis_df is not None and not analysis_df.empty:
+            self.analysis_tab_widget.set_current_data(analysis_df, annotated_cols)
+
     def update_data_table(self):
         if self.current_data is None:
+            self.data_tab_widget.update_data_table(None)
             return
+        # 数据表格始终显示完整数据（含暗号行）
+        self.data_tab_widget.update_data_table(self.current_data, self.MAX_DISPLAY_ROWS)
+        # 分析模块接收清洗后的数据（跳过暗号行 + 重命名列）并填充列选择列表
+        if hasattr(self, 'analysis_tab_widget'):
+            analysis_df, _, annotated_cols = self._get_analysis_data()
+            self.analysis_tab_widget.set_current_data(analysis_df, annotated_cols)
 
-        if not hasattr(self, 'data_table') or self.data_table is None:
-            self.data_table = QTableWidget()
-            self.data_table.setAlternatingRowColors(True)
-            if hasattr(self, 'data_tab') and self.data_tab.layout():
-                self.data_tab.layout().addWidget(self.data_table)
+    # ══════════════════════════════════════════════════════════
+    # 暗号行自动插入（数据加载时触发）
+    # ══════════════════════════════════════════════════════════
+
+    def _insert_annotation_row_if_timestamp_exists(self):
+        """数据加载后在首行插入空白备注行，供用户填写暗号。
+
+        规则：
+          - 如果数据中已有包含'时间戳'的暗号行 → 不做任何操作
+          - 否则 → 在第 0 行插入一行空白备注行
+        """
+        try:
+            if self.current_data is None or self.current_data.empty:
+                return
+            df = self.current_data
+            # 先检查是否已有暗号行（包含'时间戳'的标记行）
+            for idx in range(len(df)):
+                for val in df.iloc[idx]:
+                    s = str(val).strip().strip("'\"'\"'\"")
+                    if '时间戳' in s:
+                        # 已有暗号行，不再重复插入
+                        return
+            # 没有暗号行 → 在第 0 行插入空白行
+            # 用 np.nan 而非 '' 防止 numeric 列被污染为 object dtype
+            self._annotation_orig_dtypes = df.dtypes.to_dict()
+            blank_vals = [np.nan] * len(df.columns)
+            blank_row = pd.DataFrame([blank_vals], columns=df.columns)
+            self.current_data = pd.concat(
+                [blank_row, df],
+                ignore_index=True,
+            )
+            # 恢复原始 dtypes，防止 pd.concat 将纯 nan 列推断为 object
+            for col, dtype in self._annotation_orig_dtypes.items():
+                self.current_data[col] = self.current_data[col].astype(dtype)
+            self._annotation_orig_dtypes = self.current_data.dtypes.to_dict()
+        except Exception as e:
+            print(f'[暗号行插入失败] {e}')
+
+    # ══════════════════════════════════════════════════════════
+    # 表格编辑双向同步（用户编辑 UI → 写回 self.current_data）
+    # ══════════════════════════════════════════════════════════
+
+    def _on_data_table_cell_edited(self, row: int, col: int, text: str):
+        """用户在数据表格编辑单元格后，将新值写回底层 DataFrame。"""
+        if self.current_data is None or not (0 <= row < len(self.current_data)):
+            return
+        try:
+            self.current_data.iat[row, col] = text
+        except (ValueError, TypeError):
+            # 字符串写入 numeric 列 → 将该列转为 object 再写入
+            col_name = self.current_data.columns[col]
+            self.current_data[col_name] = self.current_data[col_name].astype(object)
+            self.current_data.iat[row, col] = text
+        except Exception as e:
+            print(f'[表格回写失败] row={row}, col={col}: {e}')
+
+    # ══════════════════════════════════════════════════════════
+    # 被动暗号标注识别（通用工具方法）
+    # ══════════════════════════════════════════════════════════
+
+    def get_annotated_columns(self):
+        """扫描 current_data 寻找暗号行，被动识别列角色。
+
+        查找包含'时间戳'的标记行，解析每列的含义：
+          - '时间戳' → 时间列
+          - '温度'、"应力"等引号包裹 → 数据列，引号内为自定义列名
+          - 无特殊标记 → 无关列（丢弃）
+
+        Returns:
+            (time_col_idx, data_cols, signal_row_idx)
+            - time_col_idx:  时间戳列的整数索引，None 表示未找到
+            - data_cols:     {列索引: 自定义列名} 字典
+            - signal_row_idx: 暗号行在 DataFrame 中的行号，None 表示未找到
+        """
+        import re as _re
+
+        if self.current_data is None or self.current_data.empty:
+            return None, {}, None
 
         df = self.current_data
-        total_rows = len(df)
-        display_rows = min(total_rows, self.MAX_DISPLAY_ROWS)
-        cols = [str(c) for c in df.columns]
+        signal_row_idx = None
 
-        self.data_table.setUpdatesEnabled(False)
-        self.data_table.setRowCount(display_rows)
-        self.data_table.setColumnCount(len(cols))
-        self.data_table.setHorizontalHeaderLabels(cols)
+        # ── 1. 定位暗号行 ──
+        for idx in range(len(df)):
+            for val in df.iloc[idx]:
+                s = str(val).strip().strip("'"'"'"")
+                if '时间戳' in s:
+                    signal_row_idx = idx
+                    break
+            if signal_row_idx is not None:
+                break
 
-        for j, col_name in enumerate(cols):
-            col_values = df[col_name].values[:display_rows]
-            for i in range(display_rows):
-                self.data_table.setItem(i, j, QTableWidgetItem(str(col_values[i])))
+        if signal_row_idx is None:
+            return None, {}, None
 
-        self.data_table.setUpdatesEnabled(True)
-        self.data_table.resizeColumnsToContents()
+        # ── 2. 解析暗号行的列含义 ──
+        signal_row = df.iloc[signal_row_idx]
+        QUOTED_RE = _re.compile(r"^[\'\"‘’“”](.*?)[\'\"‘’“”]$")
+        time_col_idx = None
+        data_cols: dict = {}
 
-        if total_rows > self.MAX_DISPLAY_ROWS:
-            self.data_info_label.setText(
-                f'显示前 {self.MAX_DISPLAY_ROWS:,} 行 / 共 {total_rows:,} 行'
-            )
+        for j in range(len(df.columns)):
+            col_name = df.columns[j]
+            val = str(signal_row[col_name]).strip()
+            cleaned = val.strip("'\"‘’“”").strip()
+
+            if '时间戳' in cleaned:
+                time_col_idx = j
+
+            elif QUOTED_RE.match(val):
+                m = QUOTED_RE.match(val)
+                custom_name = m.group(1).strip()
+                data_cols[j] = custom_name
+
+        return time_col_idx, data_cols, signal_row_idx
+
+    # ══════════════════════════════════════════════════════════
+    # 根据暗号标注获取清洗后的分析数据
+    # ══════════════════════════════════════════════════════════
+
+    def _get_analysis_data(self):
+        """如果存在暗号行，返回跳过暗号行及之前行、并重命名列的数据。
+
+        Returns:
+            (cleaned_df, time_col_name) — 无暗号时返回 (self.current_data, '时间')
+        """
+        time_col_idx, data_cols, signal_row_idx = self.get_annotated_columns()
+
+        if signal_row_idx is None or self.current_data is None:
+            return self.current_data, '时间'
+
+        df = self.current_data
+        # 跳过暗号行及之前的所有行
+        data_df = df.iloc[signal_row_idx + 1:].copy()
+        data_df.reset_index(drop=True, inplace=True)
+
+        # 恢复数值列 dtype：注解行（插入或文件自带）可能已将列污染为 object
+        # 对每个 object 列尝试 to_numeric，若 80%+ 非空值可转换则保留
+        for col in data_df.columns:
+            if data_df[col].dtype == object:
+                converted = pd.to_numeric(data_df[col], errors='coerce')
+                before = data_df[col].notna().sum()
+                after = converted.notna().sum()
+                if before > 0 and after / before >= 0.8:
+                    data_df[col] = converted
+
+        # 确定时间列名
+        if time_col_idx is not None:
+            time_col_name = str(df.columns[time_col_idx])
         else:
-            self.data_info_label.setText(f'共 {total_rows:,} 行')
+            time_col_name = '时间'
+            if time_col_name not in data_df.columns and len(data_df.columns) > 0:
+                time_col_name = str(data_df.columns[0])
+
+        # 重命名数据列（如果用户给了自定义名称）
+        rename_map = {}
+        if data_cols:
+            for col_idx, custom_name in data_cols.items():
+                if col_idx < len(df.columns):
+                    rename_map[df.columns[col_idx]] = custom_name
+        # 将时间列统一命名为 '时间'，方便下游（run_analysis）识别
+        if time_col_idx is not None:
+            orig_time_name = str(df.columns[time_col_idx])
+            if orig_time_name not in rename_map:  # 未被用户重命名
+                rename_map[orig_time_name] = '时间'
+                time_col_name = '时间'
+            else:
+                time_col_name = rename_map[orig_time_name]
+        if rename_map:
+            data_df = data_df.rename(columns=rename_map)
+
+        # 返回有暗号标注的列名集合，用于分析页筛选列选择列表
+        annotated_cols = set(data_cols.values()) if data_cols else set()
+
+        return data_df, time_col_name, annotated_cols
+
 
     # ============ Cleaning Operations ============
 
-    def apply_cleaning(self, silent=False):
+    def apply_cleaning(self, silent=False, config=None):
         if self.current_data is None:
             if not silent:
                 QMessageBox.warning(self, '警告', '请先加载数据')
             return False
 
+        if config is None:
+            config = self.cleaning_tab_widget.get_config()
+
         rules = []
 
-        if self.adjacent_enabled.isChecked():
+        if config.get('adjacent_enabled'):
             rules.append(CleaningRule(
-                '相邻差值',
-                'adjacent_diff',
-                True,
-                self.diff_threshold.value(),
-                self.fill_method_combo.currentText(),
-                self.custom_fill_value.value() if self.fill_method_combo.currentText() == 'custom' else None
+                name='相邻差值',
+                rule_type='adjacent_diff',
+                enabled=True,
+                threshold=config.get('diff_threshold', 1.0),
+                fill_method=config.get('fill_method', 'linear'),
+                fill_value=config.get('fill_value', 0) if config.get('fill_method') == 'custom' else None,
             ))
 
-        if self.nan_enabled.isChecked():
+        if config.get('nan_enabled'):
             rules.append(CleaningRule(
-                '缺失值',
-                'nan',
-                True,
-                None,
-                self.fill_method_combo.currentText(),
-                self.custom_fill_value.value() if self.fill_method_combo.currentText() == 'custom' else None
+                name='缺失值',
+                rule_type='nan',
+                enabled=True,
+                fill_method=config.get('fill_method', 'linear'),
+                fill_value=config.get('fill_value', 0) if config.get('fill_method') == 'custom' else None,
             ))
 
         try:
-            # 光纤模板仅对波长相关列进行清洗，两种子类型策略不同：
-            #   enlight:      基础 ENLIGHT 模板 → 匹配 "波长" 开头列
-            #   fiber_custom: 公式版自定义模板  → 匹配 "FBG" 开头列
             col_pattern = None
             if self.current_template:
                 fmt = getattr(self.current_template, 'file_format', '')
@@ -4967,12 +2492,13 @@ Only analyze the file list, don't read specific content."""
             anomaly_cols = [col for col in df.columns if col.endswith('_anomaly')]
             total_anomalies = sum(df[col].sum() for col in anomaly_cols)
 
-            self.cleaning_result.setText(f'检测到 {total_anomalies} 个异常数据点\n'
-                                         f'异常列: {[col.replace("_anomaly", "") for col in anomaly_cols]}')
+            self.cleaning_tab_widget.set_result_text(
+                f'检测到 {total_anomalies} 个异常数据点\n'
+                f'异常列: {[col.replace("_anomaly", "") for col in anomaly_cols]}'
+            )
 
             if not silent:
                 self.status_bar.showMessage(f'数据清洗完成，发现 {total_anomalies} 个异常')
-                QMessageBox.information(self, '成功', f'数据清洗完成，发现 {total_anomalies} 个异常')
             return True
 
         except Exception as e:

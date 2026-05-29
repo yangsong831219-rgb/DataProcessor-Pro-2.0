@@ -186,10 +186,12 @@ def parse_file(file_path: str, template: Any) -> pd.DataFrame:
             col_names = [c['name'] for c in template.columns]
             if len(col_names) == len(df.columns):
                 df.columns = col_names
+        df.columns = df.columns.astype(str)
         return df
 
     elif template.file_format in ('xlsx', 'xls'):
         df = pd.read_excel(file_path, header=None)
+        df.columns = df.columns.astype(str)
         return df
 
     elif template.file_format == 'enlight':
@@ -225,9 +227,11 @@ def parse_file(file_path: str, template: Any) -> pd.DataFrame:
                 df[col] = pd.to_numeric(df[col])
             except (ValueError, TypeError):
                 pass
+        df.columns = df.columns.astype(str)
         return df
 
     if hasattr(template, 'columns') and template.columns:
         df.columns = [col['name'] for col in template.columns]
 
+    df.columns = df.columns.astype(str)
     return df

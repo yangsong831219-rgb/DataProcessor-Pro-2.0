@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -20,6 +21,9 @@ from .models import WordReport, WordSection, WordTable
 
 # 图片插入标签格式
 IMAGE_ANCHOR_RE = re.compile(r'\[INSERT_IMAGE:\s*([^\]]+)\]')
+
+# 段落内嵌图片标签 — re.split 专用模式
+IMAGE_PATTERN = r"\[INSERT_IMAGE:\s*(.+?)\]"
 
 
 class WordBuilder:
@@ -89,42 +93,59 @@ class WordBuilder:
 
     # ── 章节渲染 ──
 
-    def _add_section(self, doc: Document, section: WordSection) -> None:
-        """渲染一个章节：标题 + 段落 + 图片 + 表格。"""
+    def _add_section(self, doc: Document, section: WordSection, project_dir: str = '') -> None:
+        """渲染一个章节：标题 + 段落（图文混排）+ 图片 + 表格。"""
         doc.add_heading(section.heading, level=1)
 
         for para_text in section.content_paragraphs:
-            self._add_paragraph_with_images(doc, para_text)
+            self._add_paragraph_with_images(doc, para_text, project_dir=project_dir)
 
         # 显式声明的图片锚点
         for anchor in section.image_anchors:
             filename = self._extract_image_filename(anchor)
             if filename:
-                self._insert_image(doc, filename)
+                self._insert_image(doc, filename, project_dir=project_dir)
 
         for table in section.tables:
             self._add_table(doc, table)
 
     # ── 段落 + 内联图片 ──
 
-    def _add_paragraph_with_images(self, doc: Document, text: str) -> None:
-        """处理段落中可能嵌入的 [INSERT_IMAGE: ...] 标签。"""
-        parts = IMAGE_ANCHOR_RE.split(text)
-        if len(parts) == 1:
+    def _add_paragraph_with_images(self, doc: Document, text: str, project_dir: str = '') -> None:
+        """处理段落中可能嵌入的 [INSERT_IMAGE: ...] 标签。
+
+        优先通过 project_dir 拼接图片绝对路径；
+        文件缺失时以红色粗体占位文本提醒，绝不崩溃。
+        """
+        if not re.search(IMAGE_PATTERN, text):
             # 无图片标签，直接写段落
             doc.add_paragraph(text)
             return
 
-        # 有图片标签：分段处理
+        # 有图片标签：re.split 逐段处理
+        parts = re.split(IMAGE_PATTERN, text)
         para = doc.add_paragraph()
         for i, part in enumerate(parts):
             if i % 2 == 1:
                 # 奇数索引 = 图片文件名
-                self._insert_image_inline(para, part.strip())
+                filename = part.strip()
+                img_path = os.path.join(project_dir, filename) if project_dir else ''
+                if img_path and os.path.isfile(img_path):
+                    try:
+                        run = para.add_run()
+                        run.add_picture(img_path, width=Inches(5.0))
+                    except Exception:
+                        run = para.add_run(f'[图片插入失败: {filename}]')
+                        run.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
+                        run.font.bold = True
+                else:
+                    run = para.add_run(f'[图表文件丢失: {filename}]')
+                    run.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
+                    run.font.bold = True
             elif part.strip():
                 para.add_run(part.strip())
+
         if not para.runs:
-            # 段落为空时移除
             p = para._element
             p.getparent().remove(p)
 
@@ -134,9 +155,18 @@ class WordBuilder:
 
     # ── 图片插入 ──
 
-    def _insert_image(self, doc: Document, filename: str) -> bool:
-        """在文档末尾插入一张图片。"""
-        img_path = self._resolve_image_path(filename)
+    def _insert_image(self, doc: Document, filename: str, project_dir: str = '') -> bool:
+        """在文档末尾插入一张图片。
+
+        优先使用 project_dir 拼接，降级到 _resolve_image_path 搜索。
+        """
+        img_path = None
+        if project_dir:
+            candidate = os.path.join(project_dir, filename)
+            if os.path.isfile(candidate):
+                img_path = candidate
+        if not img_path:
+            img_path = self._resolve_image_path(filename)
         if img_path:
             try:
                 doc.add_picture(str(img_path), width=Inches(5.5))
@@ -145,9 +175,13 @@ class WordBuilder:
                     last_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 return True
             except Exception as e:
-                doc.add_paragraph(f'[图片加载失败: {filename} — {e}]')
+                p = doc.add_paragraph(f'[图片加载失败: {filename} — {e}]')
+                for r in p.runs:
+                    r.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
         else:
-            doc.add_paragraph(f'[图片未找到: {filename}]')
+            p = doc.add_paragraph(f'[图片未找到: {filename}]')
+            for r in p.runs:
+                r.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
         return False
 
     def _insert_image_inline(self, para, filename: str) -> bool:
@@ -159,9 +193,13 @@ class WordBuilder:
                 run.add_picture(str(img_path), width=Inches(5.0))
                 return True
             except Exception:
-                para.add_run(f'[!{filename}]')
+                run = para.add_run(f'[图片待插入: {filename}]')
+                run.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
+                run.font.bold = True
         else:
-            para.add_run(f'[{filename}]')
+            run = para.add_run(f'[图片待插入: {filename}]')
+            run.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
+            run.font.bold = True
         return False
 
     def _resolve_image_path(self, filename: str) -> Path | None:
@@ -220,6 +258,64 @@ class WordBuilder:
                     tbl.cell(i + (1 if table.headers else 0), j).text = str(val) if val is not None else ''
 
         doc.add_paragraph()  # 表后间距
+
+    # ── 文件级入口（Task 2: 模板占位符 + 图片锚点红色提示） ──
+
+    PLACEHOLDER_RE = re.compile(r'\{\{(\w+)\}\}')
+
+    def build_word_report(
+        self,
+        report_data: WordReport,
+        template_path: str,
+        output_path: str,
+        project_dir: str = '',
+    ) -> str:
+        """从 WordReport 加载模板并渲染到文件.
+
+        Args:
+            report_data: WordReport 结构化数据
+            template_path: .docx 模板路径
+            output_path: 输出 .docx 路径
+            project_dir: 项目根目录（用于拼接图片绝对路径）
+
+        Returns:
+            output_path (便于链式调用)
+        """
+        # 1. 加载模板
+        doc = Document(template_path)
+
+        # 2. 模板占位符替换
+        self._replace_placeholders(doc, report_data)
+
+        # 3. 标题页
+        self._add_title_page(doc, report_data)
+
+        # 4. 章节渲染
+        for section in report_data.sections:
+            self._add_section(doc, section, project_dir=project_dir)
+
+        # 5. 保存
+        doc.save(output_path)
+        return output_path
+
+    def _replace_placeholders(self, doc: Document, report: WordReport) -> None:
+        """遍历模板中所有段落，替换 {{Placeholder}} 占位符."""
+        mapping = {
+            'Report_Title': report.title,
+            'Report_Author': report.author,
+            'Report_Date': report.date,
+        }
+        for para in doc.paragraphs:
+            for run in para.runs:
+                original = run.text
+                if '{{' not in original:
+                    continue
+                replaced = self.PLACEHOLDER_RE.sub(
+                    lambda m: mapping.get(m.group(1), m.group(0)),
+                    original,
+                )
+                if replaced != original:
+                    run.text = replaced
 
     # ── 向后兼容 ──
 

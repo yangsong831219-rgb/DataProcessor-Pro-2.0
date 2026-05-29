@@ -1,0 +1,7 @@
+# 在项目根目录新建 .claudesignore 文件，填入以下内容：
+venv/
+__pycache__/
+*.csv
+*.xlsx
+wiki_vault/assets/  # 屏蔽抓取下来的图片和视频
+plugins/.cache/

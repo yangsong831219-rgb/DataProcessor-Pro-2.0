@@ -90,17 +90,31 @@ class SupportsUnitConversion(Protocol):
 # ============ 数据模型 ============
 
 @dataclass
+class GlobalParameter:
+    """全局参数 / 共享常量定义
+
+    注入到所有传感器公式的计算命名空间中，作为 SSOT 变量池。
+    local_dict 策略: 全局参数打底，传感器局部常量覆盖。
+    """
+    name: str
+    value: float
+    unit: str = ''
+    description: str = ''
+
+
+@dataclass
 class DataTemplate:
     """数据文件格式定义
 
     描述输入数据文件的结构：分隔符、跳过行数、列定义等。
+    columns 为列描述字典列表，每项包含 name, comment, data_type 等键。
     """
     id: str
     name: str
     file_format: str
     delimiter: str = '\t'
     skip_rows: int = 1
-    columns: List[str] = field(default_factory=list)
+    columns: List[Dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -109,7 +123,14 @@ class DataTemplate:
             'file_format': self.file_format,
             'delimiter': self.delimiter,
             'skip_rows': self.skip_rows,
-            'columns': self.columns,
+            'columns': [
+                {
+                    'name': c['name'],
+                    'comment': c.get('comment', ''),
+                    'data_type': c.get('data_type', 'numeric'),
+                }
+                for c in self.columns
+            ],
         }
 
 
@@ -215,6 +236,7 @@ class SensorSystem:
         self.fbgs: List[FBG] = []
         self.sensors: List[Sensor] = []
         self.reference_row: int = 0
+        self.global_parameters: Dict[str, Any] = {}
 
     def set_reference_row(self, row_index: int) -> None:
         self.reference_row = row_index
@@ -332,6 +354,7 @@ class SensorSystem:
                         sensor.constants,
                         fbg_delta,
                         len(df),
+                        self.global_parameters,
                     )
                     results[sensor.id] = result
             except Exception as e:
@@ -375,14 +398,23 @@ class SensorSystem:
         constants: Dict[str, float],
         fbg_delta: Dict[str, List[Optional[float]]],
         n_rows: int,
+        global_params: Optional[Dict[str, Any]] = None,
     ) -> List[Optional[float]]:
         """计算公式: "W1 * k1" → 将 W1 替换为波长差值, k1 替换为常量
 
+        常量合并策略: 全局参数打底，局部常量覆盖 (局部优先)。
         使用正则单词边界替换，避免 k1 误匹配 k10。
         NaN 安全：eval 前将 None 转为 float('nan')。
         """
         expr = formula
-        for name, value in constants.items():
+        # 合并: 全局参数打底，局部常量覆盖
+        merged: Dict[str, Any] = {}
+        if global_params:
+            merged.update(global_params)
+        merged.update(constants or {})
+        for name, value in merged.items():
+            if isinstance(value, dict):
+                value = value.get('value', 0)
             expr = re.sub(r'\b' + re.escape(name) + r'\b', f'({value})', expr)
 
         # 检查未定义常量
@@ -509,3 +541,12 @@ def apply_filter(
     else:
         return list(data)
     return scipy_signal.filtfilt(b, a, data).tolist()
+
+
+# ============ 默认数据模板 ============
+
+DEFAULT_TEMPLATES: List[DataTemplate] = [
+    DataTemplate('enlight_type', 'ENLIGHT (光纤传感)', 'enlight', '\t', 104, [
+        {'name': '时间', 'comment': '时间戳', 'data_type': 'time'},
+    ]),
+]

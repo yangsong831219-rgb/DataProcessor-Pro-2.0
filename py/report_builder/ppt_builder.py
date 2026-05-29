@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -20,6 +21,9 @@ from .models import PPTReport, PPTSlide
 
 
 IMAGE_ANCHOR_RE = re.compile(r'\[INSERT_IMAGE:\s*([^\]]+)\]')
+
+# 段落内嵌图片标签 — re.split / re.sub 专用
+IMAGE_PATTERN = r"\[INSERT_IMAGE:\s*(.+?)\]"
 
 # 每页 Bullet 数量硬限制
 MAX_BULLETS_PER_SLIDE = 4
@@ -99,8 +103,25 @@ class PPTBuilder:
 
     # ── 内容页 ──
 
-    def _add_content_slide(self, prs: Presentation, slide_data: PPTSlide) -> None:
-        slide = prs.slides.add_slide(prs.slide_layouts[6])
+    def _get_content_layout(self, prs: Presentation):
+        """安全获取最佳正文版式.
+
+        优先模板中预设的版式 1 或 2（通常为标题+内容），
+        降级到空白版式，确保不因缺少版式崩溃.
+        """
+        layouts = prs.slide_layouts
+        for idx in (1, 2, 0, len(layouts) - 1):
+            try:
+                candidate = layouts[idx]
+                if candidate is not None:
+                    return candidate
+            except (IndexError, AttributeError):
+                continue
+        return None
+
+    def _add_content_slide(self, prs: Presentation, slide_data: PPTSlide, project_dir: str = '') -> None:
+        layout = self._get_content_layout(prs)
+        slide = prs.slides.add_slide(layout) if layout else prs.slides.add_slide(prs.slide_layouts[0])
 
         # --- 标题 ---
         tb = slide.shapes.add_textbox(Inches(0.8), Inches(0.4), Inches(11.5), Inches(0.9))
@@ -121,13 +142,36 @@ class PPTBuilder:
         line.fill.fore_color.rgb = RGBColor(0x18, 0x90, 0xFF)
         line.line.fill.background()
 
-        # --- Bullet Points ---
-        bullets = slide_data.bullet_points[:MAX_BULLETS_PER_SLIDE]
+        # ── Bullet Points + 图片处理 ──
+        raw_bullets = slide_data.bullet_points[:MAX_BULLETS_PER_SLIDE]
+        cleaned_bullets: list[str] = []
+        missing_images: list[str] = []
+
+        for point in raw_bullets:
+            m = re.search(IMAGE_PATTERN, point)
+            if m:
+                filename = m.group(1).strip()
+                # 从 bullet 文字中删除 [INSERT_IMAGE: ...] 标签
+                clean_point = re.sub(IMAGE_PATTERN, '', point).strip()
+                if clean_point:
+                    cleaned_bullets.append(clean_point)
+                # 尝试插入图片
+                self._try_insert_slide_image(slide, filename, project_dir, missing_images)
+            else:
+                cleaned_bullets.append(point)
+
+        # 原有的 image_anchor 字段也一并处理
+        if slide_data.image_anchor:
+            img_filename = self._extract_image_filename(slide_data.image_anchor)
+            if img_filename:
+                self._try_insert_slide_image(slide, img_filename, project_dir, missing_images)
+
+        # 渲染清理后的 bullet points
         bullet_box = slide.shapes.add_textbox(Inches(1.0), Inches(1.5), Inches(7), Inches(4.0))
         bf = bullet_box.text_frame
         bf.word_wrap = True
 
-        for i, point in enumerate(bullets):
+        for i, point in enumerate(cleaned_bullets):
             if i == 0:
                 bp = bf.paragraphs[0]
             else:
@@ -136,16 +180,34 @@ class PPTBuilder:
             bp.font.size = Pt(20)
             bp.space_after = Pt(12)
 
-        # --- 图片 (最多一张) ---
-        if slide_data.image_anchor:
-            img_filename = self._extract_image_filename(slide_data.image_anchor)
-            if img_filename:
-                self._add_slide_image(slide, img_filename)
-
-        # --- Speaker Notes ---
+        # --- Speaker Notes (含缺失图片提示) ---
+        notes_parts: list[str] = []
         if slide_data.speaker_notes:
+            notes_parts.append(slide_data.speaker_notes)
+        for fn in missing_images:
+            notes_parts.append(f'[图片缺失: {fn}]')
+        if notes_parts:
             notes_slide = slide.notes_slide
-            notes_slide.notes_text_frame.text = slide_data.speaker_notes
+            notes_slide.notes_text_frame.text = '\n'.join(notes_parts)
+
+    def _try_insert_slide_image(self, slide, filename: str, project_dir: str, missing_images: list[str]) -> None:
+        """尝试在幻灯片右侧插入图片，失败时记录到 missing_images。"""
+        img_path = os.path.join(project_dir, filename) if project_dir else ''
+        if img_path and os.path.isfile(img_path):
+            try:
+                slide.shapes.add_picture(
+                    img_path,
+                    Inches(8.5), Inches(1.6),
+                    width=Inches(4.2),
+                )
+                return
+            except Exception:
+                pass
+        # 无 project_dir 时回退到原有搜索逻辑
+        if not project_dir:
+            if self._add_slide_image(slide, filename):
+                return
+        missing_images.append(filename)
 
     def _add_slide_image(self, slide, filename: str) -> bool:
         img_path = self._resolve_image_path(filename)
@@ -183,6 +245,68 @@ class PPTBuilder:
                             if c.exists():
                                 return c
         return None
+
+    # ── 文件级入口（Task 3: 模板占位符 + 标题页修改 + 内容页 + 备注） ──
+
+    def build_ppt_report(
+        self,
+        report_data: PPTReport,
+        template_path: str,
+        output_path: str,
+        project_dir: str = '',
+    ) -> str:
+        """从 PPTReport 加载模板并渲染到文件.
+
+        模板 Slide 0 被视为标题页，将其标题修改为 report_data.title。
+        之后每页基于模板正文版式新建幻灯片。
+
+        Args:
+            report_data: PPTReport 结构化数据
+            template_path: .pptx 模板路径
+            output_path: 输出 .pptx 路径
+            project_dir: 项目根目录（用于拼接图片绝对路径）
+
+        Returns:
+            output_path (便于链式调用)
+        """
+        prs = Presentation(template_path)
+
+        # 1. 修改首页（Slide 0）标题
+        self._update_title_slide(prs, report_data)
+
+        # 2. 删除模板已有的内容页（保留标题页即可）
+        while len(prs.slides) > 1:
+            rId = prs.slides._sldIdLst[-1].get(
+                '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id'
+            )
+            prs.part.drop_rel(rId)
+            prs.slides._sldIdLst.remove(prs.slides._sldIdLst[-1])
+
+        # 3. 渲染内容页
+        for slide_data in report_data.slides:
+            self._add_content_slide(prs, slide_data, project_dir=project_dir)
+
+        # 4. 保存
+        prs.save(output_path)
+        return output_path
+
+    def _update_title_slide(self, prs: Presentation, report: PPTReport) -> None:
+        """修改模板首页的标题占位符文本."""
+        if len(prs.slides) == 0:
+            return
+        slide = prs.slides[0]
+        # 遍历所有形状，寻找标题占位符
+        for shape in slide.shapes:
+            if hasattr(shape, 'text_frame'):
+                # 尝试替换 {{Report_Title}} 占位符
+                for para in shape.text_frame.paragraphs:
+                    for run in para.runs:
+                        if '{{Report_Title}}' in run.text:
+                            run.text = run.text.replace('{{Report_Title}}', report.title)
+                        if '{{Report_Author}}' in run.text:
+                            run.text = run.text.replace('{{Report_Author}}', report.author)
+                        if '{{Report_Date}}' in run.text:
+                            run.text = run.text.replace('{{Report_Date}}', report.date)
 
     # ── 向后兼容 ──
 

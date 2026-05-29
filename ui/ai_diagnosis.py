@@ -473,6 +473,33 @@ class AiDiagnosisWidget(QWidget):
             config = self._ai_models_config[first_name]
             if config.get('api_key'):
                 self._connect_with_config(config)
+                # 启动后自动测试延迟（后台线程，不阻塞 UI）
+                self._auto_test_latency()
+
+    def _auto_test_latency(self) -> None:
+        """启动后自动测延迟 — 无弹窗，纯后台线程，结果只更新标签."""
+        if not hasattr(self, '_online_config') or not self._online_config.get('api_key'):
+            return
+        self._set_latency('-- ms')
+        try:
+            from py.online_llm_thread import OnlineLlamaGenerateThread
+            t0 = time.time()
+            self._test_thread = OnlineLlamaGenerateThread(
+                api_key=self._online_config['api_key'],
+                base_url=self._online_config['base_url'],
+                model_name=self._online_config['model_name'],
+                prompt='你好，请用一句话介绍自己。',
+                temperature=0.3,
+                max_tokens=64,
+                system_prompt='',
+            )
+            self._test_thread.finished.connect(
+                lambda r: self._set_latency(f"{int((time.time() - t0) * 1000)} ms")
+            )
+            self._test_thread.error.connect(lambda e: print(f"[AI诊断] 启动延迟测试失败: {e}"))
+            self._test_thread.start()
+        except Exception as e:
+            print(f"[AI诊断] 启动延迟测试异常: {e}")
 
     def _on_model_selected(self, index: int) -> None:
         name = self.ai_model_combo.currentText()

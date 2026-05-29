@@ -1,0 +1,313 @@
+================================================================================
+  被动暗号标注（Passive Annotation Parsing）— 功能说明与代码实现
+================================================================================
+
+一、业务背景
+───────────────────────────────────────────────────────────────────────────────
+在数据分析软件中，当用户加载一个未知格式的通用数据文件（txt/csv/excel）时，
+数据列的含义是不确定的。传统的做法要求用户先定义模板（指定每列的列名和类型），
+这对于探索性数据分析来说步骤繁琐。
+
+"暗号标注"机制允许用户在数据文件中插入一行特殊的"备注暗号行"，
+通过简单的标记规则告诉系统：哪一列是时间序列、哪些列是需要分析的数据。
+整个过程无需预先定义模板，实现了"先看数据、再标记"的逆向工作流。
+
+与旧版"主动解析"模式不同，新版采用"被动标注"模式：
+  - 数据表格保持原样展示（含暗号行），用户可直接在表格中编辑填写暗号
+  - 废弃专门的"执行解析"按钮，不再截断/重组数据
+  - 改为通用工具方法 get_annotated_columns()，下游模块按需调用
+  - 用户在表格中的编辑实时同步回底层 DataFrame
+
+二、核心流程
+───────────────────────────────────────────────────────────────────────────────
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  1. 用户加载数据文件（open_file / load_config）               │
+  │     ↓                                                       │
+  │  2. parse_file() → self.current_data = df                  │
+  │     ↓                                                       │
+  │  3. _insert_annotation_row_if_timestamp_exists()            │
+  │     └─ 扫描 df，寻找含 '时间戳' 的行                          │
+  │     └─ 找到后在其上方插入一行空白备注行                         │
+  │     ↓                                                       │
+  │  4. update_data_table() → 数据表格渲染                       │
+  │     (表格中的单元格默认可编辑)                                 │
+  │     ↓                                                       │
+  │  5.【用户操作】在空白备注行中填写暗号：                         │
+  │     时间列填入 '时间戳'（或"时间戳"、'时间戳'）                │
+  │     数据列用引号包裹自定义列名，如 '温度'、"应变"、'位移'       │
+  │     无关列留空或随便填（会被自动忽略）                          │
+  │     ↓                                                       │
+  │  6. 编辑后自动回写：data_cell_edited 信号 →                   │
+  │     _on_data_table_cell_edited() → self.current_data.iat    │
+  │     ↓                                                       │
+  │  7. 下游模块按需调用 get_annotated_columns()：                │
+  │     【FBG定义模块】或【数据分析模块】在加载列名前                │
+  │     优先调用此方法获取列角色映射                               │
+  │     ↓                                                       │
+  │  8. _get_analysis_data() 返回清洗后的 DataFrame：            │
+  │     └─ 跳过暗号行及之前的元数据行                              │
+  │     └─ 用引号内文字重命名数据列                                │
+  └──────────────────────────────────────────────────────────────┘
+
+三、暗号行填写规则
+───────────────────────────────────────────────────────────────────────────────
+
+  ┌─────────────┬──────────────────┬──────────────────┬──────────────────┐
+  │  列1        │  列2             │  列3             │  列4             │
+  ├─────────────┼──────────────────┼──────────────────┼──────────────────┤
+  │ '时间戳'     │ '温度'           │ '应变'           │ 随便填           │
+  │             │                  │                  │ （会被忽略）      │
+  └─────────────┴──────────────────┴──────────────────┴──────────────────┘
+       ↓                ↓                 ↓                 ↓
+    时间列           数据列            数据列             忽略
+
+  - 时间戳标记：该列填入 '时间戳'、"时间戳" 或 时间戳（可带引号也可不带）
+  - 数据列标记：必须用引号包裹，支持：'单引号' "双引号" ‘中文引号’ “中文引号”
+  - 无关列：不需要任何标记，程序自动忽略
+
+四、涉及文件
+───────────────────────────────────────────────────────────────────────────────
+
+  文件                                    角色
+  ─────────────────────────────────────────────────────────────────────────────
+  main.py                                 控制器层：暗号行插入 + 被动识别 +
+                                           数据回写 + 分析数据清洗
+  ui/data_tab.py                          UI 层：可编辑表格 + 双向绑定信号
+
+五、代码实现详情
+───────────────────────────────────────────────────────────────────────────────
+
+  【文件】main.py（DataProcessorWindow 类）
+
+  ----------------------------------------------------------
+  1. 暗号行自动插入（数据加载时触发，3 个调用点）
+  ----------------------------------------------------------
+
+  方法名: _insert_annotation_row_if_timestamp_exists()
+  位置:   main.py ~line 2262
+
+  触发时机：
+    - open_file → 添加新模板路径（main.py:1633）
+    - open_file → 选择已有模板路径（main.py:1690）
+    - load_config → 从配置文件恢复（main.py:1363）
+
+  代码逻辑：
+
+  def _insert_annotation_row_if_timestamp_exists(self):
+      try:
+          if self.current_data is None or self.current_data.empty:
+              return
+          df = self.current_data
+          # 先检查是否已有暗号行（包含'时间戳'的标记行）
+          for idx in range(len(df)):
+              for val in df.iloc[idx]:
+                  s = str(val).strip().strip("'\"'\"'\"")
+                  if '时间戳' in s:
+                      return   # 已有暗号行，不再重复插入
+          # 没有暗号行 → 在第 0 行插入空白行
+          blank_vals = [''] * len(df.columns)
+          blank_row = pd.DataFrame([blank_vals], columns=df.columns)
+          self.current_data = pd.concat(
+              [blank_row, df],
+              ignore_index=True,
+          )
+      except Exception as e:
+          print(f'[暗号行插入失败] {e}')
+  ----------------------------------------------------------
+  2. 表格编辑双向同步（用户编辑 UI → 写回 DataFrame）
+  ----------------------------------------------------------
+
+  方法名: _on_data_table_cell_edited()
+  位置:   main.py ~line 2299
+
+  触发方式：用户在 QTableWidget 中编辑任意单元格后自动触发
+
+  def _on_data_table_cell_edited(self, row: int, col: int, text: str):
+      try:
+          if self.current_data is not None and 0 <= row < len(self.current_data):
+              self.current_data.iat[row, col] = text
+      except Exception as e:
+          print(f'[表格回写失败] row={row}, col={col}: {e}')
+
+  ----------------------------------------------------------
+  3. 被动暗号标注识别（通用工具方法）
+  ----------------------------------------------------------
+
+  方法名: get_annotated_columns()
+  位置:   main.py ~line 2311
+
+  被下游模块按需调用，扫描含 '时间戳' 的行并解析列角色。
+
+  def get_annotated_columns(self):
+      """扫描 current_data 寻找暗号行，被动识别列角色。
+
+      Returns:
+          (time_col_idx, data_cols, signal_row_idx)
+          - time_col_idx:  时间戳列的整数索引，None 表示未找到
+          - data_cols:     {列索引: 自定义列名} 字典
+          - signal_row_idx: 暗号行在 DataFrame 中的行号
+      """
+      import re as _re
+
+      if self.current_data is None or self.current_data.empty:
+          return None, {}, None
+
+      df = self.current_data
+      signal_row_idx = None
+
+      # ── 1. 定位暗号行 ──
+      for idx in range(len(df)):
+          for val in df.iloc[idx]:
+              s = str(val).strip().strip("'\"'\"'\"")
+              if '时间戳' in s:
+                  signal_row_idx = idx
+                  break
+          if signal_row_idx is not None:
+              break
+
+      if signal_row_idx is None:
+          return None, {}, None
+
+      # ── 2. 解析暗号行的列含义 ──
+      signal_row = df.iloc[signal_row_idx]
+      QUOTED_RE = _re.compile(r"^[\'\"‘’“”](.*?)[\'\"‘’“”]$")
+      time_col_idx = None
+      data_cols: dict = {}
+
+      for j in range(len(df.columns)):
+          col_name = df.columns[j]
+          val = str(signal_row[col_name]).strip()
+          cleaned = val.strip("'\"‘’“”").strip()
+
+          if '时间戳' in cleaned:
+              time_col_idx = j
+
+          elif QUOTED_RE.match(val):
+              m = QUOTED_RE.match(val)
+              custom_name = m.group(1).strip()
+              data_cols[j] = custom_name
+
+      return time_col_idx, data_cols, signal_row_idx
+
+  ----------------------------------------------------------
+  4. 根据暗号标注获取清洗后的分析数据
+  ----------------------------------------------------------
+
+  方法名: _get_analysis_data()
+  位置:   main.py ~line 2371
+
+  def _get_analysis_data(self):
+      """如果存在暗号行，返回跳过暗号行及之前行、并重命名列的数据。
+
+      Returns:
+          (cleaned_df, time_col_name)
+          无暗号时返回 (self.current_data, '时间')
+      """
+      time_col_idx, data_cols, signal_row_idx = self.get_annotated_columns()
+
+      if signal_row_idx is None or self.current_data is None:
+          return self.current_data, '时间'
+
+      df = self.current_data
+      # 跳过暗号行及之前的所有行
+      data_df = df.iloc[signal_row_idx + 1:].copy()
+      data_df.reset_index(drop=True, inplace=True)
+
+      # 确定时间列名
+      if time_col_idx is not None:
+          time_col_name = str(df.columns[time_col_idx])
+      else:
+          time_col_name = '时间'
+          if time_col_name not in data_df.columns:
+              time_col_name = str(data_df.columns[0])
+
+      # 重命名数据列
+      if data_cols:
+          rename_map = {}
+          for col_idx, custom_name in data_cols.items():
+              if col_idx < len(df.columns):
+                  rename_map[df.columns[col_idx]] = custom_name
+          if rename_map:
+              data_df = data_df.rename(columns=rename_map)
+              if time_col_idx is not None and time_col_idx in data_cols:
+                  time_col_name = data_cols[time_col_idx]
+
+      return data_df, time_col_name
+
+  ----------------------------------------------------------
+  【文件】ui/data_tab.py（DataTabWidget 类）
+  ----------------------------------------------------------
+
+  新增信号:  data_cell_edited = pyqtSignal(int, int, str)
+  位置:     data_tab.py ~line 20
+
+  信号连接（__init__ 中）:
+      self.data_table.itemChanged.connect(self._on_cell_changed)
+
+  处理方法:
+
+  def _on_cell_changed(self, item):
+      row = item.row()
+      col = item.column()
+      text = item.text()
+      self.data_cell_edited.emit(row, col, text)
+
+  update_data_table 中增加信号阻断:
+
+  self.data_table.blockSignals(True)    # 批量填充前阻断
+  # ... 填充数据 ...
+  self.data_table.blockSignals(False)   # 填充后恢复
+
+  ----------------------------------------------------------
+  【废弃代码清理】
+  ----------------------------------------------------------
+
+  已移除：
+    - ui/data_tab.py: secret_signal_requested 信号
+    - ui/data_tab.py: 🔍 执行暗号解析 按钮及样式
+    - main.py: secret_signal_requested → apply_secret_signal_parsing 信号连线
+    - main.py: apply_secret_signal_parsing 方法（约100行）
+
+  替换为被动模式：
+    - data_cell_edited 信号 → _on_data_table_cell_edited → DataFrame.iat 回写
+    - get_annotated_columns() 被动识别
+    - _get_analysis_data() 清洗数据供下游
+
+  ----------------------------------------------------------
+  下游适配（main.py）
+  ----------------------------------------------------------
+
+  以下方法已适配使用 _get_analysis_data() 跳过暗号行：
+
+    - update_data_table()          → analysis_tab_widget.set_current_data(analysis_df)
+    - calculate_sensors()          → sensor_system.calculate(analysis_df)
+    - _recalc_after_global_param_update() → sensor_system.calculate(analysis_df)
+    - save_sensor_data()           → sensor_system.calculate(analysis_df)
+    - export_sensor_data()         → sensor_system.calculate(analysis_df)
+    - load_config() 恢复时         → set_result_preview(restored_results, analysis_df)
+
+六、异常处理与安全性
+───────────────────────────────────────────────────────────────────────────────
+
+  ① 数据加载阶段：_insert_annotation_row_if_timestamp_exists()
+     整体包裹 try/except，任何异常不会导致程序崩溃。
+
+  ② 数据回写：_on_data_table_cell_edited()
+     检查 current_data 非空 + row 边界检查，避免 IndexError。
+
+  ③ get_annotated_columns()：
+     - current_data 为空时返回 (None, {}, None)
+     - 未找到暗号行时返回 (None, {}, None)
+     - 正则匹配失败不影响后续列
+
+  ④ _get_analysis_data()：
+     - 无暗号行时返回原始数据，完全向后兼容
+     - 存在暗号行时从 signal_row_idx + 1 开始截取
+     - 重命名列用 rename(columns=rename_map)，只映射存在的列
+
+  ⑤ parse_file 列名洗脱：df.columns = df.columns.astype(str)
+     确保 UI 层用字符串索引永远不会因类型不匹配崩溃。
+
+  ⑥ UI 渲染层防御性编程：update_data_table() 中 df[col_name]
+     抛出 KeyError 时自动降级到 df.iloc[:, j] 按列位置索引。

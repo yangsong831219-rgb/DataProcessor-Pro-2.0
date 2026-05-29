@@ -9,6 +9,10 @@ openpyxl>=3.1.0
 matplotlib>=3.7.0
 requests>=2.28.0
 
+# Report Generation: AI + Schema
+openai>=1.0.0
+pydantic>=2.0.0
+
 # Local LLM (llama-cpp-python) - GPU加速
 # Install with: $env:CMAKE_ARGS="-DGGML_CUDA=on"; pip install llama-cpp-python
 llama-cpp-python>=0.2.0

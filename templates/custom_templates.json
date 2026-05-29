@@ -92,5 +92,93 @@
         "data_type": "wavelength"
       }
     ]
+  },
+  {
+    "id": "custom_东华3825",
+    "name": "东华3825",
+    "file_format": "xlsx",
+    "delimiter": ",",
+    "skip_rows": 0,
+    "columns": [
+      {
+        "name": "0",
+        "comment": "0",
+        "data_type": "numeric"
+      },
+      {
+        "name": "1",
+        "comment": "1",
+        "data_type": "numeric"
+      },
+      {
+        "name": "2",
+        "comment": "2",
+        "data_type": "numeric"
+      },
+      {
+        "name": "3",
+        "comment": "3",
+        "data_type": "numeric"
+      },
+      {
+        "name": "4",
+        "comment": "4",
+        "data_type": "numeric"
+      },
+      {
+        "name": "5",
+        "comment": "5",
+        "data_type": "numeric"
+      },
+      {
+        "name": "6",
+        "comment": "6",
+        "data_type": "numeric"
+      }
+    ]
+  },
+  {
+    "id": "custom_东华3825",
+    "name": "东华3825",
+    "file_format": "xlsx",
+    "delimiter": ",",
+    "skip_rows": 0,
+    "columns": [
+      {
+        "name": "0",
+        "comment": "0",
+        "data_type": "numeric"
+      },
+      {
+        "name": "1",
+        "comment": "1",
+        "data_type": "numeric"
+      },
+      {
+        "name": "2",
+        "comment": "2",
+        "data_type": "numeric"
+      },
+      {
+        "name": "3",
+        "comment": "3",
+        "data_type": "numeric"
+      },
+      {
+        "name": "4",
+        "comment": "4",
+        "data_type": "numeric"
+      },
+      {
+        "name": "5",
+        "comment": "5",
+        "data_type": "numeric"
+      },
+      {
+        "name": "6",
+        "comment": "6",
+        "data_type": "numeric"
+      }
+    ]
   }
 ]

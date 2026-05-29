@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from core.models import FBG, Sensor
+from core.models import FBG, GlobalParameter, Sensor
 
 
 # ============ 子状态模块 ============
@@ -144,6 +144,9 @@ class AppState:
     # 项目文件
     project_files: List[str] = field(default_factory=list)
 
+    # 全局参数池
+    global_parameters: Dict[str, GlobalParameter] = field(default_factory=dict)
+
     # 各模块子状态
     data_tab: DataTabState = field(default_factory=DataTabState)
     cleaning_tab: CleaningTabState = field(default_factory=CleaningTabState)
@@ -173,6 +176,10 @@ class AppState:
                 for s in self.sensors
             ],
             'project_files': list(self.project_files),
+            'global_parameters': {
+                name: {'value': p.value, 'unit': p.unit, 'description': p.description}
+                for name, p in self.global_parameters.items()
+            },
             'data_tab': self.data_tab.to_dict(),
             'cleaning_tab': self.cleaning_tab.to_dict(),
             'analysis_tab': self.analysis_tab.to_dict(),
@@ -204,6 +211,15 @@ class AppState:
             fbgs=fbgs,
             sensors=sensors,
             project_files=d.get('project_files', []),
+            global_parameters={
+                name: GlobalParameter(
+                    name=name,
+                    value=entry.get('value', 0) if isinstance(entry, dict) else float(entry),
+                    unit=entry.get('unit', '') if isinstance(entry, dict) else '',
+                    description=entry.get('description', '') if isinstance(entry, dict) else '',
+                )
+                for name, entry in d.get('global_parameters', {}).items()
+            },
             data_tab=DataTabState.from_dict(d.get('data_tab', {})),
             cleaning_tab=CleaningTabState.from_dict(d.get('cleaning_tab', {})),
             analysis_tab=AnalysisTabState.from_dict(d.get('analysis_tab', {})),
@@ -228,6 +244,9 @@ class AppState:
 
     def with_analysis_results(self, results: Dict[str, List[Optional[float]]]) -> 'AppState':
         return replace(self, analysis_tab=replace(self.analysis_tab, sensor_results=results))
+
+    def with_global_parameters(self, params: Dict[str, GlobalParameter]) -> 'AppState':
+        return replace(self, global_parameters=dict(params))
 
     @property
     def active_sensors(self) -> List[Sensor]:
