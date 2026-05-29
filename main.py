@@ -2255,7 +2255,19 @@ class DataProcessorWindow(QMainWindow):
         """分析页点击"刷新"时：重新从暗号标注获取分析数据并推送到列选择列表。"""
         analysis_df, _, annotated_cols = self._get_analysis_data()
         if analysis_df is not None and not analysis_df.empty:
+            # 先推 sensor_results（确保物理量路径列表能正确填充）
+            if annotated_cols:
+                self._push_annotation_sensor_results(analysis_df, annotated_cols)
             self.analysis_tab_widget.set_current_data(analysis_df, annotated_cols)
+
+    def _push_annotation_sensor_results(self, analysis_df, annotated_cols):
+        """将标注数据列转换为 sensor_results 格式，供物理量路径使用。"""
+        sensor_results = {}
+        for col in annotated_cols:
+            if col in analysis_df.columns and pd.api.types.is_numeric_dtype(analysis_df[col]):
+                sensor_results[col] = analysis_df[col].tolist()
+        if sensor_results:
+            self.analysis_tab_widget.set_sensor_results(sensor_results)
 
     def update_data_table(self):
         if self.current_data is None:
@@ -2266,6 +2278,8 @@ class DataProcessorWindow(QMainWindow):
         # 分析模块接收清洗后的数据（跳过暗号行 + 重命名列）并填充列选择列表
         if hasattr(self, 'analysis_tab_widget'):
             analysis_df, _, annotated_cols = self._get_analysis_data()
+            if annotated_cols:
+                self._push_annotation_sensor_results(analysis_df, annotated_cols)
             self.analysis_tab_widget.set_current_data(analysis_df, annotated_cols)
 
     # ══════════════════════════════════════════════════════════

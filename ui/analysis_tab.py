@@ -37,6 +37,7 @@ class AnalysisTabWidget(QWidget):
         self._annotated_cols = None  # 有暗号的列名集合
         self._sensor_results = {}
         self._sensor_system = None
+        self._annotation_mode = False  # 标注数据（其它数据）使用物理量路径
         self._setup_ui()
         self.analysis_sensor_list.itemChanged.connect(self._on_sensor_item_changed)
 
@@ -199,15 +200,24 @@ class AnalysisTabWidget(QWidget):
     def set_current_data(self, df, annotated_cols=None):
         self._current_data = df
         self._annotated_cols = annotated_cols
-        # 原始数据模式下自动刷新数据列列表
-        if self.data_source_combo.currentText() == '原始数据':
-            self._refresh_data_column_list()
+        if annotated_cols:
+            # 标注数据 → 切换到物理量路径，显示列名为传感器
+            self._annotation_mode = True
+            self.data_source_combo.setCurrentText('物理量')
+        else:
+            self._annotation_mode = False
+            # 原始数据模式下自动刷新数据列列表
+            if self.data_source_combo.currentText() == '原始数据':
+                self._refresh_data_column_list()
 
     def set_sensor_system(self, system):
         self._sensor_system = system
 
     def set_sensor_results(self, results: dict):
         self._sensor_results = results
+        # 物理量模式下立即刷新传感器列表
+        if self.data_source_combo.currentText() == '物理量':
+            self.refresh_analysis_sensors()
 
     # ── 传感器信息辅助 ──
 
@@ -413,11 +423,17 @@ class AnalysisTabWidget(QWidget):
                 self.ax.set_xticklabels(tick_labels, rotation=45, ha='right')
 
         if sensor_ids:
-            first_id = sensor_ids[0]
-            unit = self._get_sensor_unit(first_id)
-            display_name = self._get_sensor_display_name(first_id)
-            self.ax.set_ylabel(f'{display_name} ({unit})')
-            self.ax.set_title(f'{display_name}时程曲线')
+            if self._annotation_mode:
+                # 其它数据：使用暗号名称，移除数字，单位 με
+                display_name = self._clean_col_name(sensor_ids[0])
+                self.ax.set_ylabel(f'{display_name}（με）')
+                self.ax.set_title(f'{display_name}时程曲线')
+            else:
+                first_id = sensor_ids[0]
+                unit = self._get_sensor_unit(first_id)
+                display_name = self._get_sensor_display_name(first_id)
+                self.ax.set_ylabel(f'{display_name} ({unit})')
+                self.ax.set_title(f'{display_name}时程曲线')
 
         self.ax.set_xlabel('时间')
         self.ax.grid(True, alpha=0.3)
