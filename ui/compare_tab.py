@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QSpinBox, QListWidget, QListWidgetItem,
     QAbstractItemView, QTableWidget, QTableWidgetItem,
     QCheckBox, QScrollArea, QDialog, QHeaderView,
-    QInputDialog, QMenu, QSizePolicy,
+    QInputDialog, QMenu, QSizePolicy, QTextEdit,
 )
 from PyQt6.QtCore import Qt, QObject, QSettings
 
@@ -287,6 +287,15 @@ class CompareTabWidget(QWidget):
         chart_layout.addLayout(toolbar_row)
         chart_layout.addWidget(self.canvas)
         right_layout.addWidget(self._chart_container)
+
+        # ── 多源对比指标展示 ──
+        self._comparison_result = QTextEdit()
+        self._comparison_result.setReadOnly(True)
+        self._comparison_result.setMaximumHeight(100)
+        self._comparison_result.setMinimumHeight(60)
+        self._comparison_result.setPlaceholderText("多源对比指标将在执行后显示...")
+        self._comparison_result.setVisible(False)
+        right_layout.addWidget(self._comparison_result)
 
         right.setLayout(right_layout)
         self._right_panel = right  # saved for fullscreen restore
@@ -995,7 +1004,7 @@ class CompareTabWidget(QWidget):
             return
 
         # ── 2. Build master Unix-timestamp grid from the shared time source ──
-        base_raw = pd.to_datetime(base_data[base_col_name].astype(str), errors='coerce')
+        base_raw = pd.to_datetime(base_data[base_col_name].astype(str), errors='coerce', format='mixed')
         base_valid = base_raw.dropna().sort_values()
         if base_valid.empty:
             QMessageBox.warning(self, "时间解析失败", "公共时间列无法解析为有效时间。")
@@ -1026,7 +1035,7 @@ class CompareTabWidget(QWidget):
                 continue
 
             # Parse time with offset → Unix seconds
-            ft = pd.to_datetime(data_df[file_time_col].astype(str), errors='coerce')
+            ft = pd.to_datetime(data_df[file_time_col].astype(str), errors='coerce', format='mixed')
             ft += pd.Timedelta(seconds=fc.time_offset)
             mask = ft.notna()
             if not mask.any():
@@ -1110,6 +1119,87 @@ class CompareTabWidget(QWidget):
         )
         self.fig.tight_layout()
         self.canvas.draw_idle()
+
+        # ── 9. Compute pairwise comparison metrics ──
+        self._compute_and_display_comparison(plot_bucket)
+
+    # ──────────────────────────────────────
+    #  Pairwise comparison (baselining + dropna + HTML dashboard)
+    # ──────────────────────────────────────
+
+    def _compute_and_display_comparison(
+        self, plot_bucket: list[tuple],
+    ) -> None:
+        """对所有对齐序列执行成对对比分析。
+
+        实现三条工程纪律：
+          1. 窗口首点归零法（Baselining）
+          2. 联合去空对齐（dropna how='any'）
+          3. HTML 横向仪表盘呈报
+        """
+        if len(plot_bucket) < 2:
+            self._comparison_result.setVisible(False)
+            return
+
+        # ── 1. 构建 DataFrame，每列为一个对齐序列 ──
+        df = pd.DataFrame({label: y for _, y, label in plot_bucket})
+
+        # ── 2. 窗口首点归零 ──
+        df_zeroed = df - df.iloc[0]
+
+        # ── 3. 联合去空对齐 ──
+        df_clean = df_zeroed.dropna(how='any')
+        if df_clean.empty or len(df_clean) < 2:
+            self._comparison_result.setHtml(
+                '<div style="color: #999; padding: 8px;">'
+                '有效重叠数据不足，无法计算对比指标</div>'
+            )
+            self._comparison_result.setVisible(True)
+            return
+
+        cols = list(df_clean.columns)
+        n = len(cols)
+
+        # ── 4. 成对计算并构建 HTML ──
+        html_rows: list[str] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                c1, c2 = cols[i], cols[j]
+                s1, s2 = df_clean[c1], df_clean[c2]
+                diff = s1 - s2
+                max_err = float(diff.abs().max())
+                mae = float(diff.abs().mean())
+                rmse = float(np.sqrt((diff ** 2).mean()))
+                std1, std2 = float(s1.std()), float(s2.std())
+                corr = float(s1.corr(s2)) if std1 > 0 and std2 > 0 else 0.0
+
+                html_rows.append(
+                    '<tr style="border-bottom:1px solid #eee;">'
+                    f'<td style="padding:2px 8px;font-weight:bold;white-space:nowrap;">'
+                    f'{c1} vs {c2}</td>'
+                    f'<td style="padding:2px 8px;color:#d9363e;">{max_err:.4f}</td>'
+                    f'<td style="padding:2px 8px;color:#1890ff;">{mae:.4f}</td>'
+                    f'<td style="padding:2px 8px;color:#1890ff;">{rmse:.4f}</td>'
+                    f'<td style="padding:2px 8px;color:#52c41a;">{corr:.4f}</td>'
+                    '</tr>'
+                )
+
+        html = (
+            '<table width="100%" cellpadding="0" cellspacing="0"'
+            ' style="font-size:12px;border-collapse:collapse;">'
+            '<tr style="background:#f5f5f5;font-weight:bold;">'
+            '<td style="padding:3px 8px;">数据对比</td>'
+            '<td style="padding:3px 8px;color:#d9363e;">最大误差</td>'
+            '<td style="padding:3px 8px;color:#1890ff;">平均绝对误差</td>'
+            '<td style="padding:3px 8px;color:#1890ff;">均方根误差</td>'
+            '<td style="padding:3px 8px;color:#52c41a;">相关系数</td>'
+            '</tr>'
+            + ''.join(html_rows)
+            + '</table>'
+        )
+
+        self._comparison_result.setHtml(html)
+        self._comparison_result.setVisible(True)
 
     # ──────────────────────────────────────
     #  Annotation cache (annotation_cache.json)

@@ -4,6 +4,7 @@
 import sys
 import os
 import json
+import re
 from pathlib import Path
 from datetime import datetime
 from PyQt6.QtWidgets import (
@@ -525,10 +526,11 @@ class DataProcessorWindow(QMainWindow):
                 if analysis_df is None or analysis_df.empty:
                     return
                 results = self.sensor_system.calculate(analysis_df, self.current_columns)
-                self.sensor_results = results
-                self.state = self.state.with_analysis_results(results)
-                self.sensor_tab_widget.set_result_preview(results, analysis_df)
-                self.analysis_tab_widget.set_sensor_results(results)
+                cleaned = self._clean_sensor_keys(results)
+                self.sensor_results = cleaned
+                self.state = self.state.with_analysis_results(cleaned)
+                self.sensor_tab_widget.set_result_preview(cleaned, analysis_df)
+                self.analysis_tab_widget.set_sensor_results(cleaned)
                 self.refresh_analysis_sensors()
                 self.status_bar.showMessage('全局参数已更新，传感器已重新计算')
             except Exception as e:
@@ -550,12 +552,13 @@ class DataProcessorWindow(QMainWindow):
                 return
 
             results = self.sensor_system.calculate(analysis_df, self.current_columns)
+            cleaned = self._clean_sensor_keys(results)
 
             n_preview_rows = min(100, len(analysis_df))
-            self.sensor_tab_widget.set_result_preview(results, analysis_df)
-            self.sensor_results = results
-            self.state = self.state.with_analysis_results(results)
-            self.analysis_tab_widget.set_sensor_results(results)
+            self.sensor_tab_widget.set_result_preview(cleaned, analysis_df)
+            self.sensor_results = cleaned
+            self.state = self.state.with_analysis_results(cleaned)
+            self.analysis_tab_widget.set_sensor_results(cleaned)
             self.refresh_analysis_sensors()
             self.status_bar.showMessage(f'传感器计算完成，预览显示前{n_preview_rows}行')
 
@@ -597,10 +600,11 @@ class DataProcessorWindow(QMainWindow):
                     QMessageBox.warning(self, '警告', '有效数据为空')
                     return
                 results = self.sensor_system.calculate(analysis_df, self.current_columns)
+                cleaned = self._clean_sensor_keys(results)
 
                 export_df = pd.DataFrame()
                 export_df[time_col] = analysis_df[time_col]
-                for sensor_id, values in results.items():
+                for sensor_id, values in cleaned.items():
                     export_df[sensor_id] = values
 
                 if fmt == 'csv':
@@ -630,10 +634,11 @@ class DataProcessorWindow(QMainWindow):
                     QMessageBox.warning(self, '警告', '有效数据为空')
                     return
                 results = self.sensor_system.calculate(analysis_df, self.current_columns)
+                cleaned = self._clean_sensor_keys(results)
 
                 export_df = pd.DataFrame()
                 export_df[time_col] = analysis_df[time_col]
-                for sensor_id, values in results.items():
+                for sensor_id, values in cleaned.items():
                     export_df[sensor_id] = values
 
                 export_df.to_csv(file_path, index=False)
@@ -2446,6 +2451,12 @@ class DataProcessorWindow(QMainWindow):
         time_col_idx, data_cols, signal_row_idx = self.get_annotated_columns()
 
         if signal_row_idx is None or self.current_data is None:
+            # 无暗号时也执行卸妆清洗，与带暗号路径保持列名格式一致
+            _col_clean = lambda n: re.sub(r'[\(（].*?[\)）]', '', str(n)).strip()
+            if self.current_data is not None:
+                df = self.current_data.copy()
+                df.columns = [_col_clean(c) for c in df.columns]
+                return df, '时间', []
             return self.current_data, '时间', []
 
         df = self.current_data
@@ -2492,8 +2503,19 @@ class DataProcessorWindow(QMainWindow):
         # 使用 list 保持列在数据文件中的先后顺序
         annotated_cols = list(data_cols.values()) if data_cols else []
 
+        # 卸妆：剥离所有列名中英文括号及单位后缀
+        _col_clean = lambda n: re.sub(r'[\(（].*?[\)）]', '', str(n)).strip()
+        data_df.columns = [_col_clean(c) for c in data_df.columns]
+        time_col_name = _col_clean(time_col_name)
+        annotated_cols = [_col_clean(c) for c in annotated_cols]
+
         return data_df, time_col_name, annotated_cols
 
+    @staticmethod
+    def _clean_sensor_keys(results: dict) -> dict:
+        """剥离结果字典键中的中英文括号及单位后缀"""
+        return {re.sub(r'[\(（].*?[\)）]', '', str(k)).strip(): v
+                for k, v in results.items()}
 
     # ============ Cleaning Operations ============
 

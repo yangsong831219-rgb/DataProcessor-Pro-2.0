@@ -58,6 +58,20 @@ class AnalysisTabWidget(QWidget):
         """剥离列名尾部单位后缀，例如 'A1_应变(με)' → 'A1_应变'"""
         return _re.sub(r'[\(（].*?[\)）]', '', name).strip()
 
+    @staticmethod
+    def get_best_match_column(target_col: str, dataframe: 'pd.DataFrame') -> str | None:
+        """双向去括号模糊匹配列名 — 容错防御层。
+
+        1. 清洗 target_col 和所有 DataFrame 列名（剥离括号及单位）
+        2. 依次尝试：完全一致 → 双向包含 → 返回 None
+        """
+        clean_target = _re.sub(r'[\(（].*?[\)）]', '', str(target_col)).strip()
+        for actual_col in dataframe.columns:
+            clean_actual = _re.sub(r'[\(（].*?[\)）]', '', str(actual_col)).strip()
+            if clean_target == clean_actual or clean_target in clean_actual or clean_actual in clean_target:
+                return actual_col
+        return None
+
     @property
     def _is_fiber_data(self):
         """判断当前数据是否为光纤光栅数据。
@@ -393,10 +407,11 @@ class AnalysisTabWidget(QWidget):
 
         colors = ['b-', 'g-', 'r-', 'c-', 'm-', 'y-', 'k-', 'orange']
         for i, col in enumerate(data_cols):
-            if col not in plot_df.columns:
-                print(f"[analysis_tab] 找不到列: '{col}', 当前可用列: {list(plot_df.columns)}")
+            actual_key = self.get_best_match_column(col, plot_df)
+            if actual_key is None:
+                print(f"[analysis_tab] 双向清洗仍找不到列: '{col}', 当前可用列: {list(plot_df.columns)}")
                 continue
-            col_data = pd.to_numeric(plot_df[col], errors='coerce').values[start_idx:end_idx + 1]
+            col_data = pd.to_numeric(plot_df[actual_key], errors='coerce').values[start_idx:end_idx + 1]
             plot_data = [float(v) if pd.notna(v) else None for v in col_data]
 
             if len(plot_data) > max_points:
@@ -857,13 +872,15 @@ class AnalysisTabWidget(QWidget):
         selected = self.stats_curve_combo.currentText()
         if not selected:
             return
-        if self._current_plot_df is None or selected not in self._current_plot_df.columns:
+        actual_key = self.get_best_match_column(selected, self._current_plot_df) \
+            if self._current_plot_df is not None else None
+        if actual_key is None:
             if self._current_plot_df is not None:
                 print(f"[analysis_tab] 统计找不到列: '{selected}', 当前可用列: {list(self._current_plot_df.columns)}")
             return
         start_idx = self.range_start.value()
         end_idx = min(self.range_end.value(), len(self._current_plot_df) - 1)
-        data = self._current_plot_df[selected].values[start_idx:end_idx + 1]
+        data = self._current_plot_df[actual_key].values[start_idx:end_idx + 1]
         self._calculate_statistics(data, selected)
 
     def _compare_curves(self):
@@ -882,7 +899,9 @@ class AnalysisTabWidget(QWidget):
             QMessageBox.warning(self, '警告', '请先执行分析')
             return
 
-        if curve1 not in self._current_plot_df.columns or curve2 not in self._current_plot_df.columns:
+        c1_key = self.get_best_match_column(curve1, self._current_plot_df)
+        c2_key = self.get_best_match_column(curve2, self._current_plot_df)
+        if c1_key is None or c2_key is None:
             QMessageBox.warning(self, '警告', '未找到对应数据列，请刷新选择')
             return
 
@@ -892,9 +911,9 @@ class AnalysisTabWidget(QWidget):
         plot_df = self._current_plot_df.iloc[start_idx:end_idx].copy()
 
         # 提取子集并执行联合防错位清洗
-        subset = plot_df[[curve1, curve2]].copy()
-        subset[curve1] = pd.to_numeric(subset[curve1], errors='coerce')
-        subset[curve2] = pd.to_numeric(subset[curve2], errors='coerce')
+        subset = plot_df[[c1_key, c2_key]].copy()
+        subset[c1_key] = pd.to_numeric(subset[c1_key], errors='coerce')
+        subset[c2_key] = pd.to_numeric(subset[c2_key], errors='coerce')
 
         # 联合 Drop：确保留下的每一行两条曲线同时有值
         subset = subset.dropna(how='any')
@@ -903,8 +922,8 @@ class AnalysisTabWidget(QWidget):
             QMessageBox.warning(self, '警告', '所选范围内无可对比的有效数据')
             return
 
-        s1 = subset[curve1]
-        s2 = subset[curve2]
+        s1 = subset[c1_key]
+        s2 = subset[c2_key]
 
         # 【核心修复】：窗口首点归零 — 减去各自首个有效值，消除静态偏置
         s1_zeroed = s1 - s1.iloc[0]
