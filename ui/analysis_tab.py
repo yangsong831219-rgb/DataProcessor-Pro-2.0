@@ -31,6 +31,17 @@ class AnalysisTabWidget(QWidget):
     status_message_requested = pyqtSignal(str)
     data_refresh_requested = pyqtSignal()
 
+    _UNIT_MAP = {
+        '应变': '（με）',
+        '温度': '（℃）',
+        '位移': '（mm）',
+        '挠度': '（mm）',
+        '拉力': '（kN）',
+        '应力': '（MPa）',
+        '频率': '（Hz）',
+        '索力': '（kN）',
+    }
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._current_data = None
@@ -38,8 +49,43 @@ class AnalysisTabWidget(QWidget):
         self._sensor_results = {}
         self._sensor_system = None
         self._annotation_mode = False  # 标注数据（其它数据）使用物理量路径
+        self._current_plot_df = None
         self._setup_ui()
         self.analysis_sensor_list.itemChanged.connect(self._on_sensor_item_changed)
+
+    @staticmethod
+    def _strip_unit_suffix(name: str) -> str:
+        """剥离列名尾部单位后缀，例如 'A1_应变(με)' → 'A1_应变'"""
+        return _re.sub(r'[\(（].*?[\)）]', '', name).strip()
+
+    @property
+    def _is_fiber_data(self):
+        """判断当前数据是否为光纤光栅数据。
+
+        两重判定，必须与当前加载的数据文件严格绑定：
+          1. 列名含 FBG / W\d+ / ENLIG / 光纤传感 （标准 FBG 列名）
+          2. 主窗口当前模板名含"光纤"或"ENLIGHT" （暗号重命名后列名丢失前缀）
+
+        注意：绝不检查 sensor_system.fbgs —— 上一轮光纤遗留的 FBG 定义
+        会导致其它数据被误判为光纤数据（回归错误根源）。
+        """
+        if self._current_data is None:
+            return False
+        # ── 判定 1：列名匹配 ──
+        for c in self._current_data.columns:
+            name = str(c)
+            if 'FBG' in name or 'ENLIG' in name or '光纤传感' in name:
+                return True
+            if _re.match(r'^W\d+$', name):
+                return True
+        # ── 判定 2：当前加载模板名 ──
+        main_win = self.window()
+        template = getattr(main_win, 'current_template', None)
+        if template and hasattr(template, 'name'):
+            tname = str(template.name)
+            if '光纤' in tname or 'ENLIGHT' in tname:
+                return True
+        return False
 
     # ── UI 构建 ──
 
@@ -170,7 +216,7 @@ class AnalysisTabWidget(QWidget):
 
         self.compare_result = QTextEdit()
         self.compare_result.setReadOnly(True)
-        self.compare_result.setMaximumHeight(80)
+        self.compare_result.setMaximumHeight(120)
         self.compare_result.setPlaceholderText('对比结果将显示在这里...')
         compare_layout.addWidget(self.compare_result)
 
@@ -180,19 +226,6 @@ class AnalysisTabWidget(QWidget):
         stats_group.setLayout(stats_layout)
         layout.addWidget(stats_group)
 
-        # ============ 分析操作按钮 ============
-        btn_layout = QHBoxLayout()
-        self.run_analysis_btn = QPushButton('执行分析')
-        self.run_analysis_btn.clicked.connect(self.run_analysis)
-        btn_layout.addWidget(self.run_analysis_btn)
-
-        self.export_chart_btn = QPushButton('导出图表')
-        self.export_chart_btn.clicked.connect(self._export_chart)
-        btn_layout.addWidget(self.export_chart_btn)
-
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
         layout.addStretch()
 
     # ── 依赖注入 (由主窗口调用) ──
@@ -200,13 +233,24 @@ class AnalysisTabWidget(QWidget):
     def set_current_data(self, df, annotated_cols=None):
         self._current_data = df
         self._annotated_cols = annotated_cols
+
+        if not self._is_fiber_data:
+            # ═══════════ 其它数据：锁定下拉框为"物理量" ═══════════
+            self.data_source_combo.blockSignals(True)
+            self.data_source_combo.setCurrentText('物理量')
+            self.data_source_combo.setEnabled(False)
+            self.data_source_combo.blockSignals(False)
+            self._annotation_mode = True
+            self._refresh_data_column_list()
+            return
+
+        # ═══════════ 光纤光栅数据：恢复切换能力 ═══════════
+        self.data_source_combo.setEnabled(True)
         if annotated_cols:
-            # 标注数据 → 切换到物理量路径，显示列名为传感器
             self._annotation_mode = True
             self.data_source_combo.setCurrentText('物理量')
         else:
             self._annotation_mode = False
-            # 原始数据模式下自动刷新数据列列表
             if self.data_source_combo.currentText() == '原始数据':
                 self._refresh_data_column_list()
 
@@ -215,9 +259,6 @@ class AnalysisTabWidget(QWidget):
 
     def set_sensor_results(self, results: dict):
         self._sensor_results = results
-        # 物理量模式下立即刷新传感器列表
-        if self.data_source_combo.currentText() == '物理量':
-            self.refresh_analysis_sensors()
 
     # ── 传感器信息辅助 ──
 
@@ -314,15 +355,30 @@ class AnalysisTabWidget(QWidget):
         """移除列名中的数字，保留中文和字母。"""
         return _re.sub(r'\d+', '', name).strip()
 
+    @staticmethod
+    def _extract_core_name(name: str) -> str:
+        """用关键词包含匹配提取核心物理量名称。
+
+        遍历 unit_map 的 key，若 key 存在于列名中则直接命中。
+        例如: 'A1应变-光纤1' → '应变', 'A2温度-2' → '温度'
+        """
+        if not name or not isinstance(name, str):
+            return name or ''
+        for key in AnalysisTabWidget._UNIT_MAP:
+            if key in name:
+                return key
+        # 兜底：取连字符前的部分
+        return name.split('-')[0].strip() if name.strip() else name
+
     def _update_chart_multi_columns(self, data_cols, time_data):
         self.ax.clear()
         max_points = 1000
-        current_data = self._current_data
-        if current_data is None:
+        plot_df = self._current_plot_df
+        if plot_df is None:
             return
 
         start_idx = self.range_start.value()
-        end_idx = min(self.range_end.value(), len(current_data) - 1)
+        end_idx = min(self.range_end.value(), len(plot_df) - 1)
 
         if time_data:
             time_range = list(time_data)[start_idx:end_idx + 1]
@@ -335,24 +391,13 @@ class AnalysisTabWidget(QWidget):
         else:
             tick_labels = None
 
-        # 清理列名（移除数字），用于标题/Y轴
-        display_name = self._clean_col_name(data_cols[0]) if data_cols else '数据'
-
         colors = ['b-', 'g-', 'r-', 'c-', 'm-', 'y-', 'k-', 'orange']
         for i, col in enumerate(data_cols):
-            col_data = current_data[col].values[start_idx:end_idx + 1]
-
-            ref_value = None
-            for v in col_data:
-                if pd.notna(v):
-                    ref_value = float(v)
-                    break
-
-            if ref_value is not None:
-                plot_data = [float(v) - ref_value if pd.notna(v) else None
-                            for v in col_data]
-            else:
-                plot_data = list(col_data)
+            if col not in plot_df.columns:
+                print(f"[analysis_tab] 找不到列: '{col}', 当前可用列: {list(plot_df.columns)}")
+                continue
+            col_data = pd.to_numeric(plot_df[col], errors='coerce').values[start_idx:end_idx + 1]
+            plot_data = [float(v) if pd.notna(v) else None for v in col_data]
 
             if len(plot_data) > max_points:
                 indices = np.linspace(0, len(plot_data) - 1, max_points, dtype=int)
@@ -375,11 +420,26 @@ class AnalysisTabWidget(QWidget):
             self.ax.set_xticks(tick_positions)
             self.ax.set_xticklabels(tick_labels, rotation=45, ha='right')
 
-        # Y轴标记和图表名称 —— 使用清理后的列名
-        self.ax.set_ylabel(f'{display_name}（με）')
+        # Y轴标记和图表名称
+        if self._is_fiber_data and self.data_source_combo.currentText() == '原始数据':
+            # 光纤光栅 - 原始波长数据（分支 A）
+            self.ax.set_ylabel('波长差（nm）')
+            self.ax.set_title('波长差时程曲线图')
+        else:
+            # 非光纤数据 或 光纤物理量模式：用原始列名做关键词匹配
+            col_alias = data_cols[0] if data_cols else ''
+            unit_map = AnalysisTabWidget._UNIT_MAP
+            core_name = str(col_alias).split('-')[0].strip()
+            unit = ''
+            for key, val in unit_map.items():
+                if key in str(col_alias):
+                    core_name = key
+                    unit = val
+                    break
+            self.ax.set_ylabel(f'{core_name}{unit}')
+            self.ax.set_title(f'{core_name}时程曲线')
         self.ax.grid(True, alpha=0.3)
         self.ax.legend(loc='upper right', fontsize=8)
-        self.ax.set_title(f'{display_name}时程曲线')
         self.chart_figure.tight_layout()
         self.chart_canvas.draw()
 
@@ -387,10 +447,11 @@ class AnalysisTabWidget(QWidget):
         self.ax.clear()
         max_points = 1000
         colors = ['b-', 'g-', 'r-', 'c-', 'm-', 'y-', 'k-', 'orange']
-        sensor_results = self._sensor_results
+        sensor_results = self._get_sensor_results()
 
         for i, sensor_id in enumerate(sensor_ids):
             if sensor_id not in sensor_results:
+                print(f"[analysis_tab] 找不到传感器: '{sensor_id}', 当前可用: {list(sensor_results.keys())}")
                 continue
 
             data = list(sensor_results[sensor_id])
@@ -423,17 +484,17 @@ class AnalysisTabWidget(QWidget):
                 self.ax.set_xticklabels(tick_labels, rotation=45, ha='right')
 
         if sensor_ids:
-            if self._annotation_mode:
-                # 其它数据：使用暗号名称，移除数字，单位 με
-                display_name = self._clean_col_name(sensor_ids[0])
-                self.ax.set_ylabel(f'{display_name}（με）')
-                self.ax.set_title(f'{display_name}时程曲线')
-            else:
-                first_id = sensor_ids[0]
-                unit = self._get_sensor_unit(first_id)
-                display_name = self._get_sensor_display_name(first_id)
-                self.ax.set_ylabel(f'{display_name} ({unit})')
-                self.ax.set_title(f'{display_name}时程曲线')
+            col_alias = sensor_ids[0]
+            unit_map = AnalysisTabWidget._UNIT_MAP
+            core_name = str(col_alias).split('-')[0].strip()
+            unit = ''
+            for key, val in unit_map.items():
+                if key in str(col_alias):
+                    core_name = key
+                    unit = val
+                    break
+            self.ax.set_ylabel(f'{core_name}{unit}')
+            self.ax.set_title(f'{core_name}时程曲线')
 
         self.ax.set_xlabel('时间')
         self.ax.grid(True, alpha=0.3)
@@ -503,13 +564,18 @@ class AnalysisTabWidget(QWidget):
             'skew': float(np.mean(((arr - arr.mean()) / arr.std()) ** 3)) if arr.std() > 0 else 0,
             'kurtosis': float(np.mean(((arr - arr.mean()) / arr.std()) ** 4)) if arr.std() > 0 else 0,
         }
+        _label_map = {
+            'max': '最大值', 'min': '最小值', 'mean': '平均值', 'std': '标准差',
+            'peak_to_peak': '峰峰值', 'rms': '均方根', 'skew': '偏度', 'kurtosis': '峰度',
+        }
         for key, value in stats.items():
-            self.stats_labels[key].setText(f'{key}: {value:.4f}')
+            label_name = _label_map.get(key, key)
+            self.stats_labels[key].setText(f'{label_name}: {value:.4f}')
 
     def _calculate_statistics_for_sensors(self, sensor_ids, start_idx, end_idx):
         if not sensor_ids:
             return
-        sensor_results = self._sensor_results
+        sensor_results = self._get_sensor_results()
 
         self.stats_curve_combo.clear()
         self.compare_combo1.clear()
@@ -525,6 +591,99 @@ class AnalysisTabWidget(QWidget):
 
     # ── 事件处理 ──
 
+    def _get_checked_items(self):
+        """从分析传感器列表中获取所有勾选项的真实数据值。"""
+        selected = []
+        for i in range(self.analysis_sensor_list.count()):
+            item = self.analysis_sensor_list.item(i)
+            role = item.data(Qt.ItemDataRole.UserRole)
+            if role == '__select_all__' or role is None:
+                continue
+            if item.checkState() == Qt.CheckState.Checked:
+                selected.append(role)
+        return selected
+
+    def _get_current_plot_data(self):
+        """根据当前文件类型和数据源模式返回路由后的绘图数据。
+
+        返回: (data_df, time_col_name, selected_cols, is_sensor_mode)
+        """
+        if self._current_data is None:
+            return None, '', [], False
+
+        # ═════════════════════════════════════════════════════
+        # 第一层：文件类型判断（基于当前数据的列名，而非持久状态）
+        # ═════════════════════════════════════════════════════
+        if self._is_fiber_data:
+            # ═══════════ 光纤光栅数据 ═══════════
+            ds = self.data_source_combo.currentText()
+            if ds == '原始数据':
+                # 分支 A：光纤 → 原始波长数据（固化波长差）
+                selected = self._get_checked_items()
+                # 任务 1：剥离单位后缀，匹配原生列名
+                selected = [self._strip_unit_suffix(s) for s in selected]
+                if not selected:
+                    selected = [c for c in self._current_data.columns
+                                if c != '时间' and '计数' not in str(c)
+                                and not str(c).startswith('CH')
+                                and pd.api.types.is_numeric_dtype(self._current_data[c])]
+                if not selected:
+                    return None, '', [], False
+                tc = '时间' if '时间' in self._current_data.columns else ''
+                # 任务 3：安全切片防呆 — 只保留 DataFrame 真实存在的列
+                valid_selected = [c for c in selected if c in self._current_data.columns]
+                if not valid_selected:
+                    return None, '', [], False
+                selected = valid_selected
+                cols = ([tc] + selected) if tc else selected
+                df = self._current_data[cols].copy()
+                for c in selected:
+                    col_vals = df[c].values
+                    ref = next((float(v) for v in col_vals if pd.notna(v)), None)
+                    if ref is not None:
+                        df[c] = [float(v) - ref if pd.notna(v) else None
+                                for v in col_vals]
+                return df, tc, selected, False
+            else:
+                # 分支 B：光纤 → 传感器计算结果
+                sensor_results = getattr(self.window(), 'sensor_results', {})
+                if not sensor_results:
+                    return None, '', [], True
+                selected = self._get_checked_items()
+                if not selected:
+                    # 传感器列表为空 → 尝试从 sensor_results 自动重建
+                    self.refresh_analysis_sensors()
+                    selected = self._get_checked_items()
+                    if not selected:
+                        return None, '', [], True
+                tc = '时间' if '时间' in self._current_data.columns else self._current_data.columns[0]
+                ts = self._current_data[tc].reset_index(drop=True)
+                rows = len(ts)
+                d = {tc: ts}
+                for sid in selected:
+                    if sid in sensor_results:
+                        v = list(sensor_results[sid])
+                        if len(v) >= rows:
+                            d[sid] = v[:rows]
+                        else:
+                            d[sid] = v + [float('nan')] * (rows - len(v))
+                return pd.DataFrame(d), tc, selected, True
+        else:
+            # ═══════════ 其它数据（txt/csv/Excel）═══════════
+            # 分支 C：只使用用户勾选的暗号列，绝不自动探测
+            selected = self._get_checked_items()
+            # 任务 1：剥离单位后缀，匹配原生列名
+            selected = [self._strip_unit_suffix(s) for s in selected]
+            if not selected:
+                return None, '', [], False
+            tc = '时间' if '时间' in self._current_data.columns else ''
+            # 任务 3：安全切片防呆
+            valid_selected = [c for c in selected if c in self._current_data.columns]
+            if not valid_selected:
+                return None, '', [], False
+            cols = ([tc] + valid_selected) if tc else valid_selected
+            return self._current_data[cols].copy(), tc, valid_selected, False
+
     def run_analysis(self, silent=False):
         current_data = self._current_data
         if current_data is None:
@@ -533,77 +692,49 @@ class AnalysisTabWidget(QWidget):
             return
 
         try:
-            data_source = self.data_source_combo.currentText()
+            plot_df, time_col, selected_cols, is_sensor_mode = self._get_current_plot_data()
+            self._current_plot_df = plot_df
+            if plot_df is not None and selected_cols:
+                for c in selected_cols:
+                    if c in plot_df.columns:
+                        plot_df[c] = pd.to_numeric(plot_df[c], errors='coerce')
 
-            if data_source == '物理量':
-                sensor_results = self._sensor_results
-                if not sensor_results:
-                    if not silent:
-                        QMessageBox.warning(self, '警告', '请先在光纤公式配置中计算传感器数据')
-                    return
+            if plot_df is None or not selected_cols:
+                if not silent:
+                    msg = ('请先选择至少一个数据列'
+                           if self.data_source_combo.currentText() == '原始数据'
+                           else '请先在光纤公式配置中计算传感器数据')
+                    QMessageBox.warning(self, '警告', msg)
+                return
 
-                selected_sensors = []
-                for i in range(self.analysis_sensor_list.count()):
-                    item = self.analysis_sensor_list.item(i)
-                    if item.checkState() == Qt.CheckState.Checked and \
-                       item.data(Qt.ItemDataRole.UserRole) != '__select_all__':
-                        selected_sensors.append(item.data(Qt.ItemDataRole.UserRole))
+            start_idx = self.range_start.value()
+            end_idx = min(self.range_end.value(), len(plot_df) - 1)
+            if start_idx >= len(plot_df):
+                if not silent:
+                    QMessageBox.warning(self, '警告', '起始索引超出数据范围')
+                return
 
-                if not selected_sensors:
-                    if not silent:
-                        QMessageBox.warning(self, '警告', '请选择至少一个传感器')
-                    return
-
-                time_col = '时间' if '时间' in current_data.columns else current_data.columns[0]
-                time_data = list(current_data[time_col].values)
-
-                start_idx = self.range_start.value()
-                end_idx = min(self.range_end.value(), len(current_data) - 1)
-                if start_idx >= len(current_data):
-                    if not silent:
-                        QMessageBox.warning(self, '警告', '起始索引超出数据范围')
-                    return
-
-                time_range = time_data[start_idx:end_idx + 1] if len(time_data) > 0 else None
-                self._update_chart_multi_sensors(selected_sensors, time_range)
-                self._calculate_statistics_for_sensors(selected_sensors, start_idx, end_idx)
-
+            if time_col:
+                time_data = list(plot_df[time_col].values)
             else:
-                # 从复选框列表读取用户选择的数据列
-                data_cols = []
-                for i in range(self.analysis_sensor_list.count()):
-                    item = self.analysis_sensor_list.item(i)
-                    role = item.data(Qt.ItemDataRole.UserRole)
-                    if role == '__select_all__' or role is None:
-                        continue
-                    if item.checkState() == Qt.CheckState.Checked:
-                        data_cols.append(role)
-                # 如果列表为空，回退到自动检测
-                if not data_cols:
-                    data_cols = [c for c in current_data.columns
-                                if c != '时间' and '计数' not in str(c)
-                                and not str(c).startswith('CH')
-                                and pd.api.types.is_numeric_dtype(current_data[c])]
-                if not data_cols:
-                    if not silent:
-                        QMessageBox.warning(self, '警告', '没有可用的数据列')
-                    return
+                time_data = list(range(len(plot_df)))
+            time_range = time_data[start_idx:end_idx + 1]
 
-                time_col = '时间' if '时间' in current_data.columns else None
-                if time_col:
-                    time_data = list(current_data[time_col].values)
-                else:
-                    time_data = list(range(len(current_data)))
-
-                start_idx = self.range_start.value()
-                end_idx = min(self.range_end.value(), len(current_data) - 1)
-                if start_idx >= len(current_data):
-                    if not silent:
-                        QMessageBox.warning(self, '警告', '起始索引超出数据范围')
-                    return
-
-                time_range = time_data[start_idx:end_idx + 1]
-                self._update_chart_multi_columns(data_cols, time_range)
+            if is_sensor_mode:
+                self._update_chart_multi_sensors(selected_cols, time_range)
+                self._calculate_statistics_for_sensors(selected_cols, start_idx, end_idx)
+            else:
+                self._update_chart_multi_columns(selected_cols, time_range)
+                # 原始数据模式也填充统计/对比下拉
+                if selected_cols:
+                    self.stats_curve_combo.clear()
+                    self.compare_combo1.clear()
+                    self.compare_combo2.clear()
+                    self.stats_curve_combo.addItems(selected_cols)
+                    self.compare_combo1.addItems(selected_cols)
+                    self.compare_combo2.addItems(selected_cols)
+                    first_data = plot_df[selected_cols[0]].values[start_idx:end_idx + 1]
+                    self._calculate_statistics(first_data, selected_cols[0])
 
             self.status_message_requested.emit('分析完成')
 
@@ -619,7 +750,9 @@ class AnalysisTabWidget(QWidget):
     def _refresh_data_column_list(self):
         """原始数据模式下，用当前数据的数值列填充分析传感器列表（复选框）。
 
-        只显示有暗号标注的列（self._annotated_cols）；无暗号时显示所有数值列。
+        【光纤 + 原始数据】：直接使用 _annotated_cols 暗号名列表（已重命名到 DataFrame），
+        绕过 dtype 检测和成员匹配的脆弱链条。
+        无暗号时退化为显示所有数值列。
         """
         self.analysis_sensor_list.clear()
         if self._current_data is None:
@@ -627,9 +760,9 @@ class AnalysisTabWidget(QWidget):
             return
 
         if self._annotated_cols:
-            data_cols = [c for c in self._current_data.columns
-                         if c in self._annotated_cols
-                         and pd.api.types.is_numeric_dtype(self._current_data[c])]
+            # 光纤暗号标注列 = rename 后的 DataFrame 列名，直接使用（过滤时间戳）
+            data_cols = [name for name in self._annotated_cols
+                         if name and '时间戳' not in name]
         else:
             data_cols = [c for c in self._current_data.columns
                          if c != '时间'
@@ -653,8 +786,12 @@ class AnalysisTabWidget(QWidget):
 
         self.analysis_sensor_list.setEnabled(True)
 
+    def _get_sensor_results(self):
+        """获取传感器计算结果，从顶层主窗口获取（绕过 PyQt parent 层级陷阱）。"""
+        return getattr(self.window(), 'sensor_results', {})
+
     def refresh_analysis_sensors(self):
-        sensor_results = self._sensor_results
+        sensor_results = self._get_sensor_results()
         self.analysis_sensor_list.clear()
         if sensor_results:
             select_all_item = QListWidgetItem('【全选】')
@@ -683,65 +820,128 @@ class AnalysisTabWidget(QWidget):
                     other.setCheckState(state)
 
     def _on_data_source_changed(self):
+        # 非光纤数据时下拉框已禁用，忽略任何残留切换事件
+        if not self.data_source_combo.isEnabled():
+            return
         if self.data_source_combo.currentText() == '物理量':
             self.refresh_analysis_sensors()
             self.stats_curve_combo.clear()
             self.compare_combo1.clear()
             self.compare_combo2.clear()
-            sensor_results = self._sensor_results
+            sensor_results = self._get_sensor_results()
             if sensor_results:
                 ids = list(sensor_results.keys())
                 self.stats_curve_combo.addItems(ids)
                 self.compare_combo1.addItems(ids)
+                self.compare_combo2.addItems(ids)
         else:
             # 切换到原始数据：自动填充数据列列表
             self._refresh_data_column_list()
+            # 同时填充统计/对比下拉
+            self.stats_curve_combo.clear()
+            self.compare_combo1.clear()
+            self.compare_combo2.clear()
+            data_cols = []
+            for i in range(self.analysis_sensor_list.count()):
+                item = self.analysis_sensor_list.item(i)
+                role = item.data(Qt.ItemDataRole.UserRole)
+                if role == '__select_all__' or role is None:
+                    continue
+                data_cols.append(role)
+            if data_cols:
+                self.stats_curve_combo.addItems(data_cols)
+                self.compare_combo1.addItems(data_cols)
+                self.compare_combo2.addItems(data_cols)
 
     def _on_stats_curve_changed(self):
-        sensor_results = self._sensor_results
         selected = self.stats_curve_combo.currentText()
-        if not selected or selected not in sensor_results:
+        if not selected:
+            return
+        if self._current_plot_df is None or selected not in self._current_plot_df.columns:
+            if self._current_plot_df is not None:
+                print(f"[analysis_tab] 统计找不到列: '{selected}', 当前可用列: {list(self._current_plot_df.columns)}")
             return
         start_idx = self.range_start.value()
-        end_idx = min(self.range_end.value(), len(sensor_results[selected]) - 1)
-        data = list(sensor_results[selected])[start_idx:end_idx + 1]
+        end_idx = min(self.range_end.value(), len(self._current_plot_df) - 1)
+        data = self._current_plot_df[selected].values[start_idx:end_idx + 1]
         self._calculate_statistics(data, selected)
 
     def _compare_curves(self):
-        sensor_results = self._sensor_results
         curve1 = self.compare_combo1.currentText()
         curve2 = self.compare_combo2.currentText()
 
         if not curve1 or not curve2:
             QMessageBox.warning(self, '警告', '请选择两条曲线进行对比')
             return
-        if curve1 not in sensor_results or curve2 not in sensor_results:
-            QMessageBox.warning(self, '警告', '请确保两条曲线都已计算')
+
+        if curve1 == curve2:
+            QMessageBox.warning(self, '选择错误', '请选择两条不同的曲线进行对比！')
             return
 
+        if self._current_plot_df is None:
+            QMessageBox.warning(self, '警告', '请先执行分析')
+            return
+
+        if curve1 not in self._current_plot_df.columns or curve2 not in self._current_plot_df.columns:
+            QMessageBox.warning(self, '警告', '未找到对应数据列，请刷新选择')
+            return
+
+        # 强制同步"应用范围"切片（与图表保持绝对一致）
         start_idx = self.range_start.value()
-        end_idx = min(self.range_end.value(), len(sensor_results[curve1]) - 1)
-        end_idx = min(end_idx, len(sensor_results[curve2]) - 1)
+        end_idx = self.range_end.value()
+        plot_df = self._current_plot_df.iloc[start_idx:end_idx].copy()
 
-        d1 = np.array(list(sensor_results[curve1])[start_idx:end_idx + 1])
-        d2 = np.array(list(sensor_results[curve2])[start_idx:end_idx + 1])
-        diff = d1 - d2
+        # 提取子集并执行联合防错位清洗
+        subset = plot_df[[curve1, curve2]].copy()
+        subset[curve1] = pd.to_numeric(subset[curve1], errors='coerce')
+        subset[curve2] = pd.to_numeric(subset[curve2], errors='coerce')
 
-        result = (
-            f'曲线对比: {curve1} vs {curve2}\n'
-            f'{"=" * 30}\n'
-            f'最大差值: {np.max(diff):.4f}\n'
-            f'最小差值: {np.min(diff):.4f}\n'
-            f'平均差值: {np.mean(diff):.4f}\n'
-            f'标准差: {np.std(diff):.4f}\n'
-            f'峰峰值: {np.max(diff) - np.min(diff):.4f}'
+        # 联合 Drop：确保留下的每一行两条曲线同时有值
+        subset = subset.dropna(how='any')
+
+        if subset.empty:
+            QMessageBox.warning(self, '警告', '所选范围内无可对比的有效数据')
+            return
+
+        s1 = subset[curve1]
+        s2 = subset[curve2]
+
+        # 【核心修复】：窗口首点归零 — 减去各自首个有效值，消除静态偏置
+        s1_zeroed = s1 - s1.iloc[0]
+        s2_zeroed = s2 - s2.iloc[0]
+
+        # 基于相对变化量计算真实误差
+        diff = s1_zeroed - s2_zeroed
+        max_err = diff.abs().max()
+        mae = diff.abs().mean()
+        rmse = np.sqrt((diff ** 2).mean())
+
+        # 皮尔逊系数（基于归零后数据，含除零保护）
+        std1, std2 = s1_zeroed.std(), s2_zeroed.std()
+        if pd.isna(std1) or pd.isna(std2) or std1 == 0 or std2 == 0:
+            corr = 0.0
+        else:
+            corr = s1_zeroed.corr(s2_zeroed)
+
+        # 调试日志
+        print(f"--- 对比调试信息 ({curve1} vs {curve2}) ---")
+        print(f"原始起点差值: {s1.iloc[0] - s2.iloc[0]:.4f}")
+        print(f"归零后 Max Err: {max_err:.4f}, RMSE: {rmse:.4f}, Corr: {corr:.4f}")
+        print("---------------------------------")
+
+        html = (
+            '<div style="font-family: Arial, sans-serif; font-size: 13px; padding: 5px;">'
+            f'<h4 style="margin-top: 0; color: #333;">曲线对比: <b>{curve1}</b> vs <b>{curve2}</b></h4>'
+            '<hr style="border: 0; border-top: 1px solid #ccc; margin-bottom: 10px;">'
+            '<table width="100%" cellpadding="5" cellspacing="0">'
+            '<tr>'
+            f'<td width="25%">绝对误差 (Max): <br><b><span style="color: #d9363e; font-size: 14px;">{max_err:.4f}</span></b></td>'
+            f'<td width="25%">平均绝对误差 (MAE): <br><b><span style="color: #1890ff; font-size: 14px;">{mae:.4f}</span></b></td>'
+            f'<td width="25%">均方根误差 (RMSE): <br><b><span style="color: #1890ff; font-size: 14px;">{rmse:.4f}</span></b></td>'
+            f'<td width="25%">相关系数 (Pearson): <br><b><span style="color: #52c41a; font-size: 14px;">{corr:.4f}</span></b></td>'
+            '</tr>'
+            '</table>'
+            '</div>'
         )
-        self.compare_result.setText(result)
+        self.compare_result.setHtml(html)
 
-    def _export_chart(self):
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, '导出图表', '', 'PNG Files (*.png);;PDF Files (*.pdf)'
-        )
-        if file_path:
-            self.chart_figure.savefig(file_path, dpi=300, bbox_inches='tight')
-            QMessageBox.information(self, '成功', f'图表已保存到:\n{file_path}')

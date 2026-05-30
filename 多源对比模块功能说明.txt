@@ -1,0 +1,306 @@
+================================================================================
+  多源数据对比分析模块 — 功能说明与实现逻辑
+================================================================================
+
+一、模块概述
+───────────────────────────────────────────────────────────────────────────────
+
+多源数据对比分析模块（CompareTabWidget）允许用户加载多个数据文件，通过被动
+暗号标注机制标记各文件的时间列和数据列，选择一个公共时间列，将所有文件的选定
+数据列绘制在同一坐标系中实现绝对时间对齐的多文件叠加对比。
+
+    文件路径: ui/compare_tab.py
+    标签页名: "多源对比"
+    注册位置: main.py:267-269 (central_widget.addTab)
+
+二、核心数据结构 — FileConfig
+───────────────────────────────────────────────────────────────────────────────
+
+class FileConfig:
+    """单个文件的数据源配置."""
+
+    ┌──────────────┬────────────────────────────────────────────────┐
+    │ 属性          │ 说明                                           │
+    ├──────────────┼────────────────────────────────────────────────┤
+    │ filepath     │ 原始文件路径                                    │
+    │ raw_df       │ 原始 DataFrame（刚解析完的原始数据）              │
+    │ annotated_df │ 插入备注行后的 DataFrame（含空白备注行）          │
+    │ annotation_row_idx │ 黄色备注行在 annotated_df 中的行索引       │
+    │ time_col     │ 该文件的时间列名（从备注行解析所得）               │
+    │ data_cols    │ 该文件的数据列名列表（用户勾选结果）               │
+    │ row_start    │ 裁剪起始行（从备注行之后算起，0=首行数据）         │
+    │ row_end      │ 裁剪结束行（0=末尾）                            │
+    └──────────────┴────────────────────────────────────────────────┘
+
+    辅助方法:
+      - display_name → 文件名（不含路径）
+      - data_row_count → 备注行之后的数据行数
+      - get_plot_data() → 返回裁剪后的数据区域（跳过备注行及以上元数据行，
+                          按 row_start/row_end 裁剪，重置索引）
+
+三、UI 布局（QSplitter 40:60）
+───────────────────────────────────────────────────────────────────────────────
+
+    左侧面板（40%）— 四个 QGroupBox + 执行按钮:
+
+    ┌─ ① 数据源管理 ─────────────────────────────────────────┐
+    │ [+ 添加文件] [- 移除选中]                                │
+    │ [文件列表 QListWidget] (单选模式)                       │
+    └──────────────────────────────────────────────────────────┘
+
+    ┌─ ② 数据标注（选中文件） ────────────────────────────────┐
+    │ [QTableWidget] (最大高度200px)                          │
+    │   - 上下文行（备注行上方，至多3行，只读）                  │
+    │   - 黄色备注行（可编辑，填写 '时间戳' 或 '数据列名'）     │
+    │   - 预览行（备注行下方，至多10行，只读）                   │
+    │ 提示: "黄色行为备注行（可编辑）— 填写..."                 │
+    └──────────────────────────────────────────────────────────┘
+
+    ┌─ ③ 数据时程选择 ───────────────────────────────────────┐
+    │ 起始行: [QSpinBox] 行                                   │
+    │ 截止行: [QSpinBox] 行（0=末尾）                          │
+    └──────────────────────────────────────────────────────────┘
+
+    ┌─ ④ 图表数据选择 ───────────────────────────────────────┐
+    │ 时间列（单选）: [QComboBox]                              │
+    │   - 下拉列表显示所有已加载文件的标注时间列（去重）          │
+    │   - 只能选一个作为所有数据列的公共时间轴                   │
+    │ 数据列（多选）: [QScrollArea + QCheckBox列表]             │
+    │   - 仅显示当前选中文件中含引号标注的数据列                 │
+    │   - 时间列和没有 '' 引号标注的列不会出现                   │
+    └──────────────────────────────────────────────────────────┘
+
+                   [▶ 执行对比] QPushButton
+           (shared_time_col 非空 且 任一文件有 data_cols 时启用)
+
+    右侧面板（60%）— Matplotlib 图表:
+
+    [NavigationToolbar2QT] [⛶ 全屏] [↩ 返回]
+    [FigureCanvasQTAgg — Figure(figsize=(8,5), dpi=100)]
+
+四、数据流（完整链路）
+───────────────────────────────────────────────────────────────────────────────
+
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  1. 用户点击 [+ 添加文件]                                          │
+  │     → _on_add_file()                                              │
+  │       → QFileDialog.getOpenFileNames（多选）                       │
+  │       → _load_file(path) 解析原始文件                              │
+  │         ├─ .xlsx/.xls → pd.read_excel                             │
+  │         ├─ 其他格式 → try_read_csv (自动检测分隔符/表头/编码)      │
+  │         └─ 失败或单列 → _parse_enlight_like (原始行扫描，           │
+  │                            找3个连续时间戳行，Tab分隔)              │
+  │       → _insert_annotation_row(raw_df)                            │
+  │         └─ _find_first_timestamp_row → 扫描DataFrame前500行，      │
+  │             找到首个连续3行均有纯时间戳的行（正则匹配日期格式，      │
+  │             排除含字母或中文的行）→ 在该行上方插入空白行             │
+  │         └─ 所有列 astype(object)，防止空字符串写入数字列时报错      │
+  │       → _auto_annotate(cfg)                                       │
+  │         └─ 扫描列名含"时间"/"time"/"timestamp"→ 备注行填入'时间戳'   │
+  │       → _parse_annotations(cfg)                                   │
+  │         └─ 扫描备注行：'时间戳'→ time_col；引号包裹→ data_cols     │
+  │       → 文件加入 self._files 列表 + file_list 显示                 │
+  │     → 自动选中最后添加的文件（setCurrentRow）或刷新当前列选择       │
+  │     → _update_execute_button()                                    │
+  │     │                                                             │
+  │  2. 用户切换选中文件                                               │
+  │     → _on_file_selected(row)                                      │
+  │       → _populate_annotation_table(cfg)                           │
+  │         └─ 阻断信号 → 填充上下文行(只读)+备注行(黄色可编辑)         │
+  │            + 预览行(只读) → 恢复信号                               │
+  │       → _populate_range_spins(cfg)                                │
+  │         └─ 设置行范围微调框（基于 data_row_count）                  │
+  │       → _populate_column_selection(cfg)                           │
+  │         ├─ 时间列下拉：从 ALL 文件收集标注时间列（_get_all_         │
+  │         │  annotated_time_cols），去重，恢复已选值                  │
+  │         └─ 数据列多选：_get_annotated_data_cols(cfg) →             │
+  │            排除时间列 + 仅保留含引号标注的列 → 按 cfg.data_cols     │
+  │            恢复勾选状态                                            │
+  │       → _update_execute_button()                                  │
+  │     │                                                             │
+  │  3. 用户在黄色备注行中编辑暗号                                     │
+  │     → _on_annotation_cell_changed(item)                           │
+  │       └─ 验证行号 = 备注行 → 写回 cfg.annotated_df                │
+  │       → _parse_annotations(cfg) → 更新 time_col / data_cols       │
+  │       → _populate_column_selection(cfg) → 刷新下拉+勾选框          │
+  │       → _update_execute_button()                                  │
+  │     │                                                             │
+  │  4. 用户选择公共时间列 + 勾选数据列                                 │
+  │     → 时间列下拉 → currentTextChanged → _on_time_col_changed()    │
+  │       → self._shared_time_col = 当前选中文本                       │
+  │     → 数据列勾选框 → toggled → _on_data_col_toggled()             │
+  │       → 更新当前文件的 cfg.data_cols = 已勾选的列名列表              │
+  │     │                                                             │
+  │  5. 用户点击 [▶ 执行对比]                                          │
+  │     → _align_and_plot()                                           │
+  │       └─ 见第 七 节                                               │
+  └────────────────────────────────────────────────────────────────────┘
+
+五、被动暗号标注规则（与新版的 main.py 规则一致）
+───────────────────────────────────────────────────────────────────────────────
+
+  用户在黄色备注行中填写暗号标记，系统被动扫描识别：
+
+  ┌──────────────┬──────────────────┬──────────────────┬──────────────────┐
+  │  列1         │  列2             │  列3             │  列4             │
+  ├──────────────┼──────────────────┼──────────────────┼──────────────────┤
+  │ '时间戳'      │ '温度'           │ '应变'           │ 随便填           │
+  │              │                  │                  │ （会被忽略）      │
+  └──────────────┴──────────────────┴──────────────────┴──────────────────┘
+       ↓               ↓                 ↓                 ↓
+    时间列          数据列            数据列             忽略
+
+  - 时间戳标记: 填写 '时间戳'、"时间戳"、时间戳（引号可有可无）
+  - 数据列标记: 必须用引号包裹：'单引号' "双引号" ‘中文引号’ “中文引号”
+  - 无关列: 不需要任何标记，程序自动忽略
+  - 正则表达式: _QUOTED_RE = r"^[\'\"‘’“”](.*?)[\'\"‘’“”]$"
+
+六、文件解析策略
+───────────────────────────────────────────────────────────────────────────────
+
+  _load_file(path):
+
+  1. .xlsx/.xls → pd.read_excel（直接读取）
+  2. 其他格式 → try_read_csv (utils/file_parser.py)：
+     a. detect_format → 从文件前50KB检测分隔符和数据起始行
+     b. detect_header → 检测首行是表头还是数据
+     c. pd.read_csv → 自动尝试 utf-8/gbk/latin-1 编码
+     d. 列名 str 清洗 + 数值列自动 to_numeric
+  3. 若 try_read_csv 失败或仅返回单列 → _parse_enlight_like 回退：
+     a. 按行读取原始文件（utf-8）
+     b. 扫描找到连续3行首个Tab分隔字段为纯时间戳的行
+     c. 该行上一行为表头行（Tab 分隔）
+     d. 从该行开始解析数据行
+     e. 严格按表头列数匹配（跳过列数不匹配的行）
+     f. 构建 DataFrame 并对非时间列尝试 to_numeric
+
+七、核心绘图算法 — _align_and_plot()
+───────────────────────────────────────────────────────────────────────────────
+
+  输入：self._shared_time_col（用户选择的公共时间列名）
+        self._files（所有已加载的文件配置）
+
+  算法步骤：
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Step 1 — 校验公共时间列                                           │
+  │    if not shared → QMessageBox("未选择时间列") → return            │
+  │                                                                     │
+  │  Step 2 — 遍历所有文件，提取对齐序列                                │
+  │    for fc in self._files:                                           │
+  │      ├─ if not fc.data_cols → continue（未选数据列则跳过）           │
+  │      ├─ if shared not in fc.annotated_df.columns → continue         │
+  │      │   （该文件无此列名则跳过 — 可跨不同列名文件）                  │
+  │      ├─ data_df = fc.get_plot_data()                               │
+  │      │   （跳过备注行及以上元数据行，按 row_start/row_end 裁剪）      │
+  │      ├─ time_parsed = pd.to_datetime(data_df[shared], errors=      │
+  │      │   'coerce') → valid = notna()                               │
+  │      ├─ if not valid.any() → continue（时间列全部无法解析则跳过）     │
+  │      └─ for dc in fc.data_cols:                                    │
+  │           ├─ pd.to_numeric(data_df[dc], errors='coerce')           │
+  │           ├─ pd.Series(values, index=time_parsed).dropna()         │
+  │           ├─ .sort_index()                                         │
+  │           └─ 非空则加入 aligned_series + labels                     │
+  │                                                                     │
+  │  Step 3 — 全局时间交集                                              │
+  │    t_start = max(所有序列.index.min())                              │
+  │    t_end   = min(所有序列.index.max())                              │
+  │    if t_start >= t_end → QMessageBox("无重叠时间区间") → return     │
+  │                                                                     │
+  │  Step 4 — 绘制                                                      │
+  │    self.fig.clear() → ax = add_subplot(111)                        │
+  │    for each (series, label):                                        │
+  │      cropped = series.loc[t_start:t_end]   # 裁剪到重叠区间          │
+  │      ax.plot(cropped.index, cropped.values, label=label)            │
+  │                                                                     │
+  │    ax 设置: xlabel='时间', ylabel='数值', title='多源数据对比',      │
+  │    legend(fontsize=8), grid, autofmt_xdate, AutoDateLocator         │
+  │    self.fig.tight_layout() → self.canvas.draw_idle()                │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  图例格式: "{文件名} — {数据列名}"
+
+八、时间列选择机制
+───────────────────────────────────────────────────────────────────────────────
+
+  - 下拉菜单内容由 _get_all_annotated_time_cols() 生成：
+      遍历所有文件的备注行，收集含 '时间戳' 标记的列名，去重后显示
+  - 用户只能选择一个公共时间列（self._shared_time_col）
+  - 所选列必须同时存在于所有需要绘图的文件中（shared not in
+    fc.annotated_df.columns 检查），否则该文件会被跳过
+  - 切换文件时自动恢复已选时间列（若仍存在于新列表）
+  - 移除文件时重置 _shared_time_col = "" 并清空下拉
+
+九、信号连接总表
+───────────────────────────────────────────────────────────────────────────────
+
+  ┌────────────────────────────────┬────────────────────────┬──────────┐
+  │ 信号                           │ 槽                     │ 触发时机 │
+  ├────────────────────────────────┼────────────────────────┼──────────┤
+  │ add_file_btn.clicked           │ _on_add_file           │ 点击+    │
+  │ remove_file_btn.clicked        │ _on_remove_file        │ 点击-    │
+  │ file_list.currentRowChanged    │ _on_file_selected      │ 切换文件 │
+  │ annotation_table.itemChanged   │ _on_annotation_cell_   │ 编辑备注 │
+  │                                │   changed              │          │
+  │ row_start_spin.valueChanged    │ _on_range_changed      │ 调起始行 │
+  │ row_end_spin.valueChanged      │ _on_range_changed      │ 调截止行 │
+  │ time_col_combo.                │ _on_time_col_changed   │ 选时间列 │
+  │   currentTextChanged           │                        │          │
+  │ execute_btn.clicked            │ _align_and_plot        │ 执行对比 │
+  │ fullscreen_btn.clicked         │ _toggle_fullscreen     │ 全屏     │
+  │ back_btn.clicked               │ _reset_chart_view      │ 返回     │
+  │ data_col 复选框.toggled        │ _on_data_col_toggled   │ 勾选数据 │
+  └────────────────────────────────┴────────────────────────┴──────────┘
+
+十、异常处理与安全性
+───────────────────────────────────────────────────────────────────────────────
+
+  ① 文件加载失败 → QMessageBox.warning 提示，继续加载其余文件
+  ② _insert_annotation_row 强制 astype(object)：
+     防止空字符串写入数字列时触发 pandas LossySetitemError
+  ③ _load_file 双解析路径：
+     try_read_csv 失败或单列时自动回退 _parse_enlight_like
+  ④ _parse_enlight_like 容错：
+     - 跳过列数不匹配的行（部分ENLIGHT文件行尾有碎片字段）
+     - 前1000行内找不到3个连续时间戳时返回 None
+  ⑤ _find_first_timestamp_row 限500行扫描
+  ⑥ get_plot_data 空保护：annotated_df 为 None 时返回空 DataFrame
+  ⑦ _row_has_timestamp：
+     - 排除 nan/NaT/空/None
+     - 排除含字母或中文的行（防止元数据行被误判为数据）
+  ⑧ _align_and_plot 多重保护：
+     - shared_time_col 为空 → 警告
+     - 任一文件跳过条件：无 data_cols / 无共享列 / 数据为空 / 时间解析失败
+     - 序列全空或全局无交集 → 警告
+  ⑨ UI 渲染防御：_populate_annotation_table 中 str(df.iloc[df_row, j])
+     包裹 try/except，任一单元格异常不会导致全表崩溃
+  ⑩ 阻断信号机制：批量填充表格/重建复选框时 blockSignals(True)/(False)，
+     防止虚假触发导致数据不一致
+
+十一、全屏功能
+───────────────────────────────────────────────────────────────────────────────
+
+  _toggle_fullscreen():
+    - 创建独立 QDialog（WindowFullScreen）
+    - 新建 Figure + FigureCanvas + NavigationToolbar2QT
+    - 从 self.fig 复制线条数据（xdata, ydata, label, color, linewidth）
+    - 在新 Figure 中重绘（含坐标轴标签、标题、图例、网格）
+    - "关闭全屏" 按钮关闭对话框
+
+十二、与其他模块的关系
+───────────────────────────────────────────────────────────────────────────────
+
+  依赖:
+    - utils/file_parser.py → try_read_csv (格式自动检测)
+    - pandas / numpy / matplotlib
+    - PyQt6 (QtWidgets, QtCore)
+
+  独立:
+    - 本模块完全独立于 main.py 的其他业务逻辑（FBG、清洗、报告等）
+    - 不依赖全局参数管理器、传感器系统、AI 诊断等
+    - 仅通过 main.py 的 tab 注册挂载到主窗口
+
+  备注:
+    - 本模块自带的 _parse_enlight_like 独立于 main.py 的 ENLIGHT 解析逻辑
+    - 暗号标注规则与 main.py 的被动标注系统一致（get_annotated_columns）
+    - 但本模块完全自包含，不调用 main.py 的任何方法

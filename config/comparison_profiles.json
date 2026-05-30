@@ -1,0 +1,50 @@
+{
+  "光纤和应变片对比": {
+    "shared_time_source": {
+      "filepath": "D:/监测数据/2026/05/Sensors.20260519093854_sampled_10pct.txt",
+      "col_name": "Timestamp"
+    },
+    "selected_data_items": [
+      {
+        "filepath": "D:/监测数据/2026/05/Sensors.20260519093854_sampled_10pct.txt",
+        "col_name": "A1G1"
+      },
+      {
+        "filepath": "D:/监测数据/2026/05/Sensors.20260519093854_sampled_10pct.txt",
+        "col_name": "A1G2"
+      },
+      {
+        "filepath": "C:/Program Files (x86)/DHDAS/Exports/自补偿环境加载测试.xlsx",
+        "col_name": "2"
+      },
+      {
+        "filepath": "C:/Program Files (x86)/DHDAS/Exports/自补偿环境加载测试.xlsx",
+        "col_name": "1"
+      }
+    ],
+    "files": [
+      {
+        "path": "D:/监测数据/2026/05/Sensors.20260519093854_sampled_10pct.txt",
+        "row_start": 0,
+        "row_end": 0,
+        "time_offset": 0,
+        "annotations": {
+          "0": "'时间戳'",
+          "1": "‘应变-光纤1’",
+          "2": "‘应变-光纤2’"
+        }
+      },
+      {
+        "path": "C:/Program Files (x86)/DHDAS/Exports/自补偿环境加载测试.xlsx",
+        "row_start": 0,
+        "row_end": 0,
+        "time_offset": 0,
+        "annotations": {
+          "0": "‘时间戳’",
+          "1": "‘应变-应变片1’",
+          "2": "‘应变-应变片2’"
+        }
+      }
+    ]
+  }
+}

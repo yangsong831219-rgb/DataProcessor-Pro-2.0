@@ -54,6 +54,7 @@ from ui.project_tab import ProjectManagerWidget
 from ui.wiki_tab import WikiTabWidget
 from ui.clipper_tab import WebClipperWidget
 from ui.skill_tab import AgentSkillWidget
+from ui.compare_tab import CompareTabWidget
 
 # ============ Report Generation ============
 from core.report_engine import generate_outline, generate_structured_report
@@ -258,10 +259,14 @@ class DataProcessorWindow(QMainWindow):
         self.create_analysis_tab()
         self.central_widget.addTab(self.analysis_tab, '数据分析')
 
+        # Compare tab (多源数据对比)
+        self.compare_tab_widget = CompareTabWidget()
+        self.central_widget.addTab(self.compare_tab_widget, '多源对比')
+
         # Report tab
         self.report_tab = QWidget()
         self.create_report_tab()
-        self.central_widget.addTab(self.report_tab, '信息整合')
+        self.central_widget.addTab(self.report_tab, '成果输出与报告')
 
         # ── Signal bindings ──
         self.data_tab_widget.open_file_requested.connect(self.open_file)
@@ -644,7 +649,7 @@ class DataProcessorWindow(QMainWindow):
         self.analysis_tab.setLayout(layout)
 
     def create_report_tab(self):
-        # 信息整合Tab - 新设计
+        # 成果输出与报告Tab
         main_layout = QHBoxLayout()
 
         # 左侧：功能选项列表
@@ -652,8 +657,8 @@ class DataProcessorWindow(QMainWindow):
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 信息整合标题
-        title_label = QLabel('信息整合')
+        # 成果输出与报告标题
+        title_label = QLabel('成果输出与报告')
         title_label.setStyleSheet('font-size: 16px; font-weight: bold; padding: 5px;')
         left_layout.addWidget(title_label)
 
@@ -1160,7 +1165,7 @@ class DataProcessorWindow(QMainWindow):
     # ============ [skill_tab.py] 技能插件中心已提取 ============
 
     def on_info_menu_changed(self, row):
-        """切换信息整合功能页面"""
+        """切换成果输出功能页面"""
         self.report_content_stack.setCurrentIndex(row)
 
     # ============ 全局配置操作 ============
@@ -2255,13 +2260,16 @@ class DataProcessorWindow(QMainWindow):
         """分析页点击"刷新"时：重新从暗号标注获取分析数据并推送到列选择列表。"""
         analysis_df, _, annotated_cols = self._get_analysis_data()
         if analysis_df is not None and not analysis_df.empty:
-            # 先推 sensor_results（确保物理量路径列表能正确填充）
-            if annotated_cols:
+            # 有 FBG 传感器时保留真实计算结果，不覆盖
+            has_fbg = bool(self.sensor_system.fbgs)
+            if annotated_cols and not has_fbg:
                 self._push_annotation_sensor_results(analysis_df, annotated_cols)
+            elif not has_fbg:
+                self.analysis_tab_widget.set_sensor_results({})
             self.analysis_tab_widget.set_current_data(analysis_df, annotated_cols)
 
     def _push_annotation_sensor_results(self, analysis_df, annotated_cols):
-        """将标注数据列转换为 sensor_results 格式，供物理量路径使用。"""
+        """将标注数据列转换为 sensor_results 格式，供通用数据使用。"""
         sensor_results = {}
         for col in annotated_cols:
             if col in analysis_df.columns and pd.api.types.is_numeric_dtype(analysis_df[col]):
@@ -2278,8 +2286,12 @@ class DataProcessorWindow(QMainWindow):
         # 分析模块接收清洗后的数据（跳过暗号行 + 重命名列）并填充列选择列表
         if hasattr(self, 'analysis_tab_widget'):
             analysis_df, _, annotated_cols = self._get_analysis_data()
-            if annotated_cols:
+            # 有 FBG 传感器时保留真实计算结果，不覆盖（通用数据才推标注列）
+            has_fbg = bool(self.sensor_system.fbgs)
+            if annotated_cols and not has_fbg:
                 self._push_annotation_sensor_results(analysis_df, annotated_cols)
+            elif not has_fbg:
+                self.analysis_tab_widget.set_sensor_results({})
             self.analysis_tab_widget.set_current_data(analysis_df, annotated_cols)
 
     # ══════════════════════════════════════════════════════════
@@ -2292,13 +2304,14 @@ class DataProcessorWindow(QMainWindow):
         规则：
           - 如果数据中已有包含'时间戳'的暗号行 → 不做任何操作
           - 否则 → 在第 0 行插入一行空白备注行
+          - 如果当前使用了有效模板，自动根据模板列定义填充暗号
         """
         try:
             if self.current_data is None or self.current_data.empty:
                 return
             df = self.current_data
-            # 先检查是否已有暗号行（包含'时间戳'的标记行）
-            for idx in range(len(df)):
+            # 先检查是否已有暗号行（扫描前100行，包含'时间戳'的标记行）
+            for idx in range(min(100, len(df))):
                 for val in df.iloc[idx]:
                     s = str(val).strip().strip("'\"'\"'\"")
                     if '时间戳' in s:
@@ -2313,10 +2326,32 @@ class DataProcessorWindow(QMainWindow):
                 [blank_row, df],
                 ignore_index=True,
             )
-            # 恢复原始 dtypes，防止 pd.concat 将纯 nan 列推断为 object
+            # 恢复原始 dtypes（整数列含 NaN → 降级为 float64）
             for col, dtype in self._annotation_orig_dtypes.items():
-                self.current_data[col] = self.current_data[col].astype(dtype)
-            self._annotation_orig_dtypes = self.current_data.dtypes.to_dict()
+                try:
+                    self.current_data[col] = self.current_data[col].astype(dtype)
+                except (ValueError, TypeError):
+                    if 'int' in str(dtype):
+                        self.current_data[col] = self.current_data[col].astype('float64')
+                    # 其他无法恢复的类型保持 pd.concat 自动推断的结果
+
+            # ── 智能模板继承：如果有模板列定义，自动填充暗号行 ──
+            template = getattr(self, 'current_template', None)
+            if template and hasattr(template, 'columns') and template.columns:
+                for col_idx, tc in enumerate(template.columns):
+                    if col_idx >= len(self.current_data.columns):
+                        break
+                    data_type = tc.get('data_type', '').strip().lower()
+                    if data_type == 'time':
+                        col_name = self.current_data.columns[col_idx]
+                        self.current_data[col_name] = self.current_data[col_name].astype(object)
+                        self.current_data.iloc[0, col_idx] = "'时间戳'"
+                    elif data_type and data_type != 'none':
+                        ann_text = tc.get('comment', '').strip() or tc.get('name', '').strip()
+                        if ann_text:
+                            col_name = self.current_data.columns[col_idx]
+                            self.current_data[col_name] = self.current_data[col_name].astype(object)
+                            self.current_data.iloc[0, col_idx] = f"'{ann_text}'"
         except Exception as e:
             print(f'[暗号行插入失败] {e}')
 
@@ -2411,7 +2446,7 @@ class DataProcessorWindow(QMainWindow):
         time_col_idx, data_cols, signal_row_idx = self.get_annotated_columns()
 
         if signal_row_idx is None or self.current_data is None:
-            return self.current_data, '时间'
+            return self.current_data, '时间', []
 
         df = self.current_data
         # 跳过暗号行及之前的所有行
@@ -2454,7 +2489,8 @@ class DataProcessorWindow(QMainWindow):
             data_df = data_df.rename(columns=rename_map)
 
         # 返回有暗号标注的列名集合，用于分析页筛选列选择列表
-        annotated_cols = set(data_cols.values()) if data_cols else set()
+        # 使用 list 保持列在数据文件中的先后顺序
+        annotated_cols = list(data_cols.values()) if data_cols else []
 
         return data_df, time_col_name, annotated_cols
 
@@ -2542,8 +2578,8 @@ class DataProcessorWindow(QMainWindow):
 
     def export_report(self):
         """导出报告 - 跳转到信息整合页面"""
-        self.central_widget.setCurrentIndex(4)  # Switch to report tab
-        QMessageBox.information(self, '提示', '请在信息整合页面选择相应功能生成报告')
+        self.central_widget.setCurrentIndex(5)  # Switch to report tab
+        QMessageBox.information(self, '提示', '请在成果输出与报告页面选择相应功能生成报告')
 
 # ============ Dialogs ============
 
