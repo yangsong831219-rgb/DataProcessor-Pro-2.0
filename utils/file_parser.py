@@ -222,11 +222,11 @@ def parse_file(file_path: str, template: Any) -> pd.DataFrame:
         col_names += [f'波长{i}' for i in range(1, wave_count + 1)]
         df.columns = col_names[:n_cols]
 
+        # 显式跳过时间列，对数值列用 errors='coerce' 确保转换
         for col in df.columns:
-            try:
-                df[col] = pd.to_numeric(df[col])
-            except (ValueError, TypeError):
-                pass
+            if col == '时间':
+                continue
+            df[col] = pd.to_numeric(df[col], errors='coerce')
         df.columns = df.columns.astype(str)
         return df
 

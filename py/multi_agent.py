@@ -25,9 +25,143 @@ from py.analyzer import apply_filter
 from py.formula import calculate
 
 
-# ============ 角色系统提示词 ============
+# ============ JSON 输出 Schema（首席专家报告） ============
 
-DATA_SCIENTIST_PROMPT = """你是一名资深 Python 数据科学家，专门从事传感器数据分析。
+CHIEF_REPORT_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "diagnosis_summary": {
+            "type": "object",
+            "properties": {
+                "data_type": {"type": "string", "enum": ["fiber_optic", "general"]},
+                "template_name": {"type": "string"},
+                "data_quality": {"type": "string", "enum": ["good", "fair", "poor"]},
+                "anomaly_count": {"type": "integer"},
+                "overall_assessment": {"type": "string"},
+            }
+        },
+        "data_quality_assessment": {
+            "type": "object",
+            "properties": {
+                "completeness": {"type": "string"},
+                "consistency": {"type": "string"},
+                "anomaly_patterns": {"type": "array", "items": {"type": "string"}},
+                "recommendations": {"type": "array", "items": {"type": "string"}}
+            }
+        },
+        "sensor_analysis": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "sensor_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["normal", "warning", "critical"]},
+                    "statistics": {
+                        "type": "object",
+                        "properties": {
+                            "mean": {"type": "number"},
+                            "std": {"type": "number"},
+                            "min": {"type": "number"},
+                            "max": {"type": "number"}
+                        }
+                    },
+                    "findings": {"type": "string"},
+                    "suggestions": {"type": "string"}
+                }
+            }
+        },
+        "physical_diagnosis": {
+            "type": "object",
+            "properties": {
+                "phenomenon": {"type": "string"},
+                "possible_causes": {"type": "array", "items": {"type": "string"}},
+                "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+                "recommended_actions": {"type": "array", "items": {"type": "string"}}
+            }
+        }
+    }
+}
+
+_JSON_SCHEMA_STR = __import__('json').dumps(CHIEF_REPORT_JSON_SCHEMA, ensure_ascii=False, indent=2)
+
+
+# ============ 数据上下文构建器 ============
+
+def build_context_block(data_context: dict | None = None) -> str:
+    """将数据上下文 dict 序列化为自然语言上下文块，注入 Agent 系统提示词。
+
+    Args:
+        data_context: 来自 ui/ai_diagnosis.py _build_data_context() 的输出
+
+    Returns:
+        格式化的上下文文本（含数据类型防火墙、清洗统计、模板信息）
+    """
+    if not data_context:
+        return ""
+
+    data_type = data_context.get("data_type", "unknown")
+    is_fiber = data_type == "fiber_optic"
+    template_name = data_context.get("template_name", "(无模板)")
+    cleaning = data_context.get("cleaning_summary", "(未清洗)")
+    rows = data_context.get("data_rows", 0)
+    cols = data_context.get("data_columns", 0)
+
+    type_label = "光纤光栅传感器数据（基于波长差 W1~W8 进行物理量转换）" if is_fiber else "通用数据（外部已算好，直接读取标注列）"
+
+    lines = [
+        "=== 当前数据上下文（自动注入） ===",
+        f"模板: {template_name}",
+        f"数据类型: {type_label}",
+        f"数据规模: {rows} 行 × {cols} 列",
+    ]
+
+    if is_fiber:
+        lines.extend([
+            "数据类型防火墙规则:",
+            "  - 基于波长差计算物理量，关注 FBG 波长漂移趋势",
+            "  - 判断滤波截止频率是否合理（避免波形畸变）",
+            "  - 检查基线回零是否准确",
+        ])
+    else:
+        lines.extend([
+            "数据类型防火墙规则:",
+            "  - 不进行波长差到物理量的转换计算",
+            "  - 从暗号标注列（annotated_columns）直接读取物理量含义",
+            "  - 关注数据完整性、一致性、异常模式",
+        ])
+
+    lines.append(f"清洗概况: {cleaning}")
+
+    stats = data_context.get("numeric_stats", [])
+    if stats:
+        lines.append("数值列统计:")
+        for s in stats:
+            lines.append(
+                f"  {s['col']}: 有效={s['count']}, 缺失={s['missing']}, "
+                f"均值={s['mean']}, 标准差={s['std']}, 范围=[{s['min']}, {s['max']}]"
+            )
+
+    sensors = data_context.get("sensor_results_summary", [])
+    if sensors:
+        lines.append("传感器结果:")
+        for s in sensors:
+            lines.append(
+                f"  {s['id']}: 有效={s['valid_count']}/{s['total_count']}, "
+                f"均值={s['mean']}, 范围=[{s['min']}, {s['max']}]"
+            )
+
+    annotated = data_context.get("annotated_columns", [])
+    if annotated:
+        lines.append(f"暗号标注列: {annotated}")
+
+    return '\n'.join(lines)
+
+
+# ============ 角色系统提示词（含上下文注入点） ============
+
+DATA_SCIENTIST_PROMPT_TPL = """你是一名资深 Python 数据科学家，专门从事传感器数据分析。
+
+{data_context}
 
 你的职责：
 1. 读取 CSV 数据文件，进行降噪和特征提取
@@ -47,10 +181,17 @@ DATA_SCIENTIST_PROMPT = """你是一名资深 Python 数据科学家，专门从
 3. 提取波形特征
 4. 生成技术备忘录（包含处理步骤和清洗前后特征比对）
 
-你的输出应该是专业的数据分析报告。"""
+你的输出应该是专业的数据分析报告。
+
+注意：请根据上方"数据类型"选择正确的处理路径：
+- 光纤数据 → 基于波长差计算，关注 FBG 漂移
+- 通用数据 → 直接从标注列读取，不做波长转换
+"""
 
 
-DATA_AUDITOR_PROMPT = """你是一名严格的实验数据质量控制官（QC），专门审查数据分析结果的合理性。
+DATA_AUDITOR_PROMPT_TPL = """你是一名严格的实验数据质量控制官（QC），专门审查数据分析结果的合理性。
+
+{data_context}
 
 你的职责：
 1. 审查数据科学家处理后的数据是否合理
@@ -66,6 +207,10 @@ DATA_AUDITOR_PROMPT = """你是一名严格的实验数据质量控制官（QC�
 - 数据特征提取是否完整
 - 计算公式是否正确
 
+根据数据类型采用不同的审查重点：
+- 光纤数据：重点审查波长漂移趋势、应变/温度耦合、滤波参数
+- 通用数据：重点审查标注列一致性、缺失值处理、异常分布
+
 你的输出格式：
 - 通过：[简短说明] → 进入下一阶段
 - 驳回：[具体问题描述 + 修改建议]
@@ -73,7 +218,9 @@ DATA_AUDITOR_PROMPT = """你是一名严格的实验数据质量控制官（QC�
 如果发现问题，必须给出具体的驳回理由和修改建议。"""
 
 
-CHIEF_SCIENTIST_PROMPT = """你是光纤光栅传感器研发总负责人，拥有深厚的材料力学背景。
+CHIEF_SCIENTIST_PROMPT_TPL = """你是光纤光栅传感器研发总负责人，拥有深厚的材料力学背景。
+
+{data_context}
 
 你的职责：
 1. 结合本地知识库，将数字转化为物理诊断结论
@@ -90,11 +237,18 @@ CHIEF_SCIENTIST_PROMPT = """你是光纤光栅传感器研发总负责人，拥�
 工作流程：
 1. 读取数据科学家的分析结果和审查员的审查意见
 2. 读取相关知识库内容（如 NOA81 封装工艺）
-3. 进行物理层面的深度诊断
-4. 生成最终 Word 诊断报告
+3. 根据数据类型选择诊断路径：
+   - 光纤数据 → 分析波长漂移、应变/温度耦合、界面滑移
+   - 通用数据 → 分析数据完整性、趋势变化、异常成因
+4. 生成最终诊断报告（严格 JSON 格式）
 5. 将新发现更新到知识库
 
-你的输出应该是专业的物理诊断报告和知识沉淀。"""
+=== 输出要求 ===
+你必须严格以 JSON 格式输出最终诊断报告，遵循以下 schema（输出纯 JSON，不要 markdown 包裹，不要多余文字）：
+
+{json_schema}
+
+注意：全部用中文输出。"""
 
 
 # ============ 工具定义 ============
@@ -215,13 +369,28 @@ def create_llm(api_key: str, base_url: str, model_name: str) -> BaseChatModel:
     )
 
 
-# ============ 节点工厂 ============
+# ============ 节点工厂（上下文感知版） ============
 
-def _make_nodes(llm: BaseChatModel):
-    """创建节点函数，捕获共享的 LLM 实例"""
+def _make_nodes(llm: BaseChatModel, data_context: dict | None = None):
+    """创建节点函数，捕获共享的 LLM 实例。
+
+    Args:
+        llm: 大语言模型实例
+        data_context: 来自 ui/ai_diagnosis.py _build_data_context() 的结构化上下文，
+                      用于动态注入数据类型防火墙规则、清洗统计、模板信息。
+    """
+    ctx_block = build_context_block(data_context)
+
+    # 预格式化各角色的系统提示词，注入上下文块
+    ds_prompt = DATA_SCIENTIST_PROMPT_TPL.format(data_context=ctx_block)
+    auditor_prompt = DATA_AUDITOR_PROMPT_TPL.format(data_context=ctx_block)
+    chief_prompt = CHIEF_SCIENTIST_PROMPT_TPL.format(
+        data_context=ctx_block,
+        json_schema=_JSON_SCHEMA_STR,
+    )
 
     def data_scientist_node(state: MultiAgentState) -> MultiAgentState:
-        system_msg = SystemMessage(content=DATA_SCIENTIST_PROMPT)
+        system_msg = SystemMessage(content=ds_prompt)
         messages = [system_msg] + state["messages"]
         response = llm.invoke(messages)
         return {
@@ -231,18 +400,19 @@ def _make_nodes(llm: BaseChatModel):
         }
 
     def auditor_node(state: MultiAgentState) -> MultiAgentState:
-        audit_prompt = f"""请审查以下数据科学家的工作成果：
+        audit_user_prompt = f"""请审查以下数据科学家的工作成果：
 
 {state.get('data_scientist_report', '无报告')}
 
-审查标准：
-1. 滤波截止频率是否合理
-2. 数据处理是否符合物理规律
-3. 是否有异常遗漏
+请：
+1. 结合上方数据上下文判断处理路径是否正确（光纤 vs 通用）
+2. 检查滤波截止频率是否合理
+3. 检查数据处理是否符合物理规律
+4. 检查是否有异常遗漏
 
 请给出审查结果（通过/驳回）及理由。"""
 
-        messages = [SystemMessage(content=DATA_AUDITOR_PROMPT), HumanMessage(content=audit_prompt)]
+        messages = [SystemMessage(content=auditor_prompt), HumanMessage(content=audit_user_prompt)]
         response = llm.invoke(messages)
 
         content = response.content.lower()
@@ -256,7 +426,7 @@ def _make_nodes(llm: BaseChatModel):
         }
 
     def chief_scientist_node(state: MultiAgentState) -> MultiAgentState:
-        diagnosis_prompt = f"""基于以下材料，进行深度物理诊断并生成最终报告：
+        diagnosis_prompt = f"""基于以下材料，进行深度物理诊断并生成严格 JSON 格式的最终报告：
 
 数据科学家报告：
 {state.get('data_scientist_report', '无')}
@@ -267,11 +437,11 @@ def _make_nodes(llm: BaseChatModel):
 请：
 1. 结合知识库进行物理诊断
 2. 分析材料力学行为
-3. 生成最终诊断报告
-4. 将新发现写入知识库
+3. 根据数据类型选择诊断路径（光纤 → 波长/应变/温度；通用 → 趋势/异常/完整性）
+4. 严格按照上方系统提示词中的 JSON schema 输出报告
 """
 
-        messages = [SystemMessage(content=CHIEF_SCIENTIST_PROMPT), HumanMessage(content=diagnosis_prompt)]
+        messages = [SystemMessage(content=chief_prompt), HumanMessage(content=diagnosis_prompt)]
         response = llm.invoke(messages)
 
         return {
@@ -315,9 +485,14 @@ def should_continue_workflow(state: MultiAgentState) -> str:
 
 # ============ 创建工作流图 ============
 
-def create_multi_agent_graph(llm: BaseChatModel):
-    """创建多智能体工作流"""
-    ds_node, aud_node, chief_node = _make_nodes(llm)
+def create_multi_agent_graph(llm: BaseChatModel, data_context: dict | None = None):
+    """创建多智能体工作流
+
+    Args:
+        llm: 大语言模型实例
+        data_context: 可选的结构化数据上下文（模板、清洗统计、数据类型等）
+    """
+    ds_node, aud_node, chief_node = _make_nodes(llm, data_context)
 
     workflow = StateGraph(MultiAgentState)
 
@@ -352,6 +527,7 @@ def run_multi_agent(
     base_url: str = "",
     model_name: str = "deepseek-chat",
     csv_path: str = None,
+    data_context: dict | None = None,
 ) -> dict:
     """
     运行多智能体审查系统
@@ -362,12 +538,14 @@ def run_multi_agent(
         base_url: API 地址
         model_name: 模型名称
         csv_path: 可选的 CSV 数据路径
+        data_context: 结构化数据上下文 dict（来自 ui/ai_diagnosis.py _build_data_context()），
+                      自动注入所有 Agent 系统提示词，含数据类型防火墙、模板信息、清洗统计
 
     Returns:
         dict: 包含各阶段报告和最终诊断结果
     """
     llm = create_llm(api_key, base_url, model_name)
-    graph = create_multi_agent_graph(llm)
+    graph = create_multi_agent_graph(llm, data_context)
 
     initial_state = MultiAgentState(
         messages=[HumanMessage(content=user_input)],

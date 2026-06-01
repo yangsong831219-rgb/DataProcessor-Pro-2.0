@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "last_updated": "2026-05-28",
+  "last_updated": "2026-05-30",
   "index": {
     "Hermes+Obsidian+LLM Wiki搭建本地知识库": {
       "path": "pages/Hermes+Obsidian+LLM Wiki搭建本地知识库.md",
@@ -18,6 +18,13 @@
         "web_clip"
       ],
       "summary": "剪藏自: 如何利用大模型搭建本地知识库？ - 知乎"
+    },
+    "花一小时搭好 Claude Code Harness，AI 写代码质量立竿见影": {
+      "path": "pages/花一小时搭好 Claude Code Harness，AI 写代码质量立竿见影.md",
+      "tags": [
+        "web_clip"
+      ],
+      "summary": "剪藏自: 花一小时搭好 Claude Code Harness，AI 写代码质量立竿见影"
     }
   }
 }

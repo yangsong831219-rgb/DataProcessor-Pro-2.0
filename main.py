@@ -219,18 +219,8 @@ class DataProcessorWindow(QMainWindow):
         self.sensor_system.add_fbg(FBG('W7', '波长7', 1520, 1590))
         self.sensor_system.add_fbg(FBG('W8', '波长8', 1520, 1590))
 
-        # 添加默认传感器
-        # 公式: "W1 * k1" 表示 波长差值乘以系数k1
-        self.sensor_system.add_sensor(Sensor(
-            '应变1', 'strain',
-            'W1 * k1',
-            {'k1': 1000.0}
-        ))
-        self.sensor_system.add_sensor(Sensor(
-            '温度1', 'temperature',
-            'W1 * k2',
-            {'k2': 1e-6}
-        ))
+        # 传感器列表初始为空，由用户通过 UI 添加
+        # （旧默认传感器 '应变1'/'温度1' 已移除，避免干扰用户配置）
 
     def init_ui(self):
         self.setWindowTitle('DataProcessor Pro - 数据分析软件')
@@ -394,14 +384,26 @@ class DataProcessorWindow(QMainWindow):
             self.sensor_tab_widget.set_fbg_list(self.sensor_system.fbgs)
 
     def _auto_populate_fbgs(self, df):
-        """从数据文件列名自动识别FBG传感器并填充FBG定义表。"""
+        """从数据文件列名自动识别FBG传感器并填充FBG定义表。
+
+        优先使用正则 r'^[wW]\d+' 捕获新版暗号列名，
+        回退到 '波长'/'FBG_' 传统列名（过渡兼容）。
+        """
         if df is None or df.empty:
             return 0
 
-        fbg_cols = [str(c) for c in df.columns if str(c).upper().startswith('FBG_')]
+        import re
+        W_PATTERN = re.compile(r'^[wW](\d+)(?:-.*)?$')
+        w_matches = sorted(
+            [(int(m.group(1)), c) for c in df.columns for m in [W_PATTERN.match(str(c))] if m],
+            key=lambda x: x[0]
+        )
+        fbg_cols = [c[1] for c in w_matches]
+
         if not fbg_cols:
-            fbg_cols = [str(c) for c in df.columns
-                       if '波长' in str(c) or 'wavelength' in str(c).lower()]
+            fbg_cols = [str(c) for c in df.columns if '波长' in str(c) or 'wavelength' in str(c).lower()]
+        if not fbg_cols:
+            fbg_cols = [str(c) for c in df.columns if str(c).upper().startswith('FBG_')]
         if not fbg_cols:
             w_digit_cols = [str(c) for c in df.columns
                            if str(c).upper().startswith('W') and str(c)[1:].isdigit()]
@@ -415,7 +417,7 @@ class DataProcessorWindow(QMainWindow):
             self.sensor_system.add_fbg(FBG(f'W{i+1}', col, 1520, 1590))
 
         self.sensor_tab_widget.set_fbg_list(self.sensor_system.fbgs)
-        print(f"[FBG自动识别] 从数据文件识别到 {len(fbg_cols)} 个FBG: {fbg_cols}")
+        print(f"[FBG] 注册 {len(fbg_cols)} 个: {[(f.id, f.channel) for f in self.sensor_system.fbgs]}")
         return len(fbg_cols)
 
     def add_sensor(self):
@@ -547,6 +549,7 @@ class DataProcessorWindow(QMainWindow):
 
             # 使用跳过暗号行后的清洗数据
             analysis_df, _, _ = self._get_analysis_data()
+
             if analysis_df is None or analysis_df.empty:
                 QMessageBox.warning(self, '警告', '有效数据为空')
                 return
@@ -2307,56 +2310,82 @@ class DataProcessorWindow(QMainWindow):
         """数据加载后在首行插入空白备注行，供用户填写暗号。
 
         规则：
-          - 如果数据中已有包含'时间戳'的暗号行 → 不做任何操作
-          - 否则 → 在第 0 行插入一行空白备注行
-          - 如果当前使用了有效模板，自动根据模板列定义填充暗号
+          - 如果数据中已有包含'时间戳'的暗号行 → 不再插入空白行
+          - 否则 → 在第 0 行插入一行空白备注行并填充模板暗号
+          - 光纤模板额外执行内容探针法：强制扫描第一行真实数据，
+            将以 '15' 开头的值判定为波长列，用 'wN-类型-位置' 覆盖暗号行
         """
         try:
             if self.current_data is None or self.current_data.empty:
                 return
             df = self.current_data
-            # 先检查是否已有暗号行（扫描前100行，包含'时间戳'的标记行）
+
+            # ── 1. 检测是否已有暗号行 ──
+            existing_signal_row = None
             for idx in range(min(100, len(df))):
                 for val in df.iloc[idx]:
                     s = str(val).strip().strip("'\"'\"'\"")
                     if '时间戳' in s:
-                        # 已有暗号行，不再重复插入
-                        return
-            # 没有暗号行 → 在第 0 行插入空白行
-            # 用 np.nan 而非 '' 防止 numeric 列被污染为 object dtype
-            self._annotation_orig_dtypes = df.dtypes.to_dict()
-            blank_vals = [np.nan] * len(df.columns)
-            blank_row = pd.DataFrame([blank_vals], columns=df.columns)
-            self.current_data = pd.concat(
-                [blank_row, df],
-                ignore_index=True,
-            )
-            # 恢复原始 dtypes（整数列含 NaN → 降级为 float64）
-            for col, dtype in self._annotation_orig_dtypes.items():
-                try:
-                    self.current_data[col] = self.current_data[col].astype(dtype)
-                except (ValueError, TypeError):
-                    if 'int' in str(dtype):
-                        self.current_data[col] = self.current_data[col].astype('float64')
-                    # 其他无法恢复的类型保持 pd.concat 自动推断的结果
-
-            # ── 智能模板继承：如果有模板列定义，自动填充暗号行 ──
-            template = getattr(self, 'current_template', None)
-            if template and hasattr(template, 'columns') and template.columns:
-                for col_idx, tc in enumerate(template.columns):
-                    if col_idx >= len(self.current_data.columns):
+                        existing_signal_row = idx
                         break
-                    data_type = tc.get('data_type', '').strip().lower()
-                    if data_type == 'time':
-                        col_name = self.current_data.columns[col_idx]
-                        self.current_data[col_name] = self.current_data[col_name].astype(object)
-                        self.current_data.iloc[0, col_idx] = "'时间戳'"
-                    elif data_type and data_type != 'none':
-                        ann_text = tc.get('comment', '').strip() or tc.get('name', '').strip()
-                        if ann_text:
+                if existing_signal_row is not None:
+                    break
+
+            # ── 2. 无暗号行 → 插入空白行 + 模板填充 ──
+            template = getattr(self, 'current_template', None)
+            if existing_signal_row is None:
+                self._annotation_orig_dtypes = df.dtypes.to_dict()
+                blank_vals = [np.nan] * len(df.columns)
+                blank_row = pd.DataFrame([blank_vals], columns=df.columns)
+                self.current_data = pd.concat([blank_row, df], ignore_index=True)
+                for col, dtype in self._annotation_orig_dtypes.items():
+                    try:
+                        self.current_data[col] = self.current_data[col].astype(dtype)
+                    except (ValueError, TypeError):
+                        if 'int' in str(dtype):
+                            self.current_data[col] = self.current_data[col].astype('float64')
+
+                # 模板列定义填充暗号
+                if template and hasattr(template, 'columns') and template.columns:
+                    for col_idx, tc in enumerate(template.columns):
+                        if col_idx >= len(self.current_data.columns):
+                            break
+                        data_type = tc.get('data_type', '').strip().lower()
+                        if data_type == 'time':
                             col_name = self.current_data.columns[col_idx]
                             self.current_data[col_name] = self.current_data[col_name].astype(object)
-                            self.current_data.iloc[0, col_idx] = f"'{ann_text}'"
+                            self.current_data.iloc[0, col_idx] = "'时间戳'"
+                        elif data_type and data_type != 'none':
+                            ann_text = tc.get('comment', '').strip() or tc.get('name', '').strip()
+                            if ann_text:
+                                col_name = self.current_data.columns[col_idx]
+                                self.current_data[col_name] = self.current_data[col_name].astype(object)
+                                self.current_data.iloc[0, col_idx] = f"'{ann_text}'"
+                annotation_row = 0
+            else:
+                annotation_row = existing_signal_row
+
+            # ── 3. 光纤专属：内容探针法（强制扫描 / 覆盖，无论暗号行来源） ──
+            if template and getattr(template, 'file_format', '') in ('enlight', 'fiber_custom'):
+                data_row = annotation_row + 1
+                if data_row < len(self.current_data):
+                    w_counter = 0
+                    # 模板已填充的列索引列表（时间 / CH计数等不覆盖）
+                    tmpl_filled = {i for i in range(len(template.columns))} if template.columns else set()
+                    for col_idx in range(len(self.current_data.columns)):
+                        if col_idx in tmpl_filled:
+                            continue
+                        cell_val = self.current_data.iloc[data_row, col_idx]
+                        try:
+                            fv = float(str(cell_val).strip())
+                            if not pd.isna(fv) and str(cell_val).strip().startswith('15'):
+                                w_counter += 1
+                                col_name = self.current_data.columns[col_idx]
+                                self.current_data[col_name] = self.current_data[col_name].astype(object)
+                                # 强制覆盖暗号行对应单元格
+                                self.current_data.iloc[annotation_row, col_idx] = f"'w{w_counter}-类型-位置'"
+                        except (ValueError, TypeError):
+                            pass
         except Exception as e:
             print(f'[暗号行插入失败] {e}')
 
@@ -2465,9 +2494,9 @@ class DataProcessorWindow(QMainWindow):
         data_df.reset_index(drop=True, inplace=True)
 
         # 恢复数值列 dtype：注解行（插入或文件自带）可能已将列污染为 object
-        # 对每个 object 列尝试 to_numeric，若 80%+ 非空值可转换则保留
+        # 对每个非数值列尝试 to_numeric，若 80%+ 非空值可转换则保留
         for col in data_df.columns:
-            if data_df[col].dtype == object:
+            if not pd.api.types.is_numeric_dtype(data_df[col]):
                 converted = pd.to_numeric(data_df[col], errors='coerce')
                 before = data_df[col].notna().sum()
                 after = converted.notna().sum()
@@ -2482,7 +2511,7 @@ class DataProcessorWindow(QMainWindow):
             if time_col_name not in data_df.columns and len(data_df.columns) > 0:
                 time_col_name = str(data_df.columns[0])
 
-        # 重命名数据列（如果用户给了自定义名称）
+        # 重命名数据列（暗号标注名 → DataFrame 列名）
         rename_map = {}
         if data_cols:
             for col_idx, custom_name in data_cols.items():
@@ -2500,7 +2529,6 @@ class DataProcessorWindow(QMainWindow):
             data_df = data_df.rename(columns=rename_map)
 
         # 返回有暗号标注的列名集合，用于分析页筛选列选择列表
-        # 使用 list 保持列在数据文件中的先后顺序
         annotated_cols = list(data_cols.values()) if data_cols else []
 
         # 卸妆：剥离所有列名中英文括号及单位后缀

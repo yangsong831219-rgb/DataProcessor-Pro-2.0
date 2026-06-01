@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import re as _re
 import numpy as np
 import pandas as pd
+from core.models import Sensor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QPushButton, QLabel, QComboBox, QSpinBox, QListWidget, QListWidgetItem,
@@ -312,6 +313,43 @@ class AnalysisTabWidget(QWidget):
                     return sensor.get_name()
         return sensor_id
 
+    def _to_display_name(self, key: str) -> str:
+        """将传感器 ID 或列名转为与图例一致的下拉框显示名。
+
+        优先通过 _get_annotation_name 查找暗号备注名（w1-应变-梁底），
+        然后剥离 w{N}- 前缀得到纯净显示名（应变-梁底）。
+        """
+        ann = self._get_annotation_name(key)
+        return _re.sub(r'^[wW]\d+-', '', ann if ann != key else str(key))
+
+    def _get_annotation_name(self, sensor_id: str) -> str:
+        """从数据列中查找传感器 ID 对应的暗号备注名（如 w1-应变-梁底）。
+
+        遍历传感器公式中的 W{n} 引用，在 DataFrame 列中匹配 W_PATTERN。
+        回退：当找不到匹配时返回 sensor_id 本身。
+        """
+        if self._current_data is None:
+            return sensor_id
+        ss = self._sensor_system
+        if not ss:
+            return sensor_id
+        sensor = None
+        for s in ss.sensors:
+            if s.id == sensor_id:
+                sensor = s
+                break
+        if not sensor or not sensor.formula:
+            return sensor_id
+        w_nums = _re.findall(r'\b[Ww](\d+)\b', sensor.formula)
+        if not w_nums:
+            return sensor_id
+        for w in w_nums:
+            pat = _re.compile(r'^[wW]' + w + r'(?:-.*)?$')
+            for col in self._current_data.columns:
+                if pat.match(str(col)):
+                    return str(col)
+        return sensor_id
+
     # ── 图表绘制 ──
 
     @staticmethod
@@ -344,15 +382,16 @@ class AnalysisTabWidget(QWidget):
                 plot_time = [plot_time[i] for i in indices]
 
         if plot_time and len(plot_time) == len(plot_data):
-            self.ax.plot(plot_time, plot_data, 'b-', linewidth=1)
+            x_indices = range(len(plot_time))
+            self.ax.plot(x_indices, plot_data, 'b-', linewidth=1)
             self.ax.set_xlabel('时间')
-            if len(plot_time) > 10:
-                tick_indices = np.linspace(0, len(plot_time) - 1, 10, dtype=int)
-                self.ax.set_xticks([plot_time[i] for i in tick_indices])
-                self.ax.set_xticklabels([self._format_time(plot_time[i]) for i in tick_indices],
-                                        rotation=45, ha='right')
-            if plot_time:
-                self.ax.set_xlim([plot_time[0], plot_time[-1]])
+            if len(x_indices) >= 10:
+                tick_locs = np.linspace(0, len(x_indices) - 1, 10, dtype=int)
+            else:
+                tick_locs = list(x_indices)
+            self.ax.set_xticks(tick_locs)
+            self.ax.set_xticklabels([self._format_time(plot_time[i]) for i in tick_locs],
+                                    rotation=45, ha='right')
         else:
             self.ax.plot(plot_data, 'b-', linewidth=1)
             self.ax.set_xlabel('序号')
@@ -399,12 +438,6 @@ class AnalysisTabWidget(QWidget):
         else:
             time_range = list(range(start_idx, end_idx + 1))
 
-        if len(time_range) > 10:
-            tick_indices = np.linspace(0, len(time_range) - 1, 10, dtype=int)
-            tick_labels = [self._format_time(time_range[i]) for i in tick_indices]
-        else:
-            tick_labels = None
-
         colors = ['b-', 'g-', 'r-', 'c-', 'm-', 'y-', 'k-', 'orange']
         for i, col in enumerate(data_cols):
             actual_key = self.get_best_match_column(col, plot_df)
@@ -423,17 +456,20 @@ class AnalysisTabWidget(QWidget):
                 plot_time = time_range
 
             color = colors[i % len(colors)]
-            self.ax.plot(plot_time, plot_data_sampled, color, linewidth=1,
-                         label=col)
-
-        if time_range:
-            self.ax.set_xlim([time_range[0], time_range[-1]])
+            legend_label = _re.sub(r'^[wW]\d+-', '', col)
+            x_indices = range(len(plot_time))
+            self.ax.plot(x_indices, plot_data_sampled, color, linewidth=1,
+                         label=legend_label)
 
         self.ax.set_xlabel('时间')
-        if tick_labels:
-            tick_positions = [time_range[i] for i in tick_indices]
-            self.ax.set_xticks(tick_positions)
-            self.ax.set_xticklabels(tick_labels, rotation=45, ha='right')
+        if plot_time:
+            if len(plot_time) >= 10:
+                tick_locs = np.linspace(0, len(plot_time) - 1, 10, dtype=int)
+            else:
+                tick_locs = list(range(len(plot_time)))
+            self.ax.set_xticks(tick_locs)
+            self.ax.set_xticklabels([self._format_time(plot_time[i]) for i in tick_locs],
+                                    rotation=45, ha='right')
 
         # Y轴标记和图表名称
         if self._is_fiber_data and self.data_source_combo.currentText() == '原始数据':
@@ -441,17 +477,13 @@ class AnalysisTabWidget(QWidget):
             self.ax.set_ylabel('波长差（nm）')
             self.ax.set_title('波长差时程曲线图')
         else:
-            # 非光纤数据 或 光纤物理量模式：用原始列名做关键词匹配
+            # 非光纤数据 或 光纤物理量模式：从 Sensor.TYPE_PARAMS 获取干净单位
             col_alias = data_cols[0] if data_cols else ''
-            unit_map = AnalysisTabWidget._UNIT_MAP
-            core_name = str(col_alias).split('-')[0].strip()
-            unit = ''
-            for key, val in unit_map.items():
-                if key in str(col_alias):
-                    core_name = key
-                    unit = val
-                    break
-            self.ax.set_ylabel(f'{core_name}{unit}')
+            name_to_clean_unit = {p['name']: p['unit'] for p in Sensor.TYPE_PARAMS.values()}
+            core_name = self._extract_core_name(str(col_alias))
+            clean_unit = name_to_clean_unit.get(core_name, '')
+            y_label = f'{core_name} ({clean_unit})' if clean_unit else core_name
+            self.ax.set_ylabel(y_label)
             self.ax.set_title(f'{core_name}时程曲线')
         self.ax.grid(True, alpha=0.3)
         self.ax.legend(loc='upper right', fontsize=8)
@@ -464,6 +496,7 @@ class AnalysisTabWidget(QWidget):
         colors = ['b-', 'g-', 'r-', 'c-', 'm-', 'y-', 'k-', 'orange']
         sensor_results = self._get_sensor_results()
 
+        plot_time = []  # 后续 for 循环中赋值，用于 x 轴刻度
         for i, sensor_id in enumerate(sensor_ids):
             if sensor_id not in sensor_results:
                 print(f"[analysis_tab] 找不到传感器: '{sensor_id}', 当前可用: {list(sensor_results.keys())}")
@@ -483,32 +516,27 @@ class AnalysisTabWidget(QWidget):
                 plot_time = time_range if time_range else list(range(len(data_range)))
 
             color = colors[i % len(colors)]
-            self.ax.plot(plot_time, plot_data, color, linewidth=1, label=sensor_id)
+            # 图例：通过公式中的 W 引用查找真实暗号备注名，剥离 w{N}- 前缀
+            annotation_name = self._get_annotation_name(sensor_id)
+            legend_label = _re.sub(r'^[wW]\d+-', '', annotation_name)
+            x_indices = range(len(plot_time))
+            self.ax.plot(x_indices, plot_data, color, linewidth=1, label=legend_label)
 
-        if time_range:
-            self.ax.set_xlim([time_range[0], time_range[-1]])
-            if len(time_range) > 10:
-                tick_indices = np.linspace(0, len(time_range) - 1, 10, dtype=int)
-                tick_positions = [time_range[j] for j in tick_indices]
-                tick_labels = [self._format_time(time_range[j]) for j in tick_indices]
-                self.ax.set_xticks(tick_positions)
-                self.ax.set_xticklabels(tick_labels, rotation=45, ha='right')
-            elif len(time_range) > 0:
-                tick_labels = [self._format_time(t) for t in time_range]
-                self.ax.set_xticks(range(len(time_range)))
-                self.ax.set_xticklabels(tick_labels, rotation=45, ha='right')
+        if plot_time:
+            if len(plot_time) >= 10:
+                tick_locs = np.linspace(0, len(plot_time) - 1, 10, dtype=int)
+            else:
+                tick_locs = list(range(len(plot_time)))
+            self.ax.set_xticks(tick_locs)
+            self.ax.set_xticklabels([self._format_time(plot_time[i]) for i in tick_locs],
+                                    rotation=45, ha='right')
 
         if sensor_ids:
-            col_alias = sensor_ids[0]
-            unit_map = AnalysisTabWidget._UNIT_MAP
-            core_name = str(col_alias).split('-')[0].strip()
-            unit = ''
-            for key, val in unit_map.items():
-                if key in str(col_alias):
-                    core_name = key
-                    unit = val
-                    break
-            self.ax.set_ylabel(f'{core_name}{unit}')
+            # 从 SensorSystem 查询传感器的类型名称和单位
+            core_name = self._get_sensor_display_name(sensor_ids[0])
+            clean_unit = self._get_sensor_unit(sensor_ids[0])
+            y_label = f'{core_name} ({clean_unit})' if clean_unit else core_name
+            self.ax.set_ylabel(y_label)
             self.ax.set_title(f'{core_name}时程曲线')
 
         self.ax.set_xlabel('时间')
@@ -592,12 +620,16 @@ class AnalysisTabWidget(QWidget):
             return
         sensor_results = self._get_sensor_results()
 
+        self.stats_curve_combo.blockSignals(True)
         self.stats_curve_combo.clear()
         self.compare_combo1.clear()
         self.compare_combo2.clear()
-        self.stats_curve_combo.addItems(sensor_ids)
-        self.compare_combo1.addItems(sensor_ids)
-        self.compare_combo2.addItems(sensor_ids)
+        for sid in sensor_ids:
+            display = self._to_display_name(sid)
+            self.stats_curve_combo.addItem(display, userData=sid)
+            self.compare_combo1.addItem(display, userData=sid)
+            self.compare_combo2.addItem(display, userData=sid)
+        self.stats_curve_combo.blockSignals(False)
 
         first_id = sensor_ids[0]
         if first_id in sensor_results:
@@ -742,12 +774,16 @@ class AnalysisTabWidget(QWidget):
                 self._update_chart_multi_columns(selected_cols, time_range)
                 # 原始数据模式也填充统计/对比下拉
                 if selected_cols:
+                    self.stats_curve_combo.blockSignals(True)
                     self.stats_curve_combo.clear()
                     self.compare_combo1.clear()
                     self.compare_combo2.clear()
-                    self.stats_curve_combo.addItems(selected_cols)
-                    self.compare_combo1.addItems(selected_cols)
-                    self.compare_combo2.addItems(selected_cols)
+                    for c in selected_cols:
+                        display = self._to_display_name(c)
+                        self.stats_curve_combo.addItem(display, userData=c)
+                        self.compare_combo1.addItem(display, userData=c)
+                        self.compare_combo2.addItem(display, userData=c)
+                    self.stats_curve_combo.blockSignals(False)
                     first_data = plot_df[selected_cols[0]].values[start_idx:end_idx + 1]
                     self._calculate_statistics(first_data, selected_cols[0])
 
@@ -775,9 +811,10 @@ class AnalysisTabWidget(QWidget):
             return
 
         if self._annotated_cols:
-            # 光纤暗号标注列 = rename 后的 DataFrame 列名，直接使用（过滤时间戳）
+            # 暗号标注列 — 确保名称在 DataFrame 中真实存在，不存在的列跳过
             data_cols = [name for name in self._annotated_cols
-                         if name and '时间戳' not in name]
+                         if name and '时间戳' not in name
+                         and name in self._current_data.columns]
         else:
             data_cols = [c for c in self._current_data.columns
                          if c != '时间'
@@ -840,19 +877,27 @@ class AnalysisTabWidget(QWidget):
             return
         if self.data_source_combo.currentText() == '物理量':
             self.refresh_analysis_sensors()
+            self.stats_curve_combo.blockSignals(True)
             self.stats_curve_combo.clear()
             self.compare_combo1.clear()
             self.compare_combo2.clear()
             sensor_results = self._get_sensor_results()
             if sensor_results:
                 ids = list(sensor_results.keys())
-                self.stats_curve_combo.addItems(ids)
-                self.compare_combo1.addItems(ids)
-                self.compare_combo2.addItems(ids)
+                self.stats_curve_combo.clear()
+                self.compare_combo1.clear()
+                self.compare_combo2.clear()
+                for sid in ids:
+                    display = self._to_display_name(sid)
+                    self.stats_curve_combo.addItem(display, userData=sid)
+                    self.compare_combo1.addItem(display, userData=sid)
+                    self.compare_combo2.addItem(display, userData=sid)
+            self.stats_curve_combo.blockSignals(False)
         else:
             # 切换到原始数据：自动填充数据列列表
             self._refresh_data_column_list()
             # 同时填充统计/对比下拉
+            self.stats_curve_combo.blockSignals(True)
             self.stats_curve_combo.clear()
             self.compare_combo1.clear()
             self.compare_combo2.clear()
@@ -864,12 +909,17 @@ class AnalysisTabWidget(QWidget):
                     continue
                 data_cols.append(role)
             if data_cols:
-                self.stats_curve_combo.addItems(data_cols)
-                self.compare_combo1.addItems(data_cols)
-                self.compare_combo2.addItems(data_cols)
+                for c in data_cols:
+                    display = self._to_display_name(c)
+                    self.stats_curve_combo.addItem(display, userData=c)
+                    self.compare_combo1.addItem(display, userData=c)
+                    self.compare_combo2.addItem(display, userData=c)
+            self.stats_curve_combo.blockSignals(False)
 
     def _on_stats_curve_changed(self):
-        selected = self.stats_curve_combo.currentText()
+        selected = self.stats_curve_combo.currentData()
+        if selected is None:
+            selected = self.stats_curve_combo.currentText()
         if not selected:
             return
         actual_key = self.get_best_match_column(selected, self._current_plot_df) \
@@ -884,8 +934,12 @@ class AnalysisTabWidget(QWidget):
         self._calculate_statistics(data, selected)
 
     def _compare_curves(self):
-        curve1 = self.compare_combo1.currentText()
-        curve2 = self.compare_combo2.currentText()
+        curve1 = self.compare_combo1.currentData()
+        if curve1 is None:
+            curve1 = self.compare_combo1.currentText()
+        curve2 = self.compare_combo2.currentData()
+        if curve2 is None:
+            curve2 = self.compare_combo2.currentText()
 
         if not curve1 or not curve2:
             QMessageBox.warning(self, '警告', '请选择两条曲线进行对比')

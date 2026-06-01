@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -38,6 +39,8 @@ class AiDiagnosisWidget(QWidget):
         self._ai_models_config: Dict[str, dict] = {}
         self._online_thread: Optional[QThread] = None
         self._multi_report: str = ""
+        self._diagnosis_json_response: dict | None = None
+        self._diagnosis_raw_response: str = ""
         self._build_ui()
 
     # ═══════════════════════════════════════════════
@@ -477,29 +480,35 @@ class AiDiagnosisWidget(QWidget):
                 self._auto_test_latency()
 
     def _auto_test_latency(self) -> None:
-        """启动后自动测延迟 — 无弹窗，纯后台线程，结果只更新标签."""
+        """启动后自动测延迟 — 基于后台线程 TTFB 信号，前端只渲染结果。"""
         if not hasattr(self, '_online_config') or not self._online_config.get('api_key'):
             return
         self._set_latency('-- ms')
         try:
             from py.online_llm_thread import OnlineLlamaGenerateThread
-            t0 = time.time()
             self._test_thread = OnlineLlamaGenerateThread(
                 api_key=self._online_config['api_key'],
                 base_url=self._online_config['base_url'],
                 model_name=self._online_config['model_name'],
-                prompt='你好，请用一句话介绍自己。',
+                prompt='你好',
                 temperature=0.3,
-                max_tokens=64,
+                max_tokens=1,
                 system_prompt='',
+                latency_mode=True,  # 启用纯延迟测试模式
             )
-            self._test_thread.finished.connect(
-                lambda r: self._set_latency(f"{int((time.time() - t0) * 1000)} ms")
-            )
+            # 后台线程在 run() 内部计时并发射 latency_tested 信号
+            self._test_thread.latency_tested.connect(self._on_latency_result)
             self._test_thread.error.connect(lambda e: print(f"[AI诊断] 启动延迟测试失败: {e}"))
             self._test_thread.start()
         except Exception as e:
             print(f"[AI诊断] 启动延迟测试异常: {e}")
+
+    def _on_latency_result(self, ms: int) -> None:
+        """后台线程返回的 TTFB 毫秒数 — 仅渲染，不参与任何计时逻辑。"""
+        if ms < 0:
+            self._set_latency('-- ms')
+            return
+        self._set_latency(f"{ms} ms")
 
     def _on_model_selected(self, index: int) -> None:
         name = self.ai_model_combo.currentText()
@@ -624,24 +633,18 @@ class AiDiagnosisWidget(QWidget):
             self._warn(self, '请先连接AI模型')
             return
 
-        context = self._build_data_context()
-        if not context:
+        ctx = self._build_data_context()
+        if ctx.get("error") or not ctx.get("has_data"):
             self._warn(self, '请先加载数据文件')
             return
 
-        prompt = f"""作为数据分析专家，请对以下传感器数据进行分析诊断：
+        # 构建增强版系统提示词（含数据类型防火墙、模板状态、清洗统计、JSON schema）
+        system_prompt = self._build_system_prompt(ctx)
+        # 用户消息 = 纯数据上下文（不含 schema 约束，schema 在系统提示词中）
+        user_prompt = self._build_context_text(ctx)
 
-{context}
-
-请从以下几个维度进行分析：
-1. 数据质量评估
-2. 异常模式识别
-3. 传感器性能评估
-4. 数据处理建议
-5. 总体结论
-
-请使用中文，输出结构化的诊断报告。"""
-
+        self._diagnosis_json_response = None
+        self._diagnosis_raw_response = ""
         self.ai_diagnosis_result.clear()
         self.ai_terminal_title.setText("AI 诊断结果 (生成中...)")
         QApplication.processEvents()
@@ -652,10 +655,10 @@ class AiDiagnosisWidget(QWidget):
                 api_key=self._online_config['api_key'],
                 base_url=self._online_config['base_url'],
                 model_name=self._online_config['model_name'],
-                prompt=prompt,
+                prompt=user_prompt,
                 temperature=self._online_config.get('temperature', 0.7),
-                max_tokens=self._online_config.get('max_tokens', 2048),
-                system_prompt=self._online_config.get('system_prompt', ''),
+                max_tokens=self._online_config.get('max_tokens', 4096),
+                system_prompt=system_prompt,
             )
             self._diagnosis_thread.token_received.connect(self._on_diag_token)
             self._diagnosis_thread.finished.connect(self._on_diag_done)
@@ -673,6 +676,18 @@ class AiDiagnosisWidget(QWidget):
 
     @pyqtSlot(str)
     def _on_diag_done(self, result: str) -> None:
+        self._diagnosis_raw_response = result
+        # 尝试解析 JSON 并渲染结构化报告
+        parsed = self._extract_json(result)
+        if parsed:
+            try:
+                html = self._render_structured_report(parsed)
+                self.ai_diagnosis_result.setHtml(html)
+                self._diagnosis_json_response = parsed
+            except Exception:
+                self.ai_diagnosis_result.setPlainText(result)
+        else:
+            self.ai_diagnosis_result.setPlainText(result)
         self.ai_terminal_title.setText("AI 诊断结果")
         self.diagnosis_complete.emit(result)
 
@@ -691,8 +706,9 @@ class AiDiagnosisWidget(QWidget):
         if main_win:
             csv_path = getattr(main_win, 'sampled_file_path', None)
 
-        context = self._build_data_context()
-        user_input = f"""请分析以下传感器数据:\n\n{context}\n\nCSV文件路径: {csv_path or '未指定'}"""
+        ctx = self._build_data_context()
+        context_text = self._build_context_text(ctx)
+        user_input = f"请分析以下传感器数据:\n\n{context_text}\n\nCSV文件路径: {csv_path or '未指定'}"
 
         self.ai_diagnosis_result.clear()
         self.ai_terminal_title.setText("多智能体诊断 (运行中...)")
@@ -706,6 +722,7 @@ class AiDiagnosisWidget(QWidget):
                 base_url=self._online_config['base_url'],
                 model_name=self._online_config['model_name'],
                 csv_path=csv_path,
+                data_context=ctx,
             )
             report = (
                 f"## 数据科学家报告\n\n{result.get('data_scientist_report', '无')}\n\n"
@@ -720,41 +737,477 @@ class AiDiagnosisWidget(QWidget):
             self.ai_diagnosis_result.setPlainText(f'多智能体诊断失败: {e}')
             self.ai_terminal_title.setText("多智能体诊断 (失败)")
 
-    def _build_data_context(self) -> str:
-        """构建发送给AI的数据上下文摘要"""
+    # ═══════════════════════════════════════════════
+    # 数据类型防火墙判定（与 analysis_tab 逻辑一致）
+    # ═══════════════════════════════════════════════
+
+    @staticmethod
+    def _check_is_fiber_data(data, main_win) -> bool:
+        """判断当前数据是否为光纤光栅数据（双保险判定，与 analysis_tab._is_fiber_data 保持一致）"""
+        if data is None:
+            return False
+        # 判定 1：列名匹配
+        for c in data.columns:
+            name = str(c)
+            if 'FBG' in name or 'ENLIG' in name or '光纤传感' in name:
+                return True
+            if re.match(r'^W\d+$', name):
+                return True
+        # 判定 2：模板名
+        template = getattr(main_win, 'current_template', None)
+        if template and hasattr(template, 'name'):
+            tname = str(template.name)
+            if '光纤' in tname or 'ENLIGHT' in tname:
+                return True
+        return False
+
+    # ═══════════════════════════════════════════════
+    # 数据上下文构建（增强版）
+    # ═══════════════════════════════════════════════
+
+    def _build_data_context(self) -> dict:
+        """构建当前数据上下文的完整结构化摘要，返回 dict 供系统提示词和数据上下文使用。
+
+        包含：模板状态、数据规模、数据类型（光纤/通用）、清洗统计、传感器/标注列汇总。
+        """
         main_win = self._find_main()
         if not main_win:
-            return ""
+            return {"error": "未找到主窗口"}
 
-        parts = []
-        # 基础数据信息
+        ctx: dict[str, Any] = {}
+
+        # ── 模板与数据类型 ──
+        template = getattr(main_win, 'current_template', None)
+        if template:
+            ctx["template_name"] = str(getattr(template, 'name', ''))
+            ctx["template_id"] = str(getattr(template, 'id', ''))
+            ctx["file_format"] = str(getattr(template, 'file_format', ''))
+        else:
+            ctx["template_name"] = "(无模板)"
+
         data = getattr(main_win, 'current_data', None)
-        if data is not None and not data.empty:
-            parts.append(f"数据规模: {len(data)} 行 × {len(data.columns)} 列")
-            parts.append(f"列名: {', '.join(str(c) for c in data.columns)}")
-            parts.append(f"数据预览 (前5行):\n{data.head(5).to_string()}")
+        if data is None or data.empty:
+            ctx["has_data"] = False
+            return ctx
 
-        # 传感器结果
+        ctx["has_data"] = True
+        ctx["data_rows"] = len(data)
+        ctx["data_columns"] = len(data.columns)
+        ctx["column_names"] = [str(c) for c in data.columns]
+
+        # ── 数据类型防火墙 ──
+        is_fiber = self._check_is_fiber_data(data, main_win)
+        ctx["data_type"] = "fiber_optic" if is_fiber else "general"
+        ctx["data_type_label"] = "光纤光栅传感器数据" if is_fiber else "通用数据（TXT/CSV）"
+
+        # ── 数值列统计摘要 ──
+        numeric_cols = data.select_dtypes(include=['number']).columns.tolist()
+        if numeric_cols:
+            stats_rows = []
+            for c in numeric_cols:
+                col_data = data[c].dropna()
+                if len(col_data) > 0:
+                    stats_rows.append({
+                        "col": str(c),
+                        "count": int(len(col_data)),
+                        "missing": int(data[c].isna().sum()),
+                        "mean": round(float(col_data.mean()), 4),
+                        "std": round(float(col_data.std()), 4),
+                        "min": round(float(col_data.min()), 4),
+                        "max": round(float(col_data.max()), 4),
+                    })
+            ctx["numeric_stats"] = stats_rows
+
+        # ── 清洗统计（从 cleaning_tab_widget 获取结果文本） ──
+        cleaning_text = None
+        cleaning_tab = getattr(main_win, 'cleaning_tab_widget', None)
+        if cleaning_tab:
+            try:
+                ct = cleaning_tab.cleaning_result.toPlainText().strip()
+                if ct:
+                    cleaning_text = ct
+            except Exception:
+                pass
+        ctx["cleaning_summary"] = cleaning_text or "(未执行数据清洗)"
+
+        # ── 传感器结果（光纤数据） ──
         sensor_results = getattr(main_win, 'sensor_results', {})
         if sensor_results:
-            parts.append("\n传感器计算结果:")
+            ctx["sensor_results_summary"] = []
             for sid, vals in sensor_results.items():
                 clean = [v for v in vals if v is not None]
                 if clean:
-                    parts.append(f"  {sid}: 有效值={len(clean)}/{len(vals)}, "
-                               f"范围=[{min(clean):.4f}, {max(clean):.4f}]")
+                    ctx["sensor_results_summary"].append({
+                        "id": str(sid),
+                        "valid_count": len(clean),
+                        "total_count": len(vals),
+                        "min": round(float(min(clean)), 4),
+                        "max": round(float(max(clean)), 4),
+                        "mean": round(float(sum(clean) / len(clean)), 4),
+                    })
+
+        # ── 暗号标注列（通用数据） ──
+        try:
+            annotated_cols = main_win.get_annotated_columns()
+            if annotated_cols:
+                ctx["annotated_columns"] = list(annotated_cols)
+        except Exception:
+            pass
+
+        return ctx
+
+    def _build_context_text(self, ctx: dict) -> str:
+        """将结构化上下文 dict 转为纯文本描述，供 user prompt 使用。"""
+        if not ctx or ctx.get("error") or not ctx.get("has_data"):
+            return "当前无数据。"
+
+        lines = []
+        lines.append(f"数据文件模板: {ctx.get('template_name', '未知')}")
+        lines.append(f"数据类型: {ctx.get('data_type_label', '未知')}")
+        lines.append(f"数据规模: {ctx.get('data_rows', 0)} 行 x {ctx.get('data_columns', 0)} 列")
+        lines.append(f"列名: {', '.join(ctx.get('column_names', []))}")
+
+        stats = ctx.get("numeric_stats", [])
+        if stats:
+            lines.append("\n--- 数值列统计 ---")
+            for s in stats:
+                lines.append(
+                    f"  {s['col']}: 有效={s['count']}, 缺失={s['missing']}, "
+                    f"均值={s['mean']}, 标准差={s['std']}, "
+                    f"范围=[{s['min']}, {s['max']}]"
+                )
+
+        lines.append(f"\n清洗情况: {ctx.get('cleaning_summary', '未清洗')}")
+
+        sensors = ctx.get("sensor_results_summary", [])
+        if sensors:
+            lines.append("\n传感器计算结果:")
+            for s in sensors:
+                lines.append(
+                    f"  {s['id']}: 有效={s['valid_count']}/{s['total_count']}, "
+                    f"均值={s['mean']}, 范围=[{s['min']}, {s['max']}]"
+                )
+
+        annotated = ctx.get("annotated_columns", [])
+        if annotated:
+            lines.append(f"\n暗号标注列: {annotated}")
 
         # 需求文件
         if self.ai_req_files:
-            parts.append("\n需求文件内容:")
             for rf in self.ai_req_files:
                 try:
                     with open(rf, 'r', encoding='utf-8') as f:
-                        parts.append(f.read()[:2000])
+                        content = f.read()[:2000]
+                        lines.append(f"\n--- 需求文件: {rf} ---\n{content}")
                 except Exception:
                     pass
 
-        return '\n'.join(parts) if parts else ""
+        return '\n'.join(lines)
+
+    # ═══════════════════════════════════════════════
+    # 系统提示词构建（核心增强）
+    # ═══════════════════════════════════════════════
+
+    DIAGNOSIS_JSON_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "diagnosis_summary": {
+                "type": "object",
+                "properties": {
+                    "data_type": {"type": "string", "enum": ["fiber_optic", "general"]},
+                    "template_name": {"type": "string"},
+                    "data_quality": {"type": "string", "enum": ["good", "fair", "poor"]},
+                    "anomaly_count": {"type": "integer"},
+                    "overall_assessment": {"type": "string"},
+                    "assessment_en": {"type": "string"}
+                }
+            },
+            "data_quality_assessment": {
+                "type": "object",
+                "properties": {
+                    "completeness": {"type": "string"},
+                    "consistency": {"type": "string"},
+                    "anomaly_patterns": {"type": "array", "items": {"type": "string"}},
+                    "recommendations": {"type": "array", "items": {"type": "string"}}
+                }
+            },
+            "sensor_analysis": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "sensor_id": {"type": "string"},
+                        "status": {"type": "string", "enum": ["normal", "warning", "critical"]},
+                        "statistics": {
+                            "type": "object",
+                            "properties": {
+                                "mean": {"type": "number"},
+                                "std": {"type": "number"},
+                                "min": {"type": "number"},
+                                "max": {"type": "number"}
+                            }
+                        },
+                        "findings": {"type": "string"},
+                        "suggestions": {"type": "string"}
+                    }
+                }
+            },
+            "physical_diagnosis": {
+                "type": "object",
+                "properties": {
+                    "phenomenon": {"type": "string"},
+                    "possible_causes": {"type": "array", "items": {"type": "string"}},
+                    "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "recommended_actions": {"type": "array", "items": {"type": "string"}}
+                }
+            },
+            "raw_data_preview": {
+                "type": "object",
+                "properties": {
+                    "suggested_filter": {"type": "string"},
+                    "suggested_formula": {"type": "string"},
+                    "notes": {"type": "string"}
+                }
+            }
+        }
+    }
+
+    def _build_system_prompt(self, ctx: dict) -> str:
+        """构建带上下文约束的系统提示词。
+
+        关键设计：
+          - 数据类型防火墙（光纤 vs 通用）直接注入 system prompt 顶层规则
+          - 模板状态、清洗报警动态序列化进上下文块
+          - 严格 JSON 输出 schema
+        """
+        data_type = ctx.get("data_type", "general")
+        template_name = ctx.get("template_name", "(无模板)")
+        cleaning_summary = ctx.get("cleaning_summary", "(未清洗)")
+        is_fiber = data_type == "fiber_optic"
+
+        fiber_rule = (
+            "当前数据为【光纤光栅传感器数据】，基于波长差（W1~W8）进行物理量转换。\n"
+            "  - 关注 FBG 传感器的波长漂移趋势与应变/温度耦合效应\n"
+            "  - 判断滤波截止频率是否合理（过低会导致波形畸变）\n"
+            "  - 检查基线回零是否准确\n"
+            "  - 评估 NOA 81 胶水与 PI 光纤的界面滑移风险"
+        ) if is_fiber else (
+            "当前数据为【通用数据（TXT/CSV）】，属于外部已算好的数据。\n"
+            "  - 直接从标注列（annotated_columns）读取物理量含义\n"
+            "  - 不进行波长差到物理量的转换计算\n"
+            "  - 关注数据本身的完整性、一致性和异常模式\n"
+            "  - 提供后续数据处理建议"
+        )
+
+        return (
+            "你是一名专业的结构健康监测（SHM）诊断专家，精通传感器数据分析、异常诊断与物理机理分析。\n"
+            "\n"
+            "=== 当前数据上下文 ===\n"
+            f"模板: {template_name}\n"
+            f"数据类型: {'光纤光栅' if is_fiber else '通用'}\n"
+            f"清洗概况: {cleaning_summary}\n"
+            "\n"
+            "=== 数据类型防火墙规则（绝对约束） ===\n"
+            f"{fiber_rule}\n"
+            "\n"
+            "=== 分析维度 ===\n"
+            "1. 数据质量评估 — 完整性、一致性、异常密度\n"
+            "2. 异常模式识别 — 离群点、趋势突变、周期性异常\n"
+            "3. 传感器性能评估 — 漂移程度、信噪比、基线稳定性\n"
+            "4. 物理诊断 — 可能的材料力学行为解释\n"
+            "5. 处理建议 — 滤波参数推荐、清洗策略优化、后续关注点\n"
+            "\n"
+            "=== 输出要求 ===\n"
+            "你必须严格以 JSON 对象返回诊断结果，遵循以下 schema（输出纯 JSON，不要 markdown 包裹，不要多余文字）：\n"
+            f"{json.dumps(self.DIAGNOSIS_JSON_SCHEMA, ensure_ascii=False, indent=2)}\n"
+            "\n"
+            "注意：assessment_en 字段用英文撰写一句话总结（便于国际化仪表盘展示），其余字段全部用中文。"
+        )
+
+    # ═══════════════════════════════════════════════
+    # JSON 解析 & 结构化渲染
+    # ═══════════════════════════════════════════════
+
+    @staticmethod
+    def _extract_json(text: str) -> dict | None:
+        """从模型输出中提取第一个 JSON 对象。
+
+        优先尝试直接解析，失败则用正则提取 {...} 或 ```json ... ```。
+        """
+        # 先尝试直接解析
+        text = text.strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # 尝试提取 markdown 代码块中的 JSON
+        m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        # 尝试提取最外层大括号
+        brace_start = text.find('{')
+        if brace_start >= 0:
+            depth = 0
+            for i in range(brace_start, len(text)):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[brace_start:i + 1])
+                        except json.JSONDecodeError:
+                            break
+        return None
+
+    def _render_structured_report(self, data: dict) -> str:
+        """将解析后的 JSON 诊断报告渲染为格式化的 HTML。"""
+        html_parts = []
+
+        # ── 标题 ──
+        summary = data.get('diagnosis_summary', {})
+        quality = summary.get('data_quality', 'unknown')
+        quality_colors = {'good': '#52c41a', 'fair': '#faad14', 'poor': '#ff4d4f'}
+        q_color = quality_colors.get(quality, '#999')
+
+        html_parts.append(
+            f'<div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); '
+            f'color: white; padding: 16px 20px; border-radius: 8px; margin-bottom: 16px;">'
+            f'<h2 style="margin: 0; font-size: 18px;">诊断报告</h2>'
+            f'<div style="margin-top: 8px; font-size: 13px;">'
+            f'数据类型: {summary.get("data_type", "N/A")} &nbsp;|&nbsp; '
+            f'模板: {summary.get("template_name", "N/A")}'
+            f'</div>'
+            f'<div style="margin-top: 4px;">'
+            f'<span style="background: {q_color}; padding: 2px 10px; border-radius: 10px; '
+            f'font-size: 12px; font-weight: bold;">数据质量: {quality.upper()}</span>'
+            f' &nbsp; 异常点数: {summary.get("anomaly_count", "N/A")}'
+            f'</div>'
+            f'</div>'
+        )
+
+        # ── 总体评价 ──
+        overall = summary.get('overall_assessment', '')
+        if overall:
+            html_parts.append(
+                f'<div style="background: #f0f5ff; border-left: 4px solid #1890ff; '
+                f'padding: 12px 16px; margin-bottom: 12px; border-radius: 0 4px 4px 0;">'
+                f'<strong>总体评价</strong><br>{overall}'
+                f'</div>'
+            )
+
+        # ── 数据质量 ──
+        quality = data.get('data_quality_assessment', {})
+        if quality:
+            html_parts.append('<div style="margin-bottom: 16px;">')
+            html_parts.append('<h3 style="font-size: 15px; color: #333; margin-bottom: 8px;">数据质量评估</h3>')
+            html_parts.append(
+                f'<table style="width: 100%; border-collapse: collapse; font-size: 13px;">'
+                f'<tr><td style="padding: 6px 12px; color: #666; width: 100px;">完整性</td>'
+                f'<td style="padding: 6px 12px;">{quality.get("completeness", "")}</td></tr>'
+                f'<tr style="background: #fafafa;"><td style="padding: 6px 12px; color: #666;">一致性</td>'
+                f'<td style="padding: 6px 12px;">{quality.get("consistency", "")}</td></tr>'
+                f'</table>'
+            )
+            patterns = quality.get('anomaly_patterns', [])
+            if patterns:
+                html_parts.append('<div style="margin-top: 8px;"><strong>异常模式:</strong></div>')
+                for p in patterns:
+                    html_parts.append(
+                        f'<div style="background: #fff2f0; border: 1px solid #ffccc7; '
+                        f'padding: 6px 12px; border-radius: 4px; margin: 4px 0; font-size: 12px;">'
+                        f'{p}</div>'
+                    )
+            recs = quality.get('recommendations', [])
+            if recs:
+                html_parts.append('<div style="margin-top: 8px;"><strong>建议:</strong></div>')
+                for r in recs:
+                    html_parts.append(
+                        f'<div style="background: #f6ffed; border: 1px solid #b7eb8f; '
+                        f'padding: 6px 12px; border-radius: 4px; margin: 4px 0; font-size: 12px;">'
+                        f'{r}</div>'
+                    )
+            html_parts.append('</div>')
+
+        # ── 传感器分析 ──
+        sensors = data.get('sensor_analysis', [])
+        if sensors:
+            html_parts.append('<div style="margin-bottom: 16px;">')
+            html_parts.append('<h3 style="font-size: 15px; color: #333; margin-bottom: 8px;">传感器分析</h3>')
+            for s in sensors:
+                status = s.get('status', 'normal')
+                s_colors = {'normal': '#52c41a', 'warning': '#faad14', 'critical': '#ff4d4f'}
+                s_color = s_colors.get(status, '#999')
+                html_parts.append(
+                    f'<div style="background: #fafafa; border: 1px solid #e8e8e8; '
+                    f'border-radius: 6px; padding: 10px 14px; margin: 6px 0;">'
+                    f'<div style="display: flex; justify-content: space-between; align-items: center;">'
+                    f'<strong>{s.get("sensor_id", "")}</strong>'
+                    f'<span style="background: {s_color}; color: white; padding: 1px 8px; '
+                    f'border-radius: 8px; font-size: 11px;">{status}</span>'
+                    f'</div>'
+                    f'<div style="font-size: 12px; color: #666; margin-top: 4px;">'
+                    f'均值={s.get("statistics", {}).get("mean", "N/A")}, '
+                    f'标准差={s.get("statistics", {}).get("std", "N/A")}, '
+                    f'范围=[{s.get("statistics", {}).get("min", "N/A")}, '
+                    f'{s.get("statistics", {}).get("max", "N/A")}]'
+                    f'</div>'
+                )
+                findings = s.get('findings', '')
+                suggestions = s.get('suggestions', '')
+                if findings:
+                    html_parts.append(f'<div style="font-size: 12px; margin-top: 4px;">发现: {findings}</div>')
+                if suggestions:
+                    html_parts.append(f'<div style="font-size: 12px; color: #1890ff;">建议: {suggestions}</div>')
+                html_parts.append('</div>')
+            html_parts.append('</div>')
+
+        # ── 物理诊断 ──
+        phys = data.get('physical_diagnosis', {})
+        if phys:
+            severity = phys.get('severity', 'low')
+            sev_colors = {'low': '#52c41a', 'medium': '#faad14', 'high': '#ff4d4f'}
+            sev_color = sev_colors.get(severity, '#999')
+            html_parts.append('<div style="margin-bottom: 16px;">')
+            html_parts.append(
+                f'<h3 style="font-size: 15px; color: #333; margin-bottom: 8px;">'
+                f'物理诊断 '
+                f'<span style="background: {sev_color}; color: white; padding: 1px 8px; '
+                f'border-radius: 8px; font-size: 11px; vertical-align: middle;">{severity}</span>'
+                f'</h3>'
+            )
+            phenomenon = phys.get('phenomenon', '')
+            if phenomenon:
+                html_parts.append(
+                    f'<div style="background: #fffbe6; border: 1px solid #ffe58f; '
+                    f'padding: 10px 14px; border-radius: 6px; margin: 6px 0; font-size: 13px;">'
+                    f'{phenomenon}</div>'
+                )
+            causes = phys.get('possible_causes', [])
+            if causes:
+                html_parts.append('<div style="margin-top: 6px;"><strong>可能原因:</strong></div>')
+                for c in causes:
+                    html_parts.append(
+                        f'<div style="padding: 4px 0 4px 16px; font-size: 12px; color: #555;">'
+                        f'- {c}</div>'
+                    )
+            actions = phys.get('recommended_actions', [])
+            if actions:
+                html_parts.append('<div style="margin-top: 8px;"><strong>建议措施:</strong></div>')
+                for a in actions:
+                    html_parts.append(
+                        f'<div style="background: #f6ffed; border: 1px solid #b7eb8f; '
+                        f'padding: 6px 12px; border-radius: 4px; margin: 4px 0; font-size: 12px;">'
+                        f'{a}</div>'
+                    )
+            html_parts.append('</div>')
+
+        return ''.join(html_parts)
 
     # ═══════════════════════════════════════════════
     # 保存结果

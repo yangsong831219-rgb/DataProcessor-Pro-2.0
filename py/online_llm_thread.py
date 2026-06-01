@@ -3,7 +3,9 @@ OnlineLlamaGenerateThread - 基于 OpenAI 兼容接口的在线大模型推理�
 支持 DeepSeek、阿里通义千问、硅基流动等所有 OpenAI 兼容 API
 """
 import re
+import time
 from PyQt6.QtCore import QThread, pyqtSignal
+import requests
 from openai import OpenAI
 
 
@@ -35,10 +37,12 @@ class OnlineLlamaGenerateThread(QThread):
     token_received = pyqtSignal(str)  # 实时 token 发射
     finished = pyqtSignal(str)         # 完成时发射完整响应
     error = pyqtSignal(str)            # 错误时发射错误信息
+    latency_tested = pyqtSignal(int)   # 延迟测试结果（毫秒 TTFB）
 
     def __init__(self, prompt: str, api_key: str, base_url: str,
                  model_name: str, system_prompt: str = None,
-                 temperature: float = 0.7, max_tokens: int = 2048):
+                 temperature: float = 0.7, max_tokens: int = 2048,
+                 latency_mode: bool = False):
         """
         初始化
 
@@ -50,6 +54,7 @@ class OnlineLlamaGenerateThread(QThread):
             system_prompt: 系统提示词（可选）
             temperature: 温度参数
             max_tokens: 最大生成长度
+            latency_mode: 若为 True，仅测首字延迟（TTFB），收到第一块立即熔断
         """
         super().__init__()
         self.prompt = prompt
@@ -59,9 +64,37 @@ class OnlineLlamaGenerateThread(QThread):
         self.system_prompt = system_prompt or "你是一个专业的设备与系统 AI 诊断专家，请根据数据给出精准分析。"
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.latency_mode = latency_mode
 
     def run(self):
         """在子线程中执行在线大模型推理"""
+        if self.latency_mode:
+            self._run_latency_test()
+        else:
+            self._run_diagnosis()
+
+    def _run_latency_test(self):
+        """纯网络心跳延迟探针 — 抛弃推理接口，直接 HTTP GET 测量 TCP/TLS 往返。
+
+        向 base_url 的 roots 路径发送轻量 GET（不触发 GPU 推理），
+        精确测量 DNS + TCP + TLS + HTTP 首字节的纯网络耗时。
+        """
+        t0 = time.time()
+        try:
+            response = requests.get(
+                self.base_url.rstrip('/v1') + '/v1/models',
+                timeout=5,
+            )
+            elapsed = int((time.time() - t0) * 1000)
+            self.latency_tested.emit(elapsed)
+            response.close()
+        except requests.exceptions.Timeout:
+            self.latency_tested.emit(-1)
+        except Exception:
+            self.latency_tested.emit(-1)
+
+    def _run_diagnosis(self):
+        """正常诊断模式 — 全量流式推理"""
         try:
             # 1. 初始化客户端（自带连接池）
             client = OpenAI(
@@ -74,9 +107,6 @@ class OnlineLlamaGenerateThread(QThread):
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": self.prompt}
             ]
-
-            print(f"[Online LLM] 使用模型: {self.model_name}")
-            print(f"[Online LLM] API: {self.base_url}")
 
             # 3. 发起流式请求
             response = client.chat.completions.create(
@@ -99,7 +129,7 @@ class OnlineLlamaGenerateThread(QThread):
                     full_response += token
                     buffer += token
 
-                    # 【核心优化】：积累到 3 个字或遇到标点再发射，减少 PyQt 信号开销
+                    # 积累到 3 个字或遇到标点再发射，减少 PyQt 信号开销
                     if len(buffer) >= 3 or any(p in buffer for p in ['\n', '。', '！', '？', '，', '.', '!', '?']):
                         self.token_received.emit(buffer)
                         buffer = ""

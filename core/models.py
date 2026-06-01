@@ -273,68 +273,67 @@ class SensorSystem:
         for col in df.columns:
             column_data[col] = df[col].values
 
-        # 自动匹配FBG通道到实际数据列
-        wavelength_cols = [
-            c for c in df.columns
-            if ('波长' in str(c) or 'wavelength' in str(c).lower()
-                or str(c).upper().startswith('FBG')
-                or (str(c).upper().startswith('W') and str(c)[1:].isdigit()))
-        ]
-        if not wavelength_cols:
-            wavelength_cols = [
-                c for c in df.columns
-                if '时间' not in str(c) and 'timestamp' not in str(c).lower()
-                and pd.api.types.is_numeric_dtype(df[c])
-            ]
-
-        fbg_initial: Dict[str, float] = {}
+        import re as _re
+        # ── 重构 V2：基于正则的 W-column 自动探测 ──
+        # 匹配暗号标注列名模式: w1-类型-位置 / W2-应变-桥拱 / w3 …
+        W_PATTERN = _re.compile(r'^[wW](\d+)(?:-.*)?$')
         fbg_delta: Dict[str, List[Optional[float]]] = {}
 
         print("=" * 60)
-        print("[诊断] FBG通道匹配:")
+        print("  [W-column] 正则自动探测:")
         print(f"  DataFrame 列: {list(df.columns)}")
-        print(f"  检测到的波长列: {wavelength_cols}")
-        print(f"  已注册 FBG: {[(f.id, f.channel) for f in self.fbgs]}")
 
-        for i, fbg in enumerate(self.fbgs):
-            # 先尝试按channel精确匹配
-            if fbg.channel in column_data:
-                matched_col: str = fbg.channel
-            elif i < len(wavelength_cols):
-                matched_col = str(wavelength_cols[i])
-                fbg.channel = matched_col
-            else:
-                print(f"  FBG {fbg.id}: 未匹配到任何列!")
+        for col in df.columns:
+            m = W_PATTERN.match(str(col))
+            if not m:
                 continue
+            num = int(m.group(1))
+            wid = f'W{num}'
+            col_values = column_data[col]
+            initial = float(col_values[ref_row]) if ref_row < len(col_values) else float(col_values[0])
 
-            col_values = column_data[matched_col]
-            initial: float = float(col_values[ref_row]) if ref_row < len(col_values) else float(col_values[0])
-            fbg_initial[fbg.id] = initial
-
-            # 计算每行与初始值的差值
             delta: List[Optional[float]] = []
             for w in col_values:
                 if pd.isna(w) or pd.isna(initial):
                     delta.append(None)
                 else:
                     delta.append(float(w) - initial)
-            fbg_delta[fbg.id] = delta
-
-            # 同时用 channel（列名）作为别名
-            if str(matched_col) != str(fbg.id):
-                fbg_delta[str(matched_col)] = delta
+            fbg_delta[wid] = delta
 
             valid_deltas = [d for d in delta if d is not None][:5]
             print(
-                f"  FBG {fbg.id} → 列 '{matched_col}' | "
+                f"  {wid} ← 列 '{col}' | "
                 f"初始波长: {initial:.6f} | "
                 f"前5个差值(nm): {[f'{d:.6f}' if d is not None else 'None' for d in valid_deltas]}"
             )
-        print("=" * 60)
 
-        # 兜底：从数据列自动检测 FBG_ 列
+        # ── 兼容回退：无 W-pattern 时尝试传统列名匹配（过渡期使用） ──
         if not fbg_delta:
-            self._auto_build_delta(column_data, ref_row, fbg_delta)
+            legacy_cols = [
+                c for c in df.columns
+                if ('波长' in str(c) or 'wavelength' in str(c).lower()
+                    or str(c).upper().startswith('FBG'))
+            ]
+            if not legacy_cols:
+                legacy_cols = [
+                    c for c in df.columns
+                    if '时间' not in str(c) and 'timestamp' not in str(c).lower()
+                    and pd.api.types.is_numeric_dtype(df[c])
+                ]
+            if legacy_cols:
+                print(f"  [回退] 无 W-pattern，传统匹配: {legacy_cols}")
+                for i, col in enumerate(legacy_cols):
+                    col_values = column_data[col]
+                    ini = float(col_values[ref_row]) if ref_row < len(col_values) else float(col_values[0])
+                    delta = []
+                    for w in col_values:
+                        if pd.isna(w) or pd.isna(ini):
+                            delta.append(None)
+                        else:
+                            delta.append(float(w) - ini)
+                    wid = f'W{i+1}'
+                    fbg_delta[wid] = delta
+        print("=" * 60)
 
         # 计算每个传感器
         for sensor in self.sensors:

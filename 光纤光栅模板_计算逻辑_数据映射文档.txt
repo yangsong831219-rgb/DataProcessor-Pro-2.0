@@ -1,0 +1,454 @@
+================================================================================
+  DataProcessor Pro 2.0 — 光纤光栅模板 / 计算逻辑 / 数据映射 技术文档
+================================================================================
+更新日期: 2026-06-01
+代码基: main.py (~8800 行), core/models.py, py/formula.py, utils/file_parser.py
+
+目录:
+  1. 总体架构概览
+  2. 模板系统 (DataTemplate)
+  3. 格式一: ENLIGHT 原生格式 (enlight)
+  4. 格式二: 自定义光纤格式 (fiber_custom)
+  5. 格式三: 通用 CSV/TXT (非光纤)
+  6. 格式四: Excel 格式 (xlsx/xls)
+  7. 传感器计算引擎 (SensorSystem.calculate)
+  8. 公式解析引擎 (FormulaEngine / py/formula.py)
+  9. 暗号标注系统 (annotation-based data mapping)
+  10. 数据类型防火墙 (光纤 vs 通用数据路由)
+  11. 数据流全链路追踪
+  12. 配置文件参考 (custom_templates.json)
+
+
+================================================================================
+1. 总体架构概览
+================================================================================
+
+数据从文件到 UI 图表的核心管线:
+
+  文件选择 → 模板匹配/自动检测 → parse_file() 解析
+    → _auto_populate_fbgs() 自动识别 FBG 列
+    → _insert_annotation_row_if_timestamp_exists() 插入暗号行
+    → apply_cleaning() 数据清洗
+    → update_data_table() 推送到数据表格 + 分析模块
+    → SensorSystem.calculate() 物理量计算 (仅光纤路径)
+    → analysis_tab 渲染图表
+
+两条物理隔离路径:
+  ┌─ 光纤数据: parse_file → SensorSystem.calculate(波长差→物理量)
+  └─ 通用数据: parse_file → 暗号标注解析 → 直接读取 annotated_cols
+
+
+================================================================================
+2. 模板系统 (DataTemplate)
+================================================================================
+
+定义文件: core/models.py :106-134
+
+class DataTemplate:
+    id: str              # 唯一标识符, 如 "enlight_type", "custom_东华3825"
+    name: str            # 显示名称, 如 "ENLIGHT (光纤传感)"
+    file_format: str     # 核心分派字段: "enlight"|"fiber_custom"|"csv"|"txt"|"xlsx"
+    delimiter: str       # 分隔符, 默认 "\t", CSV 为 ","
+    skip_rows: int       # 跳过文件头行数
+    columns: List[Dict]  # 列描述列表, 每项含 name/comment/data_type
+
+columns 字典格式:
+  {
+    'name': 'FBG_A1',       # 列名
+    'comment': 'FBG FBG_A1',# 备注/说明
+    'data_type': 'time'     # 数据类型: time|numeric|wavelength|temperature|strain|none
+  }
+
+默认模板 (core/models.py:548):
+  DataTemplate('enlight_type', 'ENLIGHT (光纤传感)', 'enlight', '\t', 104, [...])
+
+持久化: 用户保存的自定义模板存储在 templates/custom_templates.json
+  启动时由 DataProcessorWindow.load_custom_templates() 加载,
+  追加到 DEFAULT_TEMPLATES 列表 (main.py:2235-2258)。
+
+
+================================================================================
+3. 格式一: ENLIGHT 原生格式 (enlight)
+================================================================================
+
+3.1 文件特征
+  - 文件头包含 "Timestamp" 和 "# CH" 关键字
+  - 前 104 行为元数据头 (取决于仪器, 但 auto_detect 以这对关键词为标志)
+  - 表头行格式: Timestamp \t # CH1 计数 \t # CH2 计数 \t ... \t 波长1 \t 波长2 ...
+  - 数据行: 25 列 (时间 + 16 个 CH 计数 + 最多 8 列波长)
+  - 分隔符: TAB (\t)
+
+3.2 解析逻辑 (utils/file_parser.py:197-231)
+  ① 逐行扫描找 "Timestamp" + "# CH" 共现的行 → 标记为 header_line
+  ② 从 header_line + 1 开始读取数据
+  ③ 每行切分为最多 25 列
+  ④ 列名自动生成: '时间' + 'CH1 计数'~'CH16 计数' + '波长1'~'波长N'
+  ⑤ 每列尝试 pd.to_numeric() 转换
+
+3.3 自动检测 (main.py:1733-1848)
+  auto_detect_template() 检查前 200 行:
+  - 若同时发现 "Timestamp" 和 "# CH" → 判定为 ENLIGHT 格式
+  - 返回 DataTemplate(file_format='enlight', skip_rows=104, ...)
+
+3.4 计算路径
+  解析后的 DataFrame 包含:
+    [时间, CH1计数, ..., CH16计数, 波长1, ..., 波长8]
+  → _auto_populate_fbgs() 按 "波长" 关键词匹配波长列
+  → SensorSystem.calculate() 以第0行为参考, 计算 Δλ = λ_i - λ_ref
+  → 对每个传感器公式求值 (如 "W1 * k1")
+
+
+================================================================================
+4. 格式二: 自定义光纤格式 (fiber_custom)
+================================================================================
+
+4.1 文件特征
+  - 用户自定义模板, file_format='fiber_custom'
+  - 通用 CSV/TXT 格式, 但列中包含波长/FBG 数据
+  - 在 parse_file() 中走与 'csv'/'txt' 相同的解析路径
+  - 解析后根据 template.columns 定义重命名列
+
+4.2 解析逻辑 (utils/file_parser.py:181-190)
+  ① try_read_csv() 读入原始 DataFrame
+  ② 若 template.columns 非空且列数匹配 → 按 columns[].name 重命名列
+  ③ 列名统一转为 str
+
+4.3 自动检测的光纤判定 (main.py:1793-1848)
+  当 auto_detect 发现以下特征时, 判定为光纤文件:
+  - 多列数值数据 + 无文本表头 → 命名列为 时间/波长1/波长2/...
+  - 列名含 FBG_、波长、wavelength、W+数字 → 标记 wavelength data_type
+  - 有 wavelength 列 → template_type = 'fiber_custom'
+  - 否则 → template_type = 'csv'
+
+4.4 示例: "ENLIGHT（光纤传感）公式版" 模板
+  实际用户保存的模板 (custom_templates.json):
+    file_format: "fiber_custom"
+    skip_rows: 123
+    列定义:
+      Timestamp  (time)
+      A1G1, A1G2, A2G1, A2G2, B1G1, B1G2, B2G1, B2G2 (numeric)
+      FBG_A1, FBG_A2, FBG_B1, FBG_D1, FBG_F1, FBG_F2, FBG_G1, FBG_G2 (wavelength)
+
+4.5 计算路径
+  与 ENLIGHT 格式完全相同的 SensorSystem.calculate() 路径:
+  → _auto_populate_fbgs() 按 FBG_ 前缀或波长关键词匹配
+  → fbg_delta 计算 Δλ
+  → 传感器公式求值
+
+
+================================================================================
+5. 格式三: 通用 CSV/TXT (非光纤)
+================================================================================
+
+5.1 文件特征
+  - file_format='csv' 或 'txt'
+  - 不包含 FBG_/波长关键词
+  - 列名不含光纤特征 → is_fiber_data=False
+
+5.2 解析逻辑 (utils/file_parser.py:181-190)
+  同 fiber_custom 的 CSV 解析路径。
+  try_read_csv() 自动检测分隔符、编码、表头行。
+
+5.3 暗号标注路径 (核心区别)
+  通用数据不走 SensorSystem.calculate()。而是:
+  ① _insert_annotation_row_if_timestamp_exists() 在首行插入暗号行
+  ② 用户在数据表格首行填写暗号: '时间戳' 标记时间列, '列名' 标记数据列
+  ③ get_annotated_columns() 解析暗号, 返回 (time_col_idx, data_cols, row_idx)
+  ④ _push_annotation_sensor_results() 将 data_cols 转换为 sensor_results
+  ⑤ analysis_tab 直接读取 annotated_cols 渲染图表 (下拉框锁定为"物理量")
+
+5.4 数据流:
+  CSV/TXT → parse_file → 插入暗号行 → 用户填写暗号
+    → get_annotated_columns → _push_annotation_sensor_results
+    → analysis_tab.set_current_data(analysis_df, annotated_cols)
+    → 绕过 SensorSystem.calculate(), 直接从 annotated_cols 读取数值
+
+
+================================================================================
+6. 格式四: Excel 格式 (xlsx/xls)
+================================================================================
+
+6.1 解析逻辑 (utils/file_parser.py:192-196)
+  df = pd.read_excel(file_path, header=None)
+  所有列无表头, 列名为 "0", "1", "2", ...
+
+6.2 适用场景
+  主要用于东华 3825 等采集仪的数据文件。
+  用户保存的模板示例:
+    id: "custom_东华3825"
+    file_format: "xlsx"
+    columns: 7 列, 全部 numeric data_type
+
+6.3 后续处理
+  加载后的 Excel 数据:
+  - 插入暗号行 → 用户手动标注时间列和数据列
+  - 走通用数据路径 (不触发 SensorSystem.calculate)
+
+
+================================================================================
+7. 传感器计算引擎 (SensorSystem.calculate)
+================================================================================
+
+定义文件: core/models.py :224-366
+
+7.1 核心流程
+
+  calculate(df, fbg_columns=None) → Dict[str, List[float]]
+
+  步骤:
+  ① 波长列自动匹配
+     优先级: 含"波长"/"wavelength" → 以 "FBG" 开头
+     → "W"+数字 → 兜底: 所有非时间数值列
+     列匹配到已注册的 FBG 对象 (fbg.channel)。
+
+  ② fbg_delta 计算
+     以 reference_row (默认第0行) 为基线:
+     Δλ[i] = λ[i] - λ[reference_row]   (单位: nm)
+     跳过 NaN/None。
+     同时注册 channel 别名: fbg_delta['W1'] = fbg_delta['FBG_A1']
+
+  ③ 兜底: _auto_build_delta()
+     若 fbg_delta 为空 → 自动扫描 FBG_ 前缀列构建差值。
+
+  ④ 传感器公式求值
+     对每个 active=True 的 Sensor:
+     - 普通传感器: _evaluate_sensor_formula()
+       表达式如 "W1 * k1" → 正则替换常量 → eval 逐行计算
+       常量优先级: 全局参数打底, 传感器局部常量覆盖
+       未定义常量 (如 k2) → 默认按 1.0 处理
+
+     - 双参量解耦传感器 (decoupling):
+       _evaluate_decoupling() → 矩阵求解:
+         Δλ1 = Ke1*Δε + KT1*ΔT
+         Δλ2 = Ke2*Δε + KT2*ΔT
+         → Δε = (Δλ1*KT2 - Δλ2*KT1) / (Ke1*KT2 - Ke2*KT1)
+         → ΔT = (Δλ2*Ke1 - Δλ1*Ke2) / (Ke1*KT2 - Ke2*KT1)
+       波长差值 nm→pm (×1000) 防浮点精度丢失。
+       行列式 |D| < 1e-9 时触发不可逆保护。
+
+7.2 默认传感器 (main.py:224-233)
+  FBG: W1~W8 (波长范围 1520-1590)
+  传感器:
+    '应变1' (strain):  公式 "W1 * k1", 常量 {k1: 1000.0}
+    '温度1' (temperature): 公式 "W1 * k2", 常量 {k2: 1e-6}
+
+7.3 全局参数
+  SensorSystem.global_parameters 作为 SSOT 变量池。
+  所有传感器公式共享的常量命名空间。
+  通过全局参数对话框 (GlobalParameterDialog) 编辑。
+
+
+================================================================================
+8. 公式解析引擎 (FormulaEngine / py/formula.py)
+================================================================================
+
+定义文件: py/formula.py :1-55
+
+8.1 FormulaEngine
+  支持函数: sin, cos, tan, log, sqrt, abs, avg, max, min, std
+  逐行 eval 计算:
+    n = 列长度
+    for i in range(n):
+      local_vars = {列名: 该行值, ...} + {参数名: 值, ...}
+      val = eval(formula, {__builtins__: {}}, local_vars)
+
+8.2 模块级 calculate() 函数
+  calculate(formula, columns, params, global_params=None)
+    → 合并全局参数和局部常量 (全局优先)
+    → 归一化 dict 格式参数 (处理 {value, unit, description} 结构)
+    → 委托 FormulaEngine.evaluate()
+
+8.3 SensorSystem 与 FormulaEngine 的区别
+  SensorSystem._evaluate_sensor_formula():
+    - 针对 FBG 波长差值 (Δλ) 设计
+    - 使用正则 \b 边界替换常量: re.sub(r'\bk1\b', '(1000.0)', expr)
+    - 包含 NaN/Inf 安全过滤
+  FormulaEngine:
+    - 通用公式引擎, 不关心 FBG
+    - 直接从 columns dict 取值
+    - 用于多智能体工具 (execute_custom_formula)
+
+
+================================================================================
+9. 暗号标注系统 (annotation-based data mapping)
+================================================================================
+
+定义位置: main.py :2306-2440
+
+9.1 暗号行自动插入
+  数据加载后 (update_data_table 之前), _insert_annotation_row_if_timestamp_exists():
+  - 扫描前 100 行, 若有单元格包含 '时间戳' → 已有暗号行, 跳过
+  - 否则 → 在第 0 行插入全 NaN 行
+  - 如果当前模板有 columns 定义:
+    data_type='time' 的列写入 "'时间戳'"
+    data_type='numeric' 或 'wavelength' 的列写入 "'列名'"
+
+9.2 暗号解析 (get_annotated_columns)
+  - 定位包含 '时间戳' 的行
+  - 解析各列:
+    '时间戳' → 时间列索引
+    '列名' (引号包裹) → 数据列, 提取自定义列名
+    无标记 → 丢弃列
+
+9.3 分析数据准备 (_get_analysis_data)
+  - 跳过了暗号行及之前所有行
+  - 按 data_cols 重命名列
+  - 返回: (cleaned_df, time_col_name, annotated_cols_set)
+
+
+================================================================================
+10. 数据类型防火墙 (光纤 vs 通用数据路由)
+================================================================================
+
+定义: ui/analysis_tab.py :75-102
+
+10.1 判定逻辑 (_is_fiber_data property)
+  双重保险:
+  ① 列名匹配: 扫描 DataFrame 列名, 包含 FBG/ENLIG/光纤传感/^W\d+$/波长
+  ② 模板名匹配: current_template.name 包含"光纤"或"ENLIGHT"
+
+  注意: 绝不检查 sensor_system.fbgs (防止上一轮光纤的遗留 FBG 定义
+  导致其它数据被误判为光纤 — 这是历史回归错误的根源)。
+
+10.2 路由分派
+  光纤数据 (is_fiber_data=True):
+    - data_source_combo 可切换: "原始数据" / "物理量"
+    - 使用 SensorSystem.calculate() 计算
+    - analysis_sensor_list 显示传感器列表 (可勾选)
+
+  通用数据 (is_fiber_data=False):
+    - data_source_combo 锁死在 "物理量" 并禁用
+    - 绕过 SensorSystem.calculate()
+    - 直接从 annotated_cols 读取数值
+    - 下拉框显示标注列名
+
+10.3 数据推送 (_push_annotation_sensor_results)
+  main.py:2276-2283
+  将 annotated_cols 转为 sensor_results dict:
+    {列名: [数值列表]}
+  仅在非光纤 (not has_fbg) 时执行。
+
+
+================================================================================
+11. 数据流全链路追踪
+================================================================================
+
+场景 A: 用户打开 ENLIGHT 光纤文件
+
+  open_file()
+    → auto_detect_template()      检测 Timestamp+#CH → enlight 格式
+    → parse_file(file, template)  解析 25 列 (时间+CH+波长)
+    → _auto_populate_fbgs(df)     按 "波长" 匹配 → FBG W1~W8
+    → _insert_annotation_row_if_timestamp_exists()
+    → apply_cleaning()            异常检测+填充
+    → update_data_table()
+      → _get_analysis_data()      跳过暗号行, 重命名
+      → has_fbg = True            → 不走 _push_annotation_sensor_results
+      → analysis_tab.set_current_data(analysis_df, annotated_cols)
+    → 用户点击"计算"
+      → SensorSystem.calculate()  → Δλ 逐行 → 传感器公式 → 物理量
+
+场景 B: 用户打开通用 CSV (如温度传感器数据)
+
+  open_file()
+    → auto_detect_template()      检测不到光纤特征 → csv 格式
+    → parse_file(file, template)  读入 DataFrame
+    → _auto_populate_fbgs(df)     无 FBG_/波长 → 返回 0
+    → _insert_annotation_row_if_timestamp_exists()  插入暗号行
+    → 用户填写暗号: '时间戳' | '温度(℃)'
+    → apply_cleaning()
+    → update_data_table()
+      → _get_analysis_data()      跳过暗号行, 重命名
+      → has_fbg = False
+      → _push_annotation_sensor_results()  → sensor_results['温度(℃)']
+      → analysis_tab.set_current_data(analysis_df, {'温度(℃)'})
+      → data_source_combo 锁定 "物理量", 禁用切换
+
+场景 C: 暗号标注数据刷新
+
+  _on_analysis_refresh_requested()
+    → _get_analysis_data()
+    → 有 annotated_cols 且无 FBG → _push_annotation_sensor_results()
+    → 无 annotated_cols 且无 FBG → set_sensor_results({})
+    → 有 FBG → 保留真实计算结果, 不覆盖
+
+
+================================================================================
+12. 配置文件参考 (custom_templates.json)
+================================================================================
+
+存储位置: templates/custom_templates.json
+
+当前已保存的模板 (2026-06-01):
+  1. "ENLIGHT（光纤传感）公式版"
+     - id: custom_ENLIGHT（光纤传感）公式版
+     - file_format: fiber_custom
+     - skip_rows: 123
+     - 17 列: Timestamp + 8 个 A/B/G 计数列 + 8 个 FBG_ 波长列
+
+  2. "东华3825" (重复两次, 仅第一个有效)
+     - id: custom_东华3825
+     - file_format: xlsx
+     - 7 列, 全部 numeric
+
+JSON 结构示例:
+  [
+    {
+      "id": "custom_ENLIGHT（光纤传感）公式版",
+      "name": "ENLIGHT（光纤传感）公式版",
+      "file_format": "fiber_custom",
+      "delimiter": "\t",
+      "skip_rows": 123,
+      "columns": [
+        {"name": "Timestamp", "comment": "时间戳", "data_type": "time"},
+        {"name": "FBG_A1", "comment": "FBG FBG_A1", "data_type": "wavelength"},
+        ...
+      ]
+    }
+  ]
+
+
+================================================================================
+附录 A: 关键函数索引
+================================================================================
+
+函数/方法                        位置                                  作用
+─── 文件解析 ───
+parse_file()                    utils/file_parser.py:165              根据 template.file_format 分派解析
+try_read_csv()                  utils/file_parser.py:117              自动检测分隔符/编码/表头
+detect_format()                 utils/file_parser.py:15               从前 50KB 样本检测分隔符
+detect_header()                 utils/file_parser.py:69               判断行是否为表头
+
+─── 模板匹配 ───
+auto_detect_template()          main.py:1733                          扫描前 200 行, 自动识别格式
+load_custom_templates()         main.py:2235                          启动时加载 templates/custom_templates.json
+_save_app_setting()             main.py:168                           持久化应用设置
+
+─── FBG 与传感器 ───
+_auto_populate_fbgs()           main.py:396                           按列名自动匹配 FBG (FBG_/波长/W+数字)
+SensorSystem.calculate()        core/models.py:250                    主计算引擎: Δλ → 传感器公式
+SensorSystem._evaluate_formula() core/models.py:395                   公式求值: 常量合并 + eval
+SensorSystem._evaluate_decoupling() core/models.py:449                双参量解耦矩阵求解
+_auto_build_delta()             core/models.py:370                    兜底: FBG_ 前缀列自动构建差值
+
+─── 暗号标注 ───
+_insert_annotation_row_if_timestamp_exists() main.py:2306             数据加载后插入暗号行
+get_annotated_columns()         main.py:2385                          解析暗号行识别列角色
+_get_analysis_data()            main.py:2445                          跳过暗号行 + 重命名列
+_push_annotation_sensor_results() main.py:2276                        标注列 → sensor_results
+
+─── 数据类型防火墙 ───
+_is_fiber_data (property)       ui/analysis_tab.py:75                 双保险判定光纤/通用
+_check_is_fiber_data (static)   ui/ai_diagnosis.py:734                AI 诊断中的相同判定逻辑
+
+
+================================================================================
+附录 B: file_format 分派汇总
+================================================================================
+
+file_format       parse_file 路径             计算路径             用户场景
+──────────────────────────────────────────────────────────────────────────
+enlight           ENLIGHT 格式读写             SensorSystem         ENLIGHT 光纤传感采集仪
+fiber_custom      CSV/TXT 解析 + 列名重命名     SensorSystem         自定义 FBG 数据文件
+csv/txt           CSV/TXT 解析                暗号标注 → 直读       通用传感器数据
+xlsx/xls          pd.read_excel               暗号标注 → 直读       东华 3825 等采集仪
