@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "last_updated": "2026-05-30",
+  "last_updated": "2026-06-03",
   "index": {
     "Hermes+Obsidian+LLM Wiki搭建本地知识库": {
       "path": "pages/Hermes+Obsidian+LLM Wiki搭建本地知识库.md",
@@ -25,6 +25,16 @@
         "web_clip"
       ],
       "summary": "剪藏自: 花一小时搭好 Claude Code Harness，AI 写代码质量立竿见影"
+    },
+    "封装无热化 FBG的材料进行详细的介绍和性价比": {
+      "path": "pages/封装无热化 FBG的材料进行详细的介绍和性价比.md",
+      "tags": [],
+      "summary": ""
+    },
+    "波长漂移的三大来源": {
+      "path": "pages/波长漂移的三大来源.md",
+      "tags": [],
+      "summary": ""
     }
   }
 }

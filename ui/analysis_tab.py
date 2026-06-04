@@ -392,6 +392,7 @@ class AnalysisTabWidget(QWidget):
             self.ax.set_xticks(tick_locs)
             self.ax.set_xticklabels([self._format_time(plot_time[i]) for i in tick_locs],
                                     rotation=45, ha='right')
+            self.ax.set_xlim(0, len(x_indices) - 1)
         else:
             self.ax.plot(plot_data, 'b-', linewidth=1)
             self.ax.set_xlabel('序号')
@@ -470,6 +471,7 @@ class AnalysisTabWidget(QWidget):
             self.ax.set_xticks(tick_locs)
             self.ax.set_xticklabels([self._format_time(plot_time[i]) for i in tick_locs],
                                     rotation=45, ha='right')
+            self.ax.set_xlim(0, len(plot_time) - 1)
 
         # Y轴标记和图表名称
         if self._is_fiber_data and self.data_source_combo.currentText() == '原始数据':
@@ -530,6 +532,7 @@ class AnalysisTabWidget(QWidget):
             self.ax.set_xticks(tick_locs)
             self.ax.set_xticklabels([self._format_time(plot_time[i]) for i in tick_locs],
                                     rotation=45, ha='right')
+            self.ax.set_xlim(0, len(plot_time) - 1)
 
         if sensor_ids:
             # 从 SensorSystem 查询传感器的类型名称和单位

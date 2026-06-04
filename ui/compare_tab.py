@@ -1117,6 +1117,8 @@ class CompareTabWidget(QWidget):
         ax.xaxis.set_major_locator(
             mdates.AutoDateLocator(minticks=5, maxticks=15)
         )
+        if plot_bucket:
+            ax.set_xlim(plot_bucket[0][0][0], plot_bucket[0][0][-1])
         self.fig.tight_layout()
         self.canvas.draw_idle()
 

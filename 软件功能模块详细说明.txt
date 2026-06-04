@@ -1,0 +1,808 @@
+================================================================================
+  DataProcessor Pro 2.0 — 软件功能模块详细说明
+================================================================================
+  生成日期: 2026-06-04
+  项目目录: D:\桌面文件\软件项目_qt6
+  主入口: main.py (~8600 行)
+  技术栈: PyQt6 + Pandas + Matplotlib + LangGraph + python-docx + python-pptx
+================================================================================
+
+目录
+  一、项目总体架构
+  二、核心数据模型层 (core/)
+  三、后端引擎层 (py/)
+  四、前端 UI 层 (ui/)
+  五、工具层 (utils/)
+  六、配置文件与状态管理
+  七、数据流全景
+  八、关键技术方案
+
+================================================================================
+一、项目总体架构
+================================================================================
+
+DataProcessor Pro 2.0 是一个离线光纤光栅(FBG)数据分析与报告生成桌面软件。
+采用 巨石架构（monolithic），主窗口 main.py 承载所有 Tab 页面的生命周期。
+
+【架构分层】
+  ┌─────────────────────────────────────────────────────┐
+  │  UI 层 (ui/)        — PyQt6 Widget, 信号驱动        │
+  │  ├─ main.py         — 主窗口, Tab 管理器, 信号路由   │
+  │  ├─ analysis_tab    — 数据分析/图表/统计             │
+  │  ├─ compare_tab     — 多源数据对比                   │
+  │  ├─ ai_diagnosis    — AI 诊断/多智能体审查            │
+  │  └─ ...             — 其他 12 个 UI 模块             │
+  ├─────────────────────────────────────────────────────┤
+  │  后端引擎层 (py/)     — 信号处理/AI/报告生成           │
+  │  ├─ multi_agent     — LangGraph 多智能体审查          │
+  │  ├─ analyzer        — 时域/频域/滤波                  │
+  │  ├─ formula         — 公式计算引擎                    │
+  │  └─ report_builder  — Word/PPT 报告生成器             │
+  ├─────────────────────────────────────────────────────┤
+  │  核心数据模型 (core/)  — SSOT 数据定义                 │
+  │  ├─ models          — Sensor/SensorSystem/FBG        │
+  │  ├─ ai_client       — LLM 客户端单例                  │
+  │  └─ report_engine   — AI 报告引擎                     │
+  ├─────────────────────────────────────────────────────┤
+  │  工具层 (utils/)      — 纯函数, 无 UI 依赖             │
+  │  ├─ file_parser     — CSV/TXT/ENLIGHT 文件解析        │
+  │  └─ data_cleaning   — 异常检测/缺失值填充              │
+  └─────────────────────────────────────────────────────┘
+
+【设计原则】
+  1. SSOT (Single Source of Truth): 所有状态在 AppState 或 main.py 统一管理
+  2. 信号驱动: UI Widget 之间不直接引用，通过 pyqtSignal 解耦
+  3. 数据流防火墙: 光纤数据与非光纤数据通过 _is_fiber_data 严格隔离
+  4. "卸妆"法则: 列名含单位后缀 (με) 时，必须先正则剥离再作为 key 匹配
+
+================================================================================
+二、核心数据模型层 (core/)
+================================================================================
+
+2.1 core/models.py — 核心数据模型 (SSOT)
+─────────────────────────────────────────
+  文件大小: 19KB | 依赖: numpy, pandas
+
+  【数据类 (dataclass)】
+  ┌ GlobalParameter
+    - 全局参数/共享常量，注入所有传感器公式的计算命名空间
+    - 字段: name, value, unit, description
+    - 策略: 全局参数打底，传感器局部常量覆盖
+
+  ┌ DataTemplate
+    - 数据文件格式定义（分隔符、跳过行数、列定义）
+    - 字段: id, name, file_format, delimiter, skip_rows, columns[]
+    - to_dict() 序列化为 JSON 配置
+
+  ┌ CleaningRule
+    - 数据清洗规则（相邻差值/nan/范围/负值/零值）
+    - 字段: rule_type, enabled, threshold, min/max_value, fill_method
+    - 填充方式: linear/mean/forward/backward/custom
+
+  ┌ FBG (Fiber Bragg Grating)
+    - 光纤光栅定义，对应一列原始波长数据
+    - 字段: id (W1~W8), channel (列名), wavelength_min/max
+    - is_valid() — 判断波长是否在有效范围
+
+  ┌ Sensor (虚拟传感器)
+    - 通过公式将原始波长差值转换为物理量
+    - 字段: id, sensor_type, formula, constants, active, location
+    - TYPE_PARAMS (ClassVar): 8 种传感器类型的参数映射
+       应变(με), 温度(°C), 位移(mm), 倾角(°), 压力(MPa),
+       双参量解耦(με/°C), 应变标定(με), 温度标定(°C)
+    - get_unit() / get_name() — 从 TYPE_PARAMS 获取单位/名称
+
+  ┌ SensorSystem (传感器系统管理器)
+    - 管理 FBG 列表 + Sensor 列表，执行物理量计算
+    - 【核心方法】calculate(df) → {sensor_id: [values]}
+      1. 正则 W_PATTERN (^[wW](\d+)(?:-.*)?$) 匹配暗号列名
+      2. 对每列计算波长差值 Δλ = λ_current - λ_reference
+      3. 对每个活跃 Sensor，执行公式求值或解耦矩阵计算
+    - _evaluate_sensor_formula() — eval 安全求值, 正则替换常量
+    - _evaluate_decoupling() — 双参量解耦矩阵求解
+
+  【类型定义】
+  ┌ SensorType 字面量: 'strain'|'temperature'|... 共 8 种
+  ┌ DecouplingConfig TypedDict: 解耦矩阵配置结构
+  ┌ TimeDomainResult / FrequencyDomainResult TypedDict
+
+  【独立函数】
+  ┌ time_domain_analysis() — 均值/最大值/RMS/标准差
+  ┌ frequency_domain_analysis() — FFT 频谱分析
+  ┌ apply_filter() — 巴特沃斯低通/高通/带通滤波
+
+2.2 core/ai_client.py — AI 客户端单例
+─────────────────────────────────────────
+  文件大小: 10KB
+
+  ┌ AIClient (单例)
+    - OpenAI 兼容 API 封装，默认 DeepSeek-V4 Pro
+    - generate() — 同步 LLM 调用 (流式/非流式)
+    - generate_with_tools() — 多轮函数调用/Agent 循环
+    - get_instance() / reset() — 单例管理
+  ┌ build_schema_prompt() — Pydantic → JSON Schema 序列化
+
+2.3 core/report_engine.py — AI 报告引擎
+─────────────────────────────────────────
+  文件大小: 13KB
+
+  ┌ generate_outline(config) → Markdown 大纲
+    - 调用 LLM 生成结构化报告大纲
+  ┌ generate_structured_report() → 结构化 JSON
+    - 逐章调用 LLM，输出 Pydantic 模型
+  ┌ _generate_word_report() — Word 章节生成（含图表工具）
+  ┌ _generate_ppt_report() — PPT 幻灯片生成（项目符号+备注）
+
+2.4 core/report_models.py — 报告数据契约
+─────────────────────────────────────────
+  文件大小: 4KB | 依赖: Pydantic
+
+  ┌ WordSection: 标题 + 段落列表 + 图片锚点
+  ┌ WordReport: 完整 Word 报告（序列化为 builder dict）
+  ┌ PPTSlide: 单张幻灯片（最多 4 条要点 + 备注 + 图片）
+  ┌ PPTReport: 完整演示文稿（builder 序列化）
+
+2.5 core/tools/chart_tool.py — AI 图表工具
+─────────────────────────────────────────
+  文件大小: 内置
+
+  ┌ generate_sensor_plot() — 渲染传感器趋势图/直方图 → PNG
+  ┌ GENERATE_SENSOR_PLOT_TOOL — OpenAI 函数调用 Schema
+  ┌ _find_sensor_values() — 模糊 ID 匹配
+  ┌ _create_placeholder_plot() — 数据缺失时生成占位图
+
+
+================================================================================
+三、后端引擎层 (py/)
+================================================================================
+
+3.1 py/analyzer.py — 信号处理原语
+─────────────────────────────────
+  文件大小: 1.3KB
+
+  纯函数，提供三种信号处理操作：
+  ┌ time_domain_analysis(data) → {mean, max, min, rms, std}
+  ┌ frequency_domain_analysis(data, sampling_rate) → {frequencies, magnitudes, dominant_freq}
+    使用 numpy.fft，仅返回正半轴频谱
+  ┌ apply_filter(data, type, cutoff, rate) → filtered_data
+    4 阶巴特沃斯滤波 (scipy.signal.butter + filtfilt)
+
+3.2 py/cleaner.py — 数据清洗
+─────────────────────────────
+  文件大小: 2KB
+
+  基于 Pandas 的数据质量清洗（已被 utils/data_cleaning.py 替代，保留兼容）
+
+3.3 py/formula.py — 公式计算引擎
+─────────────────────────────────
+  文件大小: 2KB
+
+  ┌ FormulaEngine 类
+    - set_param() / set_column() — 注入参数和列数据
+    - evaluate(formula) → [values]
+      eval 安全求值，支持 [ColName] 列引用和 ParamName 参数引用
+      数学函数: sin/cos/tan/log/sqrt/abs/avg/max/min/std
+  ┌ calculate(formula, columns, params, global_params) → [values]
+    SSOT: 全局参数打底，局部常量覆盖
+
+3.4 py/template.py — 文件模板管理
+─────────────────────────────────
+  文件大小: 3.5KB
+
+  ┌ FileTemplate / ColumnDef dataclass — 文件格式模板
+  ┌ load_templates() / save_template() — JSON 持久化 (~/.dataprocessor/)
+  ┌ parse_file() — CSV/TXT/XLSX 解析
+
+3.5 py/processor.py — 加载编排器
+─────────────────────────────────
+  文件大小: 410B
+
+  ┌ handle_load_file(file_path, template_id) — 加载模板 → 解析文件
+
+3.6 py/report.py — 简单 Word 报告（旧版）
+─────────────────────────────────
+  文件大小: 1KB
+
+  ┌ generate_report() — python-docx 简单报告生成（已由 report_builder 取代）
+
+3.7 py/multi_agent.py — 多智能体审查系统
+─────────────────────────────────
+  文件大小: 20KB | 依赖: LangGraph
+
+  【核心架构 — 三智能体流水线】
+    Data Scientist (数据分析师)
+      → 分析数据、执行滤波/公式、查询 Wiki
+      → 工具: apply_butterworth_filter, execute_custom_formula, Wiki CRUD
+    Data Auditor (数据审核员)
+      → 审查结果，pass/reject 决策（最多 3 轮拒绝循环）
+    Chief Scientist (首席科学家)
+      → 物理诊断，输出结构化 JSON 诊断报告
+
+  ┌ MultiAgentState — TypedDict: {data_info, sensor_results, ...}
+  ┌ run_multi_agent(state) — 入口，启�� LlamaCall 三智能体流
+  ┌ 角色隔离: 光纤数据 vs 通用数据的强制防火墙
+
+3.8 py/agent_graph.py — 单智能体 ReAct
+─────────────────────────────────
+  文件大小: 7.5KB | 依赖: LangGraph
+
+  ┌ AgentState — {messages, sender, ...}
+  ┌ 8 个 Tool: Butterworth 滤波, 公式执行, Wiki CRUD + 搜索
+  ┌ create_agent_graph() — LLM-brain/tool-loop 拓扑
+
+3.9 py/agent_skill_hub.py — 技能工具集
+─────────────────────────────────
+  文件大小: 8.6KB
+
+  ┌ 第三方技能: Python REPL, Arxiv, DuckDuckGo, Wikipedia
+  ┌ 本地工具: 滤波, 公式, Wiki, 语义搜索
+  ┌ get_tools_by_category("code|search|wiki") — 分类检索
+  ┌ get_all_agent_tools() — CrewAI 注入
+
+3.10 py/agent_worker.py — 后台 Agent 线程
+─────────────────────────────────
+  文件大小: 8KB
+
+  ┌ DeepSeekAgentWorker (QThread) — ReAct Agent 后台执行
+    信号: streaming_text, data_changed, report_ready, error_occurred
+  ┌ WikiSyncWorker (QThread) — Wiki 异步读写
+
+3.11 py/online_llm_thread.py — 在线 LLM 线程
+─────────────────────────────────
+  文件大小: 5.6KB
+
+  ┌ OnlineLlamaGenerateThread (QThread) — OpenAI 兼容 API 流式推理
+    - 支持 DeepSeek/Qwen/SiliconFlow 等任意 OpenAI API
+    - 流式 token 信号: 3 字符批量或标点触发
+    - latency_test_mode: TTFB 延迟测试 (GET /v1/models)
+    - 中文友好错误格式化 (限流/401/超时)
+
+3.12 py/local_llm_manager.py — 本地 LLM 管理器
+─────────────────────────────────
+  文件大小: 5.7KB
+
+  ┌ LocalLLMManager (单例) — llama-cpp-python GGUF 模型管理
+    - load_model() / unload_model() — GPU 层控制
+    - generate() / generate_stream() — 流式/非流式生成
+    - 内存清理: gc.collect()
+
+3.13 py/llama_generate_thread.py — 本地推理线程
+─────────────────────────────────
+  文件大小: 5.6KB
+
+  ┌ LlamaGenerateThread (QThread) — llama-cpp-python 本地推理
+    - 全局 LocalLLMManager 单例
+    - 模型格式适配: Qwen ChatML, Gemma instruction, 通用
+    - 去重/重复检测
+
+3.14 py/ollama_client.py — Ollama 客户端
+─────────────────────────────────
+  文件大小: 14KB
+
+  ┌ OllamaGenerateThread (QThread) — Ollama 流式生成
+  ┌ OllamaStatusThread (QThread) — 后台健康检查
+  ┌ OllamaClient 类
+    - is_available() / start_service() / stop_service()
+    - generate() — 同步推理
+    - generate_diagnosis() — 传感器数据分析
+    - unload_model() (keep_alive=0)
+
+3.15 py/github_skill_loader.py — GitHub 技能加载器
+─────────────────────────────────
+  文件大小: 9.5KB
+
+  ┌ GitHubSkillManager
+    - fetch_skill_from_github() — 带缓存的 GitHub 技能下载
+    - load_tools_from_file() — 动态导入 + 反射式工具提取
+    - 代理支持 / GitHub Token 认证 / 缓存管理
+  ┌ quick_load_skill() — 便捷工厂
+
+3.16 py/web_clipper.py — 网络剪藏工具
+─────────────────────────────────
+  文件大小: 22KB
+
+  ┌ WebClipper 类
+    - fetch_article(url) — 微信/知乎/通用 (trafilatura/markdownify)
+    - download_and_replace_images() — MD5 缓存, magic bytes 格式检测
+    - download_video() — yt-dlp, 最高 1080p
+    - save_to_wiki() — front-matter 注入, Wiki 索引更新
+    - clip() — 一站式: 抓取→下载→清洗→保存
+
+3.17 py/wiki_system.py — Wiki 知识库系统
+─────────────────────────────────
+  文件大小: 28KB
+
+  ┌ WikiFileSystem 类
+    - CRUD: read/write/delete_wiki_page()
+    - 语义搜索: sentence-transformers + ChromaDB (余弦相似度)
+    - LLM 自动标签/摘要
+    - 智能合并: LLM 去重/重构, .history 备份
+    - 全量 embedding 重建 / 缺失页面同步
+
+3.18 py/report_builder/ — 报告生成器包
+─────────────────────────────────
+  共 6 个文件
+
+  ┌ flow_controller.py — 报告流程控制器
+    - ReportFlowController: 大纲生成→逐章展开→Word/PPT 渲染
+    - generate_outline() / expand_section() / build_word_report()
+    - run_full_flow() — 完整流水线 + 进度回调
+    - Jinja 风格提示模板
+
+  ┌ word_builder.py — Word 渲染器
+    - WordBuilder.build() → .docx
+    - 封面页 / 段落 (含 [INSERT_IMAGE:...] 解析替换) / 表格
+    - 模板占位符替换 ({{Report_Title}})
+    - 项目目录图片解析
+
+  ┌ ppt_builder.py — PPT 渲染器
+    - PPTBuilder.build() → .pptx (16:9)
+    - 标题页 (作者/日期) / 内容页 (最多 4 要点, 演讲备注)
+    - 图片插入 / 模板占位符
+
+  ┌ template_engine.py — 占位符替换工具
+    - fill_word_template() / fill_ppt_template()
+    - substitute_placeholders() — 正则替换
+
+  ┌ models.py — 报告数据模型
+    - OutlineSection / ReportOutline / WordReport / PPTReport
+    - GenerationEvent (进度)
+
+
+================================================================================
+四、前端 UI 层 (ui/)
+================================================================================
+
+4.1 main.py — 主窗口 (巨石)
+─────────────────────────────
+  文件大小: ~140KB (约 8600 行)
+
+  ┌ DataProcessorWindow(QMainWindow) — 应用主窗口
+    【核心属性】
+    - current_data: pd.DataFrame — 当前加载的数据
+    - current_template: DataTemplate — 当前使用的模板
+    - sensor_system: SensorSystem — 传感器系统实例
+    - sensor_results: dict — 计算后的传感器物理量
+    - cleaning_rules: list[CleaningRule]
+    - sampled_data / file_header_lines / current_columns
+
+    【核心方法】
+    ├─ 文件操作
+    │  open_file() — 模板选择对话框 → 加载数据
+    │  clear_data() — 重置所有状态
+    │  sample_data() — N 间隔等距采样
+    │  save_sampled_data() / save_data() — 保存数据
+    │
+    ├─ 传感器操作
+    │  init_sensor_system() — 8 个默认 FBG (W1-W8, 1520-1590nm)
+    │  _auto_populate_fbgs() — 从列名正则提取 W\d+ 自动创建 FBG
+    │  calculate_sensors() — 调用 SensorSystem.calculate()
+    │  _clean_sensor_keys() — 剥离结果键的单位后缀
+    │  add_fbg() / edit_fbg() / delete_fbg()
+    │  add_sensor() / edit_sensor() / delete_sensor() / copy_sensor()
+    │
+    ├─ 数据清洗
+    │  apply_cleaning() — 调用 utils/data_cleaning.clean_data()
+    │
+    ├─ 配置持久化
+    │  save_config() / load_config() / reset_config() → JSON
+    │
+    ├─ 暗号标注
+    │  _insert_annotation_row_if_timestamp_exists() — 插入标注行
+    │  get_annotated_columns() — 解析标注行提取列角色
+    │  _get_analysis_data() — 跳过标注行, 重命名列
+    │
+    ├─ AI 报告
+    │  _ReportWorker(QThread) — 后台报告生成线程
+    │  _handle_outline_generation() / _handle_full_report_generation()
+    │
+    └─ UI 构建
+       init_ui() — 创建 QTabWidget + 所有 Tab 页面
+       create_menu_bar() — 菜单栏
+
+  ┌ FBGEditDialog(QDialog) — FBG 编辑对话框
+  ┌ SensorEditDialog(QDialog) — 传感器编辑对话框 (含解耦矩阵面板)
+  ┌ AIModelConfigDialog(QDialog) — AI 模型配置管理
+
+4.2 ui/analysis_tab.py — 数据分析 Tab
+─────────────────────────────────────
+  文件大小: 45KB
+
+  ┌ AnalysisTabWidget(QWidget) — 数据分析主界面
+    【信号】status_message_requested, data_refresh_requested
+
+    【核心逻辑】
+    ├─ 数据路由
+    │  _get_current_plot_data()
+    │    光纤+原始数据 → 波长差固化
+    │    光纤+物理量   → SensorSystem.calculate() 结果
+    │    其它数据       → 暗号标注列直读
+    │
+    ├─ 图表绘制
+    │  _update_chart_with_data() — 单传感器折线图
+    │  _update_chart_multi_columns() — 多列折线图
+    │  _update_chart_multi_sensors() — 多传感器折线图
+    │  【X轴方案】纯数值索引 range(len(x)) + set_xticklabels
+    │  彻底避免 matplotlib 自动格式化导致的幽灵刻度重叠
+    │
+    ├─ 下拉框同步
+    │  _to_display_name() — 统一将 sensor ID/列名 → 图例一致的显示名
+    │   先 _get_annotation_name() 查暗号, 再剥离 w{N}- 前缀
+    │   userData 存储原始 key, currentData() 读取
+    │
+    ├─ 统计计算
+    │  _calculate_statistics() — 最大值/最小值/均值/标准差/峰峰值/有效值/偏度/峰度
+    │  _calculate_statistics_for_sensors() — 多传感器统计
+    │
+    ├─ 曲线对比
+    │  _compare_curves() — 双曲线对比: 绝对误差/MAE/RMSE/皮尔逊系数
+    │  窗口首点归零法消除静态偏置
+    │
+    └─ 辅助方法
+       _is_fiber_data 属性 — 双重判定: 列名 + 模板名
+       get_best_match_column() — 双向去括号模糊匹配
+       _get_annotation_name() — sensor ID → 暗号备注名
+       _get_sensor_display_name() / _get_sensor_unit()
+
+4.3 ui/compare_tab.py — 多源数据对比 Tab
+─────────────────────────────────────
+  文件大小: 62KB
+
+  ┌ FileConfig — 单个文件的数据源配置
+    - raw_df / annotated_df / annotation_row_idx
+    - time_col / data_cols / row_start/end / time_offset
+    - annotated_name(col) → 暗号标注内容
+
+  ┌ CompareTabWidget(QWidget) — 多源对比主界面
+    使用 per-file 暗号标注系统: 用户标记时间列和数据列
+
+    【核心流程】
+    _align_and_plot()
+      1. 公共时间列 → 基准 Unix 时间戳网格
+      2. 遍历勾选数据列，提取各文件时间列 + 时间补偿
+      3. numpy.interp 绝对时间插值对齐到基准网格
+      4. 图例只显示备注名，Y 轴带物理单位
+      5. 成对对比指标仪表盘 (MaxErr/MAE/RMSE/Pearson)
+
+    【辅助功能】
+    - 对比方案持久化: 保存/读取/删除 (JSON 在 config/)
+    - 暗号缓存 (annotation_cache.json)
+    - 全屏查看
+
+4.4 ui/ai_diagnosis.py — AI 诊断 Tab
+─────────────────────────────────────
+  文件大小: 61KB
+
+  ┌ AiDiagnosisWidget(QWidget) — AI 诊断界面
+    40:60 左右分割布局
+
+    【特性】
+    - 模型选择: 在线/本地/Ollama 切换
+    - 流式推理显示
+    - 多智能体诊断 (调用 multi_agent.py)
+    - Zen 全屏沉浸模式
+    - 项目文件 / 需求文件选择
+
+4.5 ui/cleaning_tab.py — 数据清洗配置 Tab
+─────────────────────────────────────
+  文件大小: 4.7KB
+
+  ┌ CleaningTabWidget(QWidget)
+    【信号】apply_cleaning_requested(dict)
+    - 相邻差值检测 (可配置阈值)
+    - NaN 检测
+    - 填充方式: 线性/均值/前向/后向/自定义值
+
+4.6 ui/clipper_tab.py — 网络剪藏 Tab
+─────────────────────────────────────
+  文件大小: 18KB
+
+  ┌ WebClipperWidget(QWidget)
+    【信号】cookie_changed(str), wiki_page_saved()
+    - URL 输入 + 黏贴按钮
+    - 平台自动检测 (微信/B站/YouTube/学术期刊)
+    - Cookie 认证 (隐藏式, 需要时展开)
+    - 抓取 → 预览 → 保存到 Wiki
+
+4.7 ui/components.py — UI 组件工厂
+─────────────────────────────────────
+  文件大小: 10KB
+
+  纯函数式 UI 工厂, 无类定义:
+  ┌ create_button() — 5 种变体 (primary/secondary/danger/success/link)
+  ┌ create_label(), create_labeled_input(), create_labeled_spinbox()
+  ┌ create_form_group(), create_group_box(), create_card()
+  ┌ create_horizontal_section(), create_separator()
+
+4.8 ui/data_tab.py — 数据文件 Tab
+─────────────────────────────────────
+  文件大小: 4.4KB
+
+  ┌ DataTabWidget(QWidget)
+    【信号】open/clear/sample/save/save_template/data_cell_edited
+    - update_data_frame() — QTableWidget ← DataFrame
+    - 内联编辑 → data_cell_edited 信号
+
+4.9 ui/global_parameter_dialog.py — 全局参数对话框
+─────────────────────────────────────
+  文件大小: 13.8KB
+
+  ┌ GlobalParameterDialog(QDialog)
+    【信号】param_updated(name, dict), param_deleted(name)
+    - 参数表: 4 列 (名称/值/单位/描述)
+    - 名称校验: Python 关键字/非法标识符拒绝
+    - 脏标记追踪
+
+4.10 ui/project_tab.py — 项目管理 Tab
+─────────────────────────────────────
+  文件大小: 15KB
+
+  ┌ ProjectManagerWidget(QWidget)
+    - 左右双面板: 项目列表 + 文件树
+    - CRUD: 新建/删除项目, 添加/删除文件/文件夹
+    - QSettings 持久化
+
+4.11 ui/report_ppt.py — PPT 报告子页
+─────────────────────────────────────
+  文件大小: 20KB
+
+  ┌ PptReportWidget(QWidget)
+    - 报告配置 (标题/需求文件/模板/项目文件)
+    - AI 生成控制 + 结果展示
+    - 40:60 布局, 与 report_word.py 镜像结构
+
+4.12 ui/report_word.py — Word 报告子页
+─────────────────────────────────────
+  文件大小: 21KB
+
+  ┌ WordReportWidget(QWidget)
+    - 结构同 report_ppt.py, 变量前缀 word_ 不同
+
+4.13 ui/report_workbench.py — 报告工作台
+─────────────────────────────────────
+  文件大小: 13.8KB
+
+  ┌ ReportWorkbenchWidget(QWidget)
+    - 纯 UI 组件, 零业务逻辑
+    - 信号: outline_requested, full_report_requested, report_saved
+    - Word/PPT 切换 + 大纲编辑器
+
+4.14 ui/sensor_tab.py — 传感器配置 Tab
+─────────────────────────────────────
+  文件大小: 10.8KB
+
+  ┌ SensorTabWidget(QWidget)
+    【信号】fbg_add/edit/delete, sensor_add/edit/delete/copy
+            calculate_requested, save/export_sensor
+    - 左侧 FBG 表: ID/波长列/波长上下限
+    - 右侧 Sensor 表: ID/位置/类型/公式/常量/启用
+    - 参考行选择器 / 计算结果预览 / 格式选择保存
+
+4.15 ui/skill_tab.py — 技能插件中心 Tab
+─────────────────────────────────────
+  文件大小: 10KB
+
+  ┌ AgentSkillWidget(QWidget)
+    - 10 个内置技能表 (Python_REPL/Arxiv/搜索/Wiki CRUD 等)
+    - GitHub 技能加载 (owner/repo/path/branch)
+    - Agent 思考日志 (深色主题控制台)
+
+4.16 ui/wiki_tab.py — 知识库管理 Tab
+─────────────────────────────────────
+  文件大小: 35KB
+
+  ┌ WikiTabWidget(QWidget)
+    - Wiki 页面浏览/编辑/搜索/上传
+    - 全屏沉浸阅读模式 (QStackedWidget 切换)
+    - 文件上传 / Markdown 渲染
+
+
+================================================================================
+五、工具层 (utils/)
+================================================================================
+
+5.1 utils/file_parser.py — 文件解析器
+─────────────────────────────────────
+  文件大小: 8KB | 纯函数, 无 UI 依赖
+
+  ┌ detect_format(path, encoding, skip_rows) → (delimiter, skip_rows)
+    - 前 50KB 样本检测分隔符和数据起始行
+    - csv.Sniffer 优先, 手工检测兜底
+
+  ┌ detect_header(path, delimiter, skip_rows, encoding) → 0 or None
+    - 判断跳过后首行为表头还是数据
+
+  ┌ try_read_csv(path, delimiter, skip_rows, encoding, header) → (df, delim)
+    - 自动检测分隔符, 多编码尝试 (utf-8 → gbk → latin-1)
+    - header: None(无表头)/0(第一行)/'infer'(自动)/'detect'(智能)
+
+  ┌ parse_file(path, template) → df
+    - 模板驱动解析, 支持 CSV/TXT/XLSX/ENLIGHT 格式
+    - ENLIGHT: 扫描 'Timestamp' + '# CH' 定位表头行
+    - 自动将数值列 pd.to_numeric(errors='coerce')
+
+5.2 utils/data_cleaning.py — 数据清洗
+─────────────────────────────────────
+  文件大小: 3.7KB | 纯函数, 无 UI 依赖
+
+  ┌ detect_anomalies(df, rules) → df (含 _anomaly 标记列)
+    规则: adjacent_diff(相邻差值)/nan/range/negative/zero
+  ┌ fill_missing(df, rules) → df
+    方法: linear/mean/forward/backward/custom
+  ┌ clean_data(df, rules) → df
+    完整流程: 异常检测 → 缺失值填充
+  - 可选 column_pattern 正则过滤器
+
+
+================================================================================
+六、配置文件与状态管理
+================================================================================
+
+6.1 配置文件
+────────────
+  ai_models_config.json     — AI API 密钥和端点配置
+  ai_presets.json           — AI 诊断预设
+  custom_templates.json     — 用户自定义数据模板
+  style.qss                 — Qt 样式表
+  .app_settings.json        — 应用设置 (最近文件等)
+  config/annotation_cache.json    — 暗号标注缓存
+  config/comparison_profiles.json — 对比方案配置
+  templates/ppt_requirements_default.json — PPT 需求默认模板
+  templates/word_requirements_default.json — Word 需求默认模板
+  state/app_state.py        — 程序状态 SSOT 数据类
+
+6.2 AppState (state/app_state.py)
+─────────────────────────────────
+  使用不可变 dataclass + replace() 更新
+  ┌ DataTabState: 文件路径/模板/列
+  ┌ CleaningTabState: 差值阈值/填充方法
+  ┌ AnalysisTabState: 数据源/范围/传感器结果
+  - to_dict() / from_dict() JSON 序列化
+
+
+================================================================================
+七、数据流全景
+================================================================================
+
+【典型光纤光栅数据处理流程】
+
+  1. 用户选择文件 → open_file()
+  2. DataTemplate 识别文件格式 → parse_file() → current_data
+  3. _auto_populate_fbgs() — 从列名提取 W\d+ 自动创建 FBG
+  4. _insert_annotation_row_if_timestamp_exists() — 插入暗号标注行
+  5. 用户在传感器 Tab 配置 Sensor (公式/常量/类型)
+  6. calculate_sensors() → SensorSystem.calculate(df) → sensor_results
+     ├─ W_PATTERN 正则匹配列 → 计算 Δλ
+     ├─ 对每个活跃 Sensor 执行公式求值
+     └─ 返回 {sensor_id: [物理量值序列]}
+  7. analysis_tab.run_analysis()
+     ├─ 光纤+物理量: 从 sensor_results 读取
+     ├─ 光纤+原始: 固化波长差
+     └─ 其它数据: 暗号列直读
+  8. _update_chart_multi_sensors() 渲染图表
+  9. _compare_curves() 双曲线对比分析
+  10. 可选: 多源对比 Tab 跨文件对比
+
+【AI 诊断流程】
+  1. 用户选择模型 (在线/本地/Ollama)
+  2. 选择项目文件 + 需求文件
+  3. run_multi_agent() → LangGraph 三智能体流水线
+     Data Scientist → Data Auditor(最多3轮) → Chief Scientist
+  4. 生成结构化诊断报告 (JSON)
+
+【报告生成流程】
+  1. 用户选择报告类型 (Word/PPT) + 模板
+  2. generate_outline() → LLM 输出大纲
+  3. expand_section() → LLM 逐章展开
+  4. WordBuilder/PPTBuilder → .docx/.pptx
+
+
+================================================================================
+八、关键技术方案
+================================================================================
+
+8.1 暗号标注系统
+─────────────────
+  在 DataFrame 首行插入标注行，用户用引号标记列角色:
+  - '时间戳' — 标记时间列
+  - 'w1-应变-梁底' — 标记数据列 (w{N}-类型-位置格式)
+  解析: _parse_annotations() → data_cols + time_col + annotated_name_map
+  隔离: 图表/统计/对比都通过 annotated_name 而非原始列名访问
+
+8.2 数据流防火墙
+─────────────────
+  _is_fiber_data 双重判定:
+  1. 列名含 FBG/ENLIG/光纤传感/W\d+
+  2. 当前模板名含"光纤"/"ENLIGHT"
+  非光纤数据: 锁定"物理量"下拉框并禁用
+  光纤+原始: 波长差固化路径
+  光纤+物理量: sensor_results 路径
+
+8.3 "卸妆"清洗
+───────────────
+  列名可能含 "A1_应变(με)" 等 UI 展示后缀
+  使用正则 re.sub(r'[\(（].*?[\)）]', '', name) 剥离
+  get_best_match_column() — 双向去括号模糊匹配
+
+8.4 X 轴防重叠方案
+───────────────────
+  不传递时间字符串给 ax.plot()
+  改用 range(len(x)) 纯数值索引
+  set_xticks + set_xticklabels 实现完整刻度控制
+  np.linspace(0, N-1, 10) 精确定位 10 个刻度
+  set_xlim(0, N-1) 消除 matplotlib 5% margin
+
+8.5 下拉框-图例同步
+───────────────────
+  addItem(display_name, userData=raw_key)
+  currentData() 读取原始 key 用于数据提取
+  _to_display_name(): 先 _get_annotation_name() → 再剥离 w{N}- 前缀
+
+8.6 Pandas 严格类型安全
+───────────────────────
+  禁止切片就地赋值 (lossy item setitem)
+  全局类型提升: df = df.astype(object)
+  "乐高式"拼接: pd.concat([top, new_row, bottom])
+
+8.7 公式安全求值
+───────────────────────
+  eval(expr, {"__builtins__": {}}, local_vars)
+  正则单词边界替换常量 (避免 k1 误匹配 k10)
+  全局参数打底, 局部常量覆盖
+  NaN/None 转为 float('nan') 确保 eval 不崩溃
+
+8.8 多源时间对齐
+───────────────────────
+  numpy.interp 绝对时间插值
+  基准网格: 公共时间列 → Unix 时间戳
+  全局交集截断: max(各文件起始) ~ min(各文件结束)
+  窗口首点归零消除静态偏置
+
+================================================================================
+【文件清单】
+================================================================================
+
+根目录:
+  main.py                     — 主窗口 (~140KB, ~8600 行)
+  style.qss                   — Qt 样式表
+  requirements.txt            — Python 依赖
+  CLAUDE.md                   — Claude Code 工程约束
+  ai_models_config.json       — AI 模型配置
+  ai_presets.json             — AI 预设
+  custom_templates.json       — 自定义模板
+
+core/  (5 文件)
+  models.py                   — 核心数据模型
+  ai_client.py                — AI 客户端单例
+  report_engine.py            — AI 报告引擎
+  report_models.py            — 报告数据契约
+  tools/chart_tool.py         — AI 图表工具
+
+py/  (17 文件)
+  analyzer.py / cleaner.py / formula.py
+  template.py / processor.py / report.py
+  multi_agent.py / agent_graph.py
+  agent_skill_hub.py / agent_worker.py
+  online_llm_thread.py / local_llm_manager.py
+  llama_generate_thread.py / ollama_client.py
+  github_skill_loader.py / web_clipper.py / wiki_system.py
+  report_builder/ (6 文件: flow_controller, word_builder,
+                   ppt_builder, template_engine, models)
+
+ui/  (16 文件)
+  analysis_tab.py / compare_tab.py / ai_diagnosis.py
+  cleaning_tab.py / clipper_tab.py / components.py
+  data_tab.py / global_parameter_dialog.py
+  project_tab.py / report_ppt.py / report_word.py
+  report_workbench.py / sensor_tab.py
+  skill_tab.py / wiki_tab.py
+
+utils/  (2 文件)
+  file_parser.py / data_cleaning.py
+
+state/  (1 文件)
+  app_state.py
+
+================================================================================
+【文档结束】
+================================================================================
