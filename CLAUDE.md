@@ -27,6 +27,10 @@
 - 改任何函数签名/返回值/参数/行为前，**必须**先用 codegraph_callers 确认所有调用点。
 - **禁止只改定义不查引用**。
 
+**6. Pyright 零红线提交（硬纪律）**
+- 任何 `.py` 文件编辑后、提交前，**必须**跑 `pyright <changed_files>`，红错全清才能 commit。
+- 若 pre-commit hook 已启用，`git commit` 会自动 enforce 这条。
+
 ---
 
 ## 🏗 项目拓扑与架构
@@ -80,4 +84,5 @@
 python main.py              # 运行主程序
 python test_run.py          # 快速启动测试（仅测试 UI 加载是否崩溃）
 python -c "import py_compile; py_compile.compile('main.py', doraise=True)" # 快速语法树静态检查
+pyright <changed_files>                                   # 类型检查（提交前必须零红线）
 python run_tests.py                                       # 运行所有测试 (公式引擎 + 标定引擎)
