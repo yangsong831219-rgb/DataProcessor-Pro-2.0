@@ -22,6 +22,11 @@
   - **光纤数据 (`is_fiber_data`):** 基于波长差，依赖 `SensorSystem.calculate()` 计算，允许用户在“原始数据”和“物理量”之间自由切换。
   - **通用/其它数据 (TXT/CSV):** 属于外部已算好的数据。**必须**将下拉框锁死在“物理量”并禁用，直接绕过计算逻辑，强制读取带有用户暗号的 `annotated_cols`。
 
+
+**5. 修改前必查 CodeGraph callers（硬纪律）**
+- 改任何函数签名/返回值/参数/行为前，**必须**先用 codegraph_callers 确认所有调用点。
+- **禁止只改定义不查引用**。
+
 ---
 
 ## 🏗 项目拓扑与架构
@@ -38,7 +43,16 @@
 
 ## 🧠 代理行为准则（AI 工作流规范）
 
-1. **优先使用 LSP/符号搜索:** 不要依赖盲目的纯文本 `grep` 匹配。如果你需要查找 `current_plot_df` 或 `sensor_results` 在哪里被实例化，请优先使用语言服务器（LSP）能力进行精准的语义符号搜索。
+1. **优先使用 CodeGraph 符号搜索（硬纪律）:** 
+   - **禁止**盲目的纯文本 `grep` 匹配。每次查符号、找挂载点、定位函数定义/调用关系的**第一步必须是 `codegraph_context`**，它在一个调用中组合了 search + node + callers + callees。
+   - `codegraph_search` → 按名称找符号位置。
+   - `codegraph_context` → 查"某功能/某区域怎么工作"的首选工具（取代多轮 grep + Read 循环）。
+   - `codegraph_trace` → "X 怎么到达 Y"的完整调用路径。
+   - `codegraph_callers` / `codegraph_callees` → 查谁调用了它 / 它调用了谁。
+   - `codegraph_impact` → 改一个符号前评估影响半径。
+   - `codegraph_explore` → 批量查看多个相关符号的源码（取代多个 Read 调用）。
+   - 只有在 CodeGraph 无法覆盖（如索引尚未就绪的 .txt / .md / .json 文件）时才降级到 Grep/Read。
+   - **修改前必查 callers**：改任何函数的签名或行为前，必须用 `codegraph_callers` 确认所有调用点。
 2. **派生子代理（Sub-agent）探路:** 在调试复杂的 Pandas 索引对齐或切片 Bug 时，不要直接在主会话里盲改 `main.py`。请先派生一个子代理（Sub-agent）写个独立的测试脚本，摸清底层的 `.index` 行为后，再在主会话中给出最终代码。
 3. **公式求值统一走 `py/formula.py` 的 asteval 引擎:** 所有公式求值必须通过 `py.formula.calculate()`（基于 `asteval.Interpreter` 安全向量化求值），**禁止再用 `eval` 或字符串替换**。参数与列变量均作为 symtable 注入，彻底消除 k1/k10 误匹配风险。
 
