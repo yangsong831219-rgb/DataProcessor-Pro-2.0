@@ -30,3 +30,6 @@ screenshot_temp.png
 # OS files
 Thumbs.db
 .DS_Store
+calibration_profiles/
+grid_test*.png
+test_api_speed.py

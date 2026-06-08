@@ -56,6 +56,7 @@ from ui.wiki_tab import WikiTabWidget
 from ui.clipper_tab import WebClipperWidget
 from ui.skill_tab import AgentSkillWidget
 from ui.compare_tab import CompareTabWidget
+from ui.calibration_tab import CalibrationTabWidget
 
 # ============ Report Generation ============
 from core.report_engine import generate_outline, generate_structured_report
@@ -253,6 +254,10 @@ class DataProcessorWindow(QMainWindow):
         # Compare tab (多源数据对比)
         self.compare_tab_widget = CompareTabWidget()
         self.central_widget.addTab(self.compare_tab_widget, '多源对比')
+
+        # Calibration tab (传感器标定)
+        self.calibration_tab_widget = CalibrationTabWidget()
+        self.central_widget.addTab(self.calibration_tab_widget, '传感器标定')
 
         # Report tab
         self.report_tab = QWidget()
@@ -2736,9 +2741,7 @@ class SensorEditDialog(QDialog):
         self.type_combo = QComboBox()
         self.type_combo.addItems([
             'strain: 应变',
-            'strain_cal: 应变标定',
             'temperature: 温度',
-            'temp_cal: 温度标定',
             'displacement: 位移',
             'inclination: 倾角',
             'pressure: 压力',

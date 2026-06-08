@@ -4,9 +4,10 @@
 
 ## ⚠️ 关键工程纪律（绝对最高优先级）
 
-**1. Pandas 2.0+ 严格类型安全（禁止 LossySetitem）**
+**1. Pandas 2.0+ 严格类型安全**
 - **严禁**使用切片就地赋值（in-place slice assignment）将对象（object）或字符串直接插入到底层为 float64 的 DataFrame 块中（例如：绝对禁止写 `part[:] = part.astype(object)`）。
-- **必须**使用全局类型提升后进行“乐高式”拼接的安全写法：`df = df.astype(object)` -> `pd.concat([top, new_row, bottom])`。
+- **必须**使用全局类型提升后进行”乐高式”拼接的安全写法：`df = df.astype(object)` -> `pd.concat([top, new_row, bottom])`。
+- **禁止对 DataFrame/Series 直接做布尔判断**：`if df` / `if not df` / `if series` 都触发 `ValueError`（多元素歧义）。判空用 `df is None` 或 `df.empty`；判非空用 `df is not None and not df.empty`。
 
 **2. PyQt6 状态与窗口层级穿透**
 - **严禁**使用 `self.parent()` 来获取全局或跨标签页的变量（如 `sensor_results`），因为这在 `QTabWidget` 的嵌套结构中会导致指针断裂，拿不到主窗口数据。
@@ -26,7 +27,10 @@
 ## 🏗 项目拓扑与架构
 
 - **巨石架构警告:** 前端 UI 集中在庞大的单文件（`main.py`，约 8800 行）中。当你使用 `edit_file` 工具时，**必须**提供极其明确的上下文特征字符串，以防止灾难性的全局搜索替换错误。
-- **后端引擎 (`py/`):** 信号处理 (`analyzer.py`)、数学公式解析 (`formula.py`)、Word/PPT 报告引擎 (`report_builder/`)，以及 LangGraph 多智能体审查系统 (`multi_agent.py`)。
+- **后端引擎 (`py/`):** 信号处理 (`analyzer.py`)、数学公式解析 (`formula.py`)，Word/PPT 报告引擎 (`report_builder/`)、LangGraph 多智能体审查系统 (`multi_agent.py`)。
+- **标定引擎 (`py/calibration/`):** 温度标定 (平台检测 + KMeans 映射 + 灵敏度回归 + 解耦诊断)、应变标定 (手填表驱动 + 灵敏度/线性度/重复性/迟滞/双栅分析)、Excel 导出。
+- **标定 UI (`ui/calibration_tab.py`):** 温度标定子页 (文件加载/列角色指派/设定温度/诊断图/Word报告) + 应变标定子页 (动态填表/自动计算/指标图表/系数闭环)。
+- **标定图表工具 (`core/tools/calibration_chart_tool.py`):** 封装标定图表渲染函数 (回归图/诊断四联图/应变曲线/指标柱状图)，供报告引擎调用。
 - **核心数据流向:** `文件解析 -> _auto_populate_fbgs (正则提取 FBG_) -> SensorSystem.calculate (公式计算) -> 异常清洗/FFT分析 -> 导出报告`。
 - **机密隔离:** `ai_models_config.json` 文件内含有敏感的 API 密钥。**严禁**在对话中打印其内容或将其提交入库（commit）。
 
@@ -36,9 +40,25 @@
 
 1. **优先使用 LSP/符号搜索:** 不要依赖盲目的纯文本 `grep` 匹配。如果你需要查找 `current_plot_df` 或 `sensor_results` 在哪里被实例化，请优先使用语言服务器（LSP）能力进行精准的语义符号搜索。
 2. **派生子代理（Sub-agent）探路:** 在调试复杂的 Pandas 索引对齐或切片 Bug 时，不要直接在主会话里盲改 `main.py`。请先派生一个子代理（Sub-agent）写个独立的测试脚本，摸清底层的 `.index` 行为后，再在主会话中给出最终代码。
-3. **正则优于 `.replace`:** 在解析和计算传感器公式（如 `k1 * W1`）时，**必须**使用带有单词边界的正则表达式（`\b`）来安全替换常数，严禁使用脆弱的纯字符串 `.replace`（防止将 `k10` 误替换为 `k1`）。
+3. **公式求值统一走 `py/formula.py` 的 asteval 引擎:** 所有公式求值必须通过 `py.formula.calculate()`（基于 `asteval.Interpreter` 安全向量化求值），**禁止再用 `eval` 或字符串替换**。参数与列变量均作为 symtable 注入，彻底消除 k1/k10 误匹配风险。
 
 ---
+
+## 🔧 标定模块约定 (v2.1 新增)
+
+1. **标定系数闭环仅限当前会话:** 通过「应用标定系数到当前传感器」按钮注入的实测 k 系数，**仅写入当前 `sensor_system` 实例的 `Sensor.constants`**（会话级）。**严禁**写回全局 `Sensor.TYPE_PARAMS` 或持久化为默认值。
+2. **标定模块不得改动暗号标注机制:** 标定模块有自己独立的列角色指派 UI（`col_table`），**绝不插入标注行**（annotation row），**不复用** `analysis_tab` 的 `_annotated_cols` 解析逻辑。
+3. **温度标定独立加载文件:** 温度标定子页加载的连续波长文件**不写入**主窗口的 `current_data`，在独立的 DataFrame 中完成全流程。
+4. **解耦矩阵与 `core/models.py` 公式一致:** `py/calibration/temperature_calibration.decouple()` 的 2×2 矩阵求逆公式与 `SensorSystem._evaluate_decoupling()` **逐元素等价**。
+5. **对话框状态对称恢复:** 任何对话框 `close/accept()` 时写入主 Tab 状态 dict 的数据，**必须在 `__init__` 末尾完整 restore 到 UI**（含表格内容、表格样式、单元格背景色、状态条文本）。禁止只存不取或只取部分。Phase A/B 必须同构——修一边必须同时检查另一边。
+6. **对称 Phase 改动同步:** 凡涉及"Phase A 和 Phase B 对称功能"的改动（状态恢复、对话框形态、暗号显示、结果渲染），**写完一边立即 LSP grep 对偶位置检查另一边是否有相同路径**。禁止"Phase A 修了但 Phase B 漏了"的反复 bug。
+7. **新对话框/流程必须配 smoke test:** 每加一个对话框或完整流程，**必须**配一个 happy-path roundtrip smoke test（构造完整状态→执行→assert no exception）。比单元测试便宜但拦截 80% 的回归。参照 `tests/test_phase_b_dialog.py::test_full_temp_calibration_roundtrip_smoke`。
+8. **对话框写回必须覆盖全部关闭路径:** 任何对话框的状态写回必须在 `accept()` + `reject()` 双覆写中触发（或 `closeEvent` 统一拦截）。**禁止只绑到单一按钮的 click handler**。Qt 的四条关闭路径（确定按钮 / Esc / X / Alt+F4）必须全部触发写回。每个对话框配 3 条 close-path 回归测试 (accept / reject Esc / reject X)。参照 `tests/test_phase_a_dialog.py::TestPhaseAWriteback`。
+
+## 🚧 已知待办 (v2.1 未完成)
+
+- **main.py 整体拆分**: 目前约 8600 行，仍是巨石架构。本次更新仅以标定模块为样板做了局部控制器抽离（`ui/calibration_tab.py`），整体拆分仍是待办。
+- **test_run.py**: 需要 GUI 环境才能运行，无头环境（CI）下会崩溃。
 
 ## 🚀 常用开发命令
 
@@ -46,3 +66,4 @@
 python main.py              # 运行主程序
 python test_run.py          # 快速启动测试（仅测试 UI 加载是否崩溃）
 python -c "import py_compile; py_compile.compile('main.py', doraise=True)" # 快速语法树静态检查
+python run_tests.py                                       # 运行所有测试 (公式引擎 + 标定引擎)

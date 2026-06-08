@@ -21,7 +21,7 @@ import pandas as pd
 
 SensorType = Literal[
     'strain', 'temperature', 'displacement', 'inclination',
-    'pressure', 'decoupling', 'strain_cal', 'temp_cal',
+    'pressure', 'decoupling',
 ]
 
 CleaningRuleType = Literal['adjacent_diff', 'nan', 'range', 'negative', 'zero']
@@ -208,8 +208,6 @@ class Sensor:
         'inclination':      {'name': '倾角',   'unit': '°',       'need_temp_compensation': False},
         'pressure':         {'name': '压力',   'unit': 'MPa',     'need_temp_compensation': False},
         'decoupling':       {'name': '双参量解耦', 'unit': 'με / °C', 'need_temp_compensation': False},
-        'strain_cal':       {'name': '应变标定', 'unit': 'με',    'need_temp_compensation': False},
-        'temp_cal':         {'name': '温度标定', 'unit': '°C',    'need_temp_compensation': False},
     }
 
     def get_unit(self) -> str:
@@ -399,51 +397,43 @@ class SensorSystem:
         n_rows: int,
         global_params: Optional[Dict[str, Any]] = None,
     ) -> List[Optional[float]]:
-        """计算公式: "W1 * k1" → 将 W1 替换为波长差值, k1 替换为常量
+        """计算公式: "W1 * k1" → asteval 向量化求值
 
         常量合并策略: 全局参数打底，局部常量覆盖 (局部优先)。
-        使用正则单词边界替换，避免 k1 误匹配 k10。
-        NaN 安全：eval 前将 None 转为 float('nan')。
+        使用 asteval.Interpreter (minimal 模式) 安全求值，
+        参数与列变量均作为 symtable 注入，彻底消除正则替换 k1/k10 误匹配风险。
         """
-        expr = formula
+        from py.formula import calculate as _engine_calculate
+
         # 合并: 全局参数打底，局部常量覆盖
         merged: Dict[str, Any] = {}
         if global_params:
             merged.update(global_params)
         merged.update(constants or {})
+
+        # 归一化常量
+        normalized: Dict[str, float] = {}
         for name, value in merged.items():
             if isinstance(value, dict):
-                value = value.get('value', 0)
-            expr = re.sub(r'\b' + re.escape(name) + r'\b', f'({value})', expr)
+                normalized[name] = float(value.get('value', 0))
+            elif isinstance(value, (int, float)):
+                normalized[name] = float(value)
 
-        # 检查未定义常量
-        unresolved_k = re.findall(r'\b[kK]\d+\b', expr)
-        if unresolved_k:
-            print(
-                f"警告: 公式中常量 {unresolved_k} 未定义，默认按 1.0 计算。"
-                f"请在传感器配置中添加常量。"
-            )
-            for k_var in set(unresolved_k):
-                expr = re.sub(r'\b' + re.escape(k_var) + r'\b', '(1.0)', expr)
+        # 转换 fbg_delta 为纯数值数组（None → NaN 用于向量化运算）
+        columns: Dict[str, np.ndarray] = {}
+        for fbg_id, delta in fbg_delta.items():
+            arr = np.array([
+                np.nan if v is None else float(v)
+                for v in delta
+            ], dtype=np.float64)
+            columns[fbg_id] = arr
 
-        result: List[Optional[float]] = []
-        for i in range(n_rows):
-            row_vars: Dict[str, float] = {}
-            for fbg_id, delta in fbg_delta.items():
-                v = delta[i] if i < len(delta) else None
-                row_vars[fbg_id] = float('nan') if v is None else float(v)
-
-            try:
-                val = eval(expr, {"__builtins__": {}}, row_vars)
-                if val is None or (isinstance(val, float) and (val != val or abs(val) == float('inf'))):
-                    result.append(None)
-                else:
-                    result.append(val)
-            except Exception as e:
-                print(f"行 {i} 计算失败: {expr} -> {e}")
-                result.append(None)
-
-        return result
+        return _engine_calculate(
+            formula=formula,
+            columns=columns,
+            params=normalized,
+            global_params=None,  # already merged
+        )
 
     def _evaluate_decoupling(
         self,

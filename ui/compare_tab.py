@@ -492,55 +492,14 @@ class CompareTabWidget(QWidget):
 
     @staticmethod
     def _parse_enlight_like(path: str) -> pd.DataFrame | None:
-        """Scan raw file lines for a tab-delimited data section (ENLIGHT-style)."""
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            raw_lines = f.readlines()
-
-        def first_field_is_timestamp(line: str) -> bool:
-            fields = line.strip().split('\t')
-            if not fields:
-                return False
-            first = fields[0].strip()
-            if re.match(r'^\d{2,4}[-/\.]\d{1,2}[-/\.]\d{1,2}', first):
-                if not re.search(r'[a-zA-Z一-鿿]', first):
-                    return True
-            return False
-
-        data_start_line = None
-        for i in range(min(len(raw_lines), 1000) - 2):
-            if all(first_field_is_timestamp(raw_lines[i + offset]) for offset in (0, 1, 2)):
-                data_start_line = i
-                break
-
-        if data_start_line is None or data_start_line < 1:
+        """薄壳委托 — 调用统一的 ENLIGHT/Hyperion 解析器"""
+        try:
+            from utils.file_parser import parse_enlight_file
+            df, _annotation, _meta = parse_enlight_file(path)
+            return df if df is not None and not df.empty else None
+        except Exception:
+            # 兼容旧行为: 解析失败返回 None 不抛异常
             return None
-
-        header_line_idx = data_start_line - 1
-        header_line = raw_lines[header_line_idx].strip()
-        headers = [h.strip() for h in header_line.split('\t') if h.strip()]
-
-        if len(headers) < 2:
-            return None
-
-        data_rows = []
-        for line in raw_lines[data_start_line:]:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            fields = stripped.split('\t')
-            if len(fields) == len(headers):
-                data_rows.append(fields)
-
-        if not data_rows:
-            return None
-
-        df = pd.DataFrame(data_rows, columns=headers)
-        for col in df.columns:
-            try:
-                df[col] = pd.to_numeric(df[col])
-            except (ValueError, TypeError):
-                pass
-        return df
 
     # ──────────────────────────────────────
     #  Annotation row management
