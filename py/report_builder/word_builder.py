@@ -1,3 +1,5 @@
+# pyright: reportGeneralTypeIssues=false
+# python-docx stub: Document() 被误识为函数签名而非类构造器，运行时正确
 """Word document builder — 消费 WordReport JSON，渲染 .docx。
 
 只读取结构化数据，严禁在此文件中调用任何 LLM。

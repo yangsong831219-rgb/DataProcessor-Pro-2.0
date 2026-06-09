@@ -199,11 +199,8 @@ def parse_file(file_path: str, template: Any) -> pd.DataFrame:
         df, _annotation, _meta = parse_enlight_file(file_path)
         return df
 
-    if hasattr(template, 'columns') and template.columns:
-        df.columns = [col['name'] for col in template.columns]
-
-    df.columns = df.columns.astype(str)
-    return df
+    else:
+        raise ValueError(f"不支持的文件格式: {template.file_format}")
 
 
 # ═══════════════════════════════════════════════════════════════════════

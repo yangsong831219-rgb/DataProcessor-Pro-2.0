@@ -481,7 +481,7 @@ class AnalysisTabWidget(QWidget):
         else:
             # 非光纤数据 或 光纤物理量模式：从 Sensor.TYPE_PARAMS 获取干净单位
             col_alias = data_cols[0] if data_cols else ''
-            name_to_clean_unit = {p['name']: p['unit'] for p in Sensor.TYPE_PARAMS.values()}
+            name_to_clean_unit = {p.get('name', ''): p.get('unit', '') for p in Sensor.TYPE_PARAMS.values()}
             core_name = self._extract_core_name(str(col_alias))
             clean_unit = name_to_clean_unit.get(core_name, '')
             y_label = f'{core_name} ({clean_unit})' if clean_unit else core_name

@@ -396,7 +396,12 @@ def _make_nodes(llm: BaseChatModel, data_context: dict | None = None):
         return {
             "messages": [response],
             "task_status": "data_processing",
-            "data_scientist_report": response.content,
+            "data_scientist_report": str(response.content),
+            "current_csv_path": state.get("current_csv_path", ""),
+            "execution_logs": state.get("execution_logs", []),
+            "audit_result": state.get("audit_result"),
+            "chief_scientist_report": state.get("chief_scientist_report"),
+            "rejection_count": state.get("rejection_count", 0),
         }
 
     def auditor_node(state: MultiAgentState) -> MultiAgentState:
@@ -423,6 +428,10 @@ def _make_nodes(llm: BaseChatModel, data_context: dict | None = None):
             "task_status": "auditing",
             "audit_result": "approved" if is_approved else "rejected",
             "rejection_count": state.get("rejection_count", 0) + (0 if is_approved else 1),
+            "current_csv_path": state.get("current_csv_path", ""),
+            "execution_logs": state.get("execution_logs", []),
+            "data_scientist_report": state.get("data_scientist_report"),
+            "chief_scientist_report": state.get("chief_scientist_report"),
         }
 
     def chief_scientist_node(state: MultiAgentState) -> MultiAgentState:
@@ -447,7 +456,12 @@ def _make_nodes(llm: BaseChatModel, data_context: dict | None = None):
         return {
             "messages": [response],
             "task_status": "diagnosis",
-            "chief_scientist_report": response.content,
+            "chief_scientist_report": str(response.content),
+            "current_csv_path": state.get("current_csv_path", ""),
+            "execution_logs": state.get("execution_logs", []),
+            "audit_result": state.get("audit_result"),
+            "data_scientist_report": state.get("data_scientist_report"),
+            "rejection_count": state.get("rejection_count", 0),
         }
 
     return data_scientist_node, auditor_node, chief_scientist_node

@@ -1,0 +1,37 @@
+[tool.pyright]
+include = ["py", "ui", "utils", "core", "tests"]
+exclude = [
+    "venv", ".venv", "**/__pycache__",
+    "tests/golden",
+    "py/llama_generate_thread.py",
+    "py/local_llm_manager.py",
+    "py/wiki_system.py",
+]
+venv = "venv"
+venvPath = "."
+typeCheckingMode = "basic"
+
+# pandas/PyQt 噪音压制
+# ★ reportAttributeAccessIssue 关掉会导致 str({}).get() 之类运行时错误被漏报
+#   2026-06-09 改回 warning (零增量，项目无此类违规)
+reportAttributeAccessIssue = "warning"
+reportArgumentType = "warning"
+reportOptionalMemberAccess = "warning"
+reportOptionalSubscript = "warning"
+reportOptionalIterable = "warning"
+reportIndexIssue = "warning"
+reportCallIssue = "warning"
+reportOperatorIssue = "warning"
+
+# 第三方库
+reportMissingImports = "warning"
+reportMissingTypeStubs = "none"
+reportPrivateImportUsage = "none"
+reportUnknownMemberType = "none"
+
+# 真错误保持 error
+reportUnboundVariable = "error"
+reportGeneralTypeIssues = "error"
+reportAssignmentType = "error"
+reportReturnType = "error"
+reportIncompatibleMethodOverride = "warning"

@@ -139,7 +139,11 @@ class DeepSeekAgentWorker(QThread):
             new_messages = state["messages"] + [
                 HumanMessage(content=f"工具执行完成，结果: {execution_logs[-1] if execution_logs else '无'}")
             ]
-            return {"messages": new_messages, "execution_logs": execution_logs}
+            return {
+                "messages": new_messages,
+                "execution_logs": execution_logs,
+                "current_csv_path": state.get("current_csv_path", ""),
+            }
 
         workflow = StateGraph(AgentState)
         workflow.add_node("llm_brain", lambda state: state)

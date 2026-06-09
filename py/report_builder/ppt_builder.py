@@ -1,3 +1,5 @@
+# pyright: reportGeneralTypeIssues=false
+# python-pptx stub: Presentation() 被误识为函数签名而非类构造器，运行时正确
 """PowerPoint builder — 消费 PPTReport JSON，渲染 .pptx。
 
 空间极简原则：每页 ≤4 bullet points，具体数据放入 Speaker Notes。

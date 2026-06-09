@@ -224,7 +224,11 @@ def call_deepseek_node(state: AgentState, llm=None) -> AgentState:
     tool_node = ToolNode(TOOLS)
 
     response = llm.invoke(state["messages"])
-    return {"messages": [response]}
+    return {
+        "messages": [response],
+        "current_csv_path": state.get("current_csv_path", ""),
+        "execution_logs": state.get("execution_logs", []),
+    }
 
 
 def create_agent_graph():

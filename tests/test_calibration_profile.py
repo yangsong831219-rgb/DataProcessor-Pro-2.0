@@ -101,7 +101,7 @@ class TestDataFrameBoolGuard:
         import pandas as pd
         df = pd.DataFrame({"a": [1, 2, 3]})
         with pytest.raises(ValueError, match="truth.*DataFrame.*ambiguous"):
-            _ = not df
+            _ = not df  # pyright: ignore[reportGeneralTypeIssues]  # intentional: testing DataFrame __bool__ raises
 
     def test_empty_dataframe_guard(self):
         """空 DataFrame 用 .empty 安全判断"""
@@ -120,7 +120,7 @@ class TestDataFrameBoolGuard:
         assert is_empty is False  # 非空 → 不是 empty
         # 单独验证: not df 仍然抛错 (确认 pandas 行为不变)
         with pytest.raises(ValueError):
-            _ = not df
+            _ = not df  # pyright: ignore[reportGeneralTypeIssues]  # intentional: testing DataFrame __bool__ raises
 
 
 class TestLoadProfileLiveState:

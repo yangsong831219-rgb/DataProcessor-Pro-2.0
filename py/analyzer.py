@@ -1,6 +1,7 @@
 import numpy as np
 from scipy import signal
 from scipy.fft import fft
+from typing import cast
 
 def time_domain_analysis(data: list[float]) -> dict:
     """时域分析"""
@@ -31,11 +32,11 @@ def apply_filter(data: list[float], filter_type: str, cutoff: float, sampling_ra
     """滤波处理"""
     nyquist = sampling_rate / 2
     if filter_type == 'lowpass':
-        b, a = signal.butter(4, cutoff/nyquist, btype='low')
+        b, a = cast("tuple[np.ndarray, np.ndarray]", signal.butter(4, cutoff/nyquist, btype='low'))
     elif filter_type == 'highpass':
-        b, a = signal.butter(4, cutoff/nyquist, btype='high')
+        b, a = cast("tuple[np.ndarray, np.ndarray]", signal.butter(4, cutoff/nyquist, btype='high'))
     elif filter_type == 'bandpass':
-        b, a = signal.butter(4, [cutoff[0]/nyquist, cutoff[1]/nyquist], btype='band')
+        b, a = cast("tuple[np.ndarray, np.ndarray]", signal.butter(4, [cutoff[0]/nyquist, cutoff[1]/nyquist], btype='band'))
     else:
         return data
 

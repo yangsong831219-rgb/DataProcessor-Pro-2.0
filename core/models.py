@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, field
 from typing import (
     Any, Callable, ClassVar, Dict, List, Literal, Optional, Protocol,
-    Sequence, TypedDict, Union,
+    Sequence, TypedDict, Union, cast,
 )
 
 import numpy as np
@@ -521,12 +521,12 @@ def apply_filter(
     from scipy import signal as scipy_signal
     nyquist = sampling_rate / 2.0
     if filter_type == 'lowpass':
-        b, a = scipy_signal.butter(4, float(cutoff) / nyquist, btype='low')
+        b, a = cast("tuple[np.ndarray, np.ndarray]", scipy_signal.butter(4, float(cutoff) / nyquist, btype='low'))
     elif filter_type == 'highpass':
-        b, a = scipy_signal.butter(4, float(cutoff) / nyquist, btype='high')
+        b, a = cast("tuple[np.ndarray, np.ndarray]", scipy_signal.butter(4, float(cutoff) / nyquist, btype='high'))
     elif filter_type == 'bandpass':
         cutoffs = list(cutoff) if not isinstance(cutoff, (int, float)) else [float(cutoff)]
-        b, a = scipy_signal.butter(4, [cutoffs[0] / nyquist, cutoffs[1] / nyquist], btype='band')
+        b, a = cast("tuple[np.ndarray, np.ndarray]", scipy_signal.butter(4, [cutoffs[0] / nyquist, cutoffs[1] / nyquist], btype='band'))
     else:
         return list(data)
     return scipy_signal.filtfilt(b, a, data).tolist()

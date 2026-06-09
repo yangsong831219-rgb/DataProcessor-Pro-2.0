@@ -772,6 +772,124 @@ class _PasteTable(QTableWidget):
 
 # ═══════════════════════════════════════════════════════════════════════
 # Phase A 对话框
+class _StrainPasteTable(QTableWidget):
+    """应变读数表 — 支持 Ctrl+V 整块粘贴（跳过备注行 row 0）
+
+    单击 → 选中（不编辑）；双击/F2 → 编辑态；选中态 Ctrl+V → 多行分发
+    """
+
+    def __init__(self, rows: int, cols: int, parent=None):
+        super().__init__(rows, cols, parent)
+        from PyQt6.QtWidgets import QAbstractItemView
+        self.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked |
+                             QAbstractItemView.EditTrigger.EditKeyPressed)
+
+    def keyPressEvent(self, ev):
+        from PyQt6.QtGui import QKeySequence
+        if ev.matches(QKeySequence.StandardKey.Paste):
+            # 编辑态: 默认单格粘贴
+            if self.state().value == 2:  # EditingState
+                super().keyPressEvent(ev)
+                return
+            # 选中态: 多行分发（备注行 row 0 永不参与）
+            self._paste_block(self.currentRow(), self.currentColumn())
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
+    def _paste_block(self, start_row: int = -1, start_col: int = 0):
+        """取剪贴板 → 拆行 → 逐行 setItem（跳过 row 0；col 1 自动计算列不覆盖）"""
+        from PyQt6.QtWidgets import QApplication
+        text = QApplication.clipboard().text()
+        if not text.strip():
+            return
+
+        lines = [ln for ln in text.replace('\r\n', '\n').split('\n') if ln.strip()]
+        if not lines:
+            return
+
+        # 起始行: 永远不低于 1（row 0 = 备注行）
+        if start_row < 1:
+            start_row = self.currentRow() if self.currentRow() >= 1 else 1
+        start_row = max(start_row, 1)
+        if start_col < 0:
+            start_col = self.currentColumn() if self.currentColumn() >= 0 else 0
+
+        # 列跳转表: col 0 → col 2 (跳过 col 1 应变自动计算列)
+        # 其他起始列按正常顺序
+        _COL_SKIP_1 = (start_col == 0)
+
+        self.blockSignals(True)
+        try:
+            for i, line in enumerate(lines):
+                target_row = start_row + i
+                if target_row >= self.rowCount():
+                    break
+                cells = line.split('\t')
+                col_offset = 0
+                for cell_text in cells:
+                    if start_col == 0 and col_offset == 1:
+                        # 跳过 col 1 (理论应变，自动计算)
+                        col_offset += 1
+                    target_col = start_col + col_offset
+                    if target_col >= self.columnCount():
+                        break
+                    val = cell_text.strip()
+                    item = QTableWidgetItem(val)
+                    item.setFlags(Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                    self.setItem(target_row, target_col, item)
+                    col_offset += 1
+        finally:
+            self.blockSignals(False)
+
+        # 粘贴后触发位移→应变自动计算（仅位移列 col=0）
+        if start_col == 0:
+            for i in range(len(lines)):
+                target_row = start_row + i
+                if target_row >= self.rowCount():
+                    break
+                disp_item = self.item(target_row, 0)
+                if disp_item is None or not disp_item.text().strip():
+                    continue
+                try:
+                    disp_mm = float(disp_item.text().strip())
+                except (ValueError, TypeError):
+                    continue
+                gauge = getattr(self, '_paste_gauge_mm', 80.0)
+                eps = disp_mm / gauge * 1e6 if gauge > 0 else 0.0
+                strain_item = QTableWidgetItem(f"{eps:.2f}")
+                strain_item.setFlags(strain_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.setItem(target_row, 1, strain_item)
+
+
+class _ComboPasteRedirect(QObject):
+    """QComboBox 事件过滤器 — Ctrl+V 转发给表格粘贴处理器
+
+    setEditable(True) 的 QComboBox 内部有 QLineEdit 子控件，
+    过滤器必须装到 QLineEdit 上才能截获所有键事件。
+    """
+
+    def __init__(self, table: _StrainPasteTable, combo: QComboBox, parent=None):
+        super().__init__(parent)
+        self._table = table
+        # 装到 editable ComboBox 的内部 QLineEdit
+        line_edit = combo.lineEdit()
+        if line_edit is not None:
+            line_edit.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if event.type() == QEvent.Type.KeyPress:
+            from PyQt6.QtCore import Qt as _QtC
+            is_v = event.key() == _QtC.Key.Key_V
+            ctrl = bool(event.modifiers() & _QtC.KeyboardModifier.ControlModifier)
+            if is_v and ctrl:
+                # 转发给表格的粘贴处理器，不吞进 ComboBox
+                self._table._paste_block(1, self._table.currentColumn())
+                return True  # 拦截，阻止 QLineEdit 处理
+        return False
+
+
 # ═══════════════════════════════════════════════════════════════════════
 
 class PhaseADialog(QDialog):
@@ -1271,6 +1389,7 @@ class PhaseBDialog(QDialog):
         self._coeffs = {}
         self._worker = None
         self._last_result = None
+        self._single_excluded_label = None  # 单栅排除提示 label (懒初始化)
         self._build_ui()
 
         # ── 状态恢复: 从主 Tab _phase_b_state 恢复上次关闭时的值 ──
@@ -1283,8 +1402,8 @@ class PhaseBDialog(QDialog):
                 pfx = self.coef_table.item(i, 0).text().strip()
                 if pfx in ke_table:
                     ke = ke_table[pfx]
-                    self.coef_table.setItem(i, 1, QTableWidgetItem(str(ke["Ke1"])))
-                    self.coef_table.setItem(i, 2, QTableWidgetItem(str(ke["Ke2"])))
+                    self.coef_table.setItem(i, 1, QTableWidgetItem(f"{float(ke['Ke1']):.2f}"))
+                    self.coef_table.setItem(i, 2, QTableWidgetItem(f"{float(ke['Ke2']):.2f}"))
             self._coeffs = dict(ke_table)
             # 恢复解耦结果 (渲染 10 列表格)
             decoupling = state.get("decoupling_results", {})
@@ -1429,13 +1548,22 @@ class PhaseBDialog(QDialog):
         self.run_btn.setEnabled(True)
 
     def _render_result_table(self, sensors: dict, S_eff: dict, saved_ratings: dict = None):
-        """渲染 10 列解耦结果表 (保存/恢复复用)"""
+        """渲染 10 列解耦结果表 — 仅双栅传感器 (单栅跳过，不进解耦)
+
+        Phase B 解耦基于 2×2 矩阵求逆，单栅传感器无第二个光栅参与
+        解耦，因此不在此表中显示。单栅的 S_eff 温度系数保留在 Phase A，
+        不在 Phase B 处理。
+        """
         saved_ratings = saved_ratings or {}
         self.result_table.setSortingEnabled(False)
-        self.result_table.setRowCount(len(sensors))
+
+        # ── 过滤: 仅双栅传感器 ──
+        dual_sensors = {k: v for k, v in sensors.items() if not v.get("single_grating", False)}
+        single_names = [k for k, v in sensors.items() if v.get("single_grating", False)]
+
+        self.result_table.setRowCount(len(dual_sensors))
         row = 0
-        for s_name, r in sensors.items():
-            is_single = r.get("single_grating", False)
+        for s_name, r in dual_sensors.items():
             eps = np.asarray(r.get("eps_corr", np.empty(0)), dtype=np.float64)
 
             kt1 = float("nan"); kt2 = float("nan")
@@ -1467,9 +1595,8 @@ class PhaseBDialog(QDialog):
 
             cells = [
                 s_name,
-                "双栅" if not is_single else "单栅",
-                dash(ke1) if not is_single else "—",
-                dash(ke2) if not is_single else "—",
+                "双栅",
+                dash(ke1), dash(ke2),
                 dash(kt1), dash(kt2),
                 dash(e_mean), dash(e_std), dash(e_range),
                 rating,
@@ -1481,6 +1608,20 @@ class PhaseBDialog(QDialog):
                 self.result_table.setItem(row, j, item)
             row += 1
         self.result_table.setSortingEnabled(True)
+
+        # ── 单栅排除提示 ──
+        if single_names:
+            display_names = ", ".join(single_names)
+            label = getattr(self, '_single_excluded_label', None)
+            if label is None:
+                label = QLabel("")
+                label.setStyleSheet("color: #666; font-size: 11px; padding: 4px 0;")
+                self._single_excluded_label = label
+                # 插入到 result_table 下方
+                idx = self.layout().indexOf(self.result_table)
+                if idx >= 0:
+                    self.layout().insertWidget(idx + 1, label)
+            label.setText(f"ⓘ 单栅传感器 ({display_names}) 不进 Phase B 解耦，温度系数 S_eff 保留在 Phase A 结果中")
 
     def _write_state_to_main_page(self):
         """写回主 Tab 状态 (被 accept + reject 共用)"""
@@ -1499,6 +1640,8 @@ class PhaseBDialog(QDialog):
             decoupling = {}
             if self._last_result:
                 for s_name, r in self._last_result.get("sensors", {}).items():
+                    if r.get("single_grating", False):
+                        continue  # 单栅不参与解耦，不写入 decoupling_results
                     eps = np.asarray(r.get("eps_corr", np.empty(0)), dtype=np.float64)
                     e_mean = float(np.nanmean(eps)) if len(eps) > 0 else float("nan")
                     e_std  = float(np.nanstd(eps)) if len(eps) > 0 else float("nan")
@@ -1825,54 +1968,64 @@ class TemperatureCalibrationPage(QWidget):
     # ── 参数文件管理 ──
 
     def _save_profile(self):
-        """保存当前全部标定参数"""
-        if self._loaded_df is None or self._loaded_df.empty or not self._annotation_dict:
-            QMessageBox.information(self, "提示", "请先加载文件并完成暗号标注。")
-            return
+        """保存项目配置 (温度段 + 应变段)"""
+        from py.calibration.project_config import ProjectConfigManager
+        ctw = self._get_cal_tab_widget()
+        sp = ctw.strain_page if ctw is not None else None
+        pc = ProjectConfigManager.capture(self, sp)
 
-        from py.calibration.profile import CalibrationProfile
         default_name = os.path.splitext(os.path.basename(
             self.file_path_edit.text() or "calibration"
         ))[0] + "_" + datetime.now().strftime("%Y%m%d_%H%M")
 
-
-
         name, ok = QInputDialog.getText(
-            self, "保存配置", "配置名称:", text=default_name)
+            self, "保存项目配置", "配置名称:", text=default_name)
         if not ok or not name.strip():
             return
         name = name.strip()
+        pc.name = name
 
         try:
-            profile = CalibrationProfile.from_state(name, self)
-            profile.file_path = self.file_path_edit.text() or ""
-            profile.file_format = self._annotation_meta.get("format", "unknown")
-            path = profile.save()
+            path = ProjectConfigManager.save(pc)
+            # 同步到 CalibrationTabWidget
+            if ctw is not None:
+                ctw.project_config = pc
             QMessageBox.information(self, "已保存",
-                f"配置已保存到:\n{path}")
+                f"项目配置已保存到:\n{path}\n\n"
+                f"温度段: {'有' if pc.temperature else '无'}  |  "
+                f"应变传感器: {len(pc.strain)} 个")
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
 
-    def _load_profile(self):
-        """从文件恢复标定参数"""
-        from py.calibration.profile import CalibrationProfile, PROFILES_DIR
+    def _get_cal_tab_widget(self):
+        """向上搜索 CalibrationTabWidget (最多3层)"""
+        w: object = self
+        for _ in range(3):
+            w = getattr(w, 'parent', lambda: None)()
+            if w is not None and hasattr(w, 'project_config'):
+                return w
+        return None
 
-        profiles = CalibrationProfile.list_all()
-        if not profiles:
-            QMessageBox.information(self, "无配置", "还没有保存的配置文件。")
+    def _load_profile(self):
+        """加载项目配置，回填温度段 + 应变段"""
+        from py.calibration.project_config import ProjectConfigManager, PROFILES_DIR
+
+        projects = ProjectConfigManager.list_all()
+        if not projects:
+            QMessageBox.information(self, "无配置", "还没有保存的项目配置文件。")
             return
 
-        # 列表对话框
         dlg = QDialog(self)
-        dlg.setWindowTitle("加载配置"); dlg.resize(650, 400)
+        dlg.setWindowTitle("加载项目配置"); dlg.resize(650, 400)
         layout = QVBoxLayout(dlg)
 
         lst = QListWidget()
-        for p in profiles:
-            name = p.get("_name", p.get("name", "?"))
-            created = p.get("created_at", "")[:16]
-            fpath = p.get("file_path", "")
-            lst.addItem(f"{name}\n  创建: {created}  |  源文件: {fpath}")
+        for p in projects:
+            key = p.get("_key", p.get("name", "?"))
+            created = str(p.get("created_at", ""))[:16]
+            n_strain = len(p.get("strain", {}) or {})
+            fpath = (p.get("temperature") or {}).get("file_path", "") if isinstance(p.get("temperature"), dict) else ""
+            lst.addItem(f"{key}\n  创建: {created}  |  应变传感器: {n_strain}  |  源文件: {fpath}")
         layout.addWidget(lst)
 
         btn_row = QHBoxLayout()
@@ -1884,236 +2037,75 @@ class TemperatureCalibrationPage(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted or lst.currentRow() < 0:
             return
 
-        profile_dict = profiles[lst.currentRow()]
-        name = profile_dict.get("_name", profile_dict.get("name", ""))
+        proj_dict = projects[lst.currentRow()]
+        name = proj_dict.get("_key", proj_dict.get("name", ""))
 
-        # 检查是否有未保存状态
         if self._phase_a_state or self._phase_b_state:
             r = QMessageBox.question(self, "确认加载",
-                "当前未保存的修改将丢失，是否继续加载？",
+                "当前未保存的修改可能丢失，是否继续加载？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r != QMessageBox.StandardButton.Yes:
                 return
 
         try:
-            profile = CalibrationProfile.load(name)
+            pc = ProjectConfigManager.load(name)
 
-            # -- 读 JSON 后 --
-            d = profile.to_dict()
+            ctw = self._get_cal_tab_widget()
+            sp = ctw.strain_page if ctw is not None else None
+            ProjectConfigManager.restore(pc, self, sp)
 
-            # ── Step 0: 先重读源文件到 _loaded_df ──
-            src_path = profile.file_path or ""
-            if src_path and os.path.isfile(src_path):
-                from utils.file_parser import parse_enlight_file
-                try:
-                    df, _annotation, meta = parse_enlight_file(src_path)
-                    self._loaded_df = df
-                    self._annotation_meta = meta
-                    self._time_col_idx = 0
-                    self.file_path_edit.setText(src_path)
-                except Exception as e:
-                    self._loaded_df = None
-                    self.status_card.setText(f"⚠ 原文件读取失败: {src_path}\n{e}")
-            else:
-                self._loaded_df = None
-                if src_path:
-                    self.status_card.setText(f"⚠ 原文件不可访问: {src_path}\n请重新加载文件")
-                else:
-                    self.status_card.setText(f"✅ 已加载配置: {name} (无关联数据文件)")
-
-            # ── Step 1: 用 profile 真实数据覆盖所有活状态 (必须 parse 后做) ──
-            # Step 1a: annotation + groups (活状态)
-            self._annotation_dict = dict(profile.annotation)
-            data_cols_for_group = {}
-            for col_name, ann_name in profile.annotation.items():
-                try:
-                    idx = list(self._loaded_df.columns).index(col_name) if self._loaded_df is not None else -1
-                    s = str(ann_name).strip().strip("'\"'\"'\"")
-                    if s and '-' in s and idx >= 0:
-                        data_cols_for_group[idx] = s
-                except (ValueError, IndexError):
-                    pass
-            self._annotation_groups = _group_annotations_by_prefix(data_cols_for_group, self._loaded_df) if data_cols_for_group else {}
-
-            # Step 1b: detection_params (活状态)
-            self._detection_params = dict(profile.detection_params)
-
-            # Step 1c: Phase A 完成标志 + last_result (活状态)
-            if profile.s_eff_results:
-                self._phase_a_done = True
-                self._last_result = {
-                    "S_eff": dict(profile.s_eff_results),
-                    "wavelength_cols": list(profile.s_eff_results.keys()),
-                    "plateaus": pd.DataFrame(),
-                    "df": self._loaded_df if self._loaded_df is not None else pd.DataFrame(),
-                }
-
-            # Step 1d: Phase B 结果 (活状态)
-            self._phase_b_result = {
-                "sensors": self._build_sensors_from_profile(profile),
-                "time_h": np.array([]),
-                "df": self._loaded_df if self._loaded_df is not None else pd.DataFrame(),
-            } if profile.decoupling_results else None
-
-            # ── Step 2: 同步快照字典 (双副本一致) ──
-            self._phase_a_state = {
-                "annotation": dict(profile.annotation),
-                "groups": dict(self._annotation_groups),
-                "tmin": profile.temp_min, "tmax": profile.temp_max, "tstep": profile.temp_step,
-                "params": dict(profile.detection_params),
-                "seff_result": self._last_result,
-            }
-            self._phase_b_state = {
-                "ke_table": dict(profile.ke_table),
-                "decoupling_results": dict(profile.decoupling_results),
-            }
-
-            # ── Step 3: 按钮门控 + UI 同步 ──
-            df_ready = self._loaded_df is not None and not self._loaded_df.empty
-            if df_ready:
-                self.btn_phase_a.setStyleSheet(_BTN_STYLE_ENABLED)
-                self.btn_phase_a.setCursor(Qt.CursorShape.PointingHandCursor)
-                self.btn_phase_a.setEnabled(True)
-                self.btn_phase_a.setToolTip("打开阶段 A 对话框")
-                self.btn_phase_b.setStyleSheet(_BTN_STYLE_ENABLED)
-                self.btn_phase_b.setCursor(Qt.CursorShape.PointingHandCursor)
-                self.btn_phase_b.setEnabled(self._phase_a_done)
-                self.btn_phase_b.setToolTip("打开阶段 B 对话框" if self._phase_a_done else "请先完成阶段 A")
-            else:
-                self.btn_phase_a.setStyleSheet(_BTN_STYLE_DISABLED)
-                self.btn_phase_a.setCursor(Qt.CursorShape.ForbiddenCursor)
-                self.btn_phase_a.setEnabled(False)
-                self.btn_phase_a.setToolTip("原文件不可访问，请重新加载数据文件")
-                self.btn_phase_b.setEnabled(False)
-
-            self.status_card.setText(
-                f"✅ 已加载配置: {name}\n📁 {os.path.basename(src_path) if src_path else '(无文件)'}  "
-                f"| 暗号 {len(profile.annotation)} 个 | S_eff {len(profile.s_eff_results)} 个"
-                f" | Ke {len(profile.ke_table)} 传感器 | 解耦 {len(profile.decoupling_results)} 传感器"
-            )
-
-            QMessageBox.information(self, "已加载", f"配置 '{name}' 已恢复。")
+            QMessageBox.information(self, "已加载",
+                f"项目 '{name}' 已恢复。\n\n"
+                f"温度段: {'有' if pc.temperature else '无'}  |  "
+                f"应变传感器: {len(pc.strain)} 个")
         except Exception as e:
             QMessageBox.critical(self, "加载失败", str(e))
 
     def _manage_profiles(self):
-        """配置管理: 查看/删除/重命名已保存的配置"""
-        from py.calibration.profile import CalibrationProfile, PROFILES_DIR
+        """配置管理: 查看/删除已保存的项目配置"""
+        from py.calibration.project_config import ProjectConfigManager
 
-        profiles = CalibrationProfile.list_all()
-        if not profiles:
-            QMessageBox.information(self, "无配置", "还没有保存的配置文件。")
+        projects = ProjectConfigManager.list_all()
+        if not projects:
+            QMessageBox.information(self, "无配置", "还没有保存的项目配置文件。")
             return
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("配置管理"); dlg.resize(750, 450)
+        dlg.setWindowTitle("配置管理 — 项目配置"); dlg.resize(750, 450)
         layout = QVBoxLayout(dlg)
 
-        tbl = QTableWidget(len(profiles), 5)
-        tbl.setHorizontalHeaderLabels(["名称", "创建时间", "源文件", "操作", "预览"])
+        tbl = QTableWidget(len(projects), 4)
+        tbl.setHorizontalHeaderLabels(["名称", "创建时间", "传感器数", "操作"])
         tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        for i, p in enumerate(profiles):
-            tbl.setItem(i, 0, QTableWidgetItem(p.get("_name", p.get("name", "?"))))
-            tbl.setItem(i, 1, QTableWidgetItem(p.get("created_at", "")[:16]))
-            tbl.setItem(i, 2, QTableWidgetItem(p.get("file_path", "")))
+        for i, p in enumerate(projects):
+            key = p.get("_key", p.get("name", "?"))
+            tbl.setItem(i, 0, QTableWidgetItem(key))
+            tbl.setItem(i, 1, QTableWidgetItem(str(p.get("created_at", ""))[:16]))
+            n_strain = len(p.get("strain", {}) or {})
+            n_s_eff = len((p.get("temperature", {}) or {}).get("s_eff_results", {}) or {})
+            tbl.setItem(i, 2, QTableWidgetItem(f"温度S_eff:{n_s_eff} + 应变:{n_strain}"))
 
             del_btn = QPushButton("删除")
-            name = p.get("_name", "")
-            del_btn.clicked.connect(lambda checked, n=name: self._delete_and_refresh(n, dlg, tbl))
+            name = key
+            del_btn.clicked.connect(lambda checked, n=name: self._delete_project_and_refresh(n, dlg, tbl))
             tbl.setCellWidget(i, 3, del_btn)
-
-            prev_btn = QPushButton("预览")
-            prev_btn.clicked.connect(lambda checked, n=name: self._preview_profile(n))
-            tbl.setCellWidget(i, 4, prev_btn)
         layout.addWidget(tbl)
 
         btn_row = QHBoxLayout()
-        rename_btn = create_button("重命名选中", lambda: self._rename_selected_profile(tbl),
-                                    "secondary")
-        btn_row.addWidget(rename_btn)
         btn_row.addStretch()
         btn_row.addWidget(create_button("关闭", dlg.accept, "primary"))
         layout.addLayout(btn_row)
 
         dlg.exec()
 
-    def _delete_and_refresh(self, name: str, dlg, tbl):
-        from py.calibration.profile import CalibrationProfile
-        r = QMessageBox.question(self, "确认删除", f"确定删除配置 '{name}'？")
+    def _delete_project_and_refresh(self, name: str, dlg, tbl):
+        from py.calibration.project_config import ProjectConfigManager
+        r = QMessageBox.question(self, "确认删除", f"确定删除项目配置 '{name}'？")
         if r == QMessageBox.StandardButton.Yes:
-            CalibrationProfile.delete(name)
+            ProjectConfigManager.delete(name)
             dlg.accept()
-            QMessageBox.information(self, "已删除", f"配置 '{name}' 已删除。")
-
-    def _build_sensors_from_profile(self, profile) -> dict:
-        """从 profile.decoupling_results 重建 sensors dict (供 Phase B restore 用)"""
-        sensors = {}
-        for s_name, d in profile.decoupling_results.items():
-            is_single = s_name not in profile.ke_table
-            sensors[s_name] = {
-                "eps_corr": [d.get("e_mean", 0)] * 10,
-                "eps_orig": [], "dT_corr": [], "T_abs": [],
-                "S1": 0, "S2": 0, "T_base": 0,
-                "single_grating": is_single,
-            }
-        return sensors
-
-    def _rename_selected_profile(self, tbl):
-        row = tbl.currentRow()
-        if row < 0:
-            return
-        old_name = tbl.item(row, 0).text()
-        new_name, ok = QInputDialog.getText(self, "重命名", "新名称:", text=old_name)
-        if ok and new_name.strip() and new_name.strip() != old_name:
-            from py.calibration.profile import CalibrationProfile
-            CalibrationProfile.rename(old_name, new_name.strip())
-            tbl.item(row, 0).setText(new_name.strip())
-            QMessageBox.information(self, "已重命名", f"'{old_name}' → '{new_name.strip()}'")
-
-    def _preview_profile(self, name: str):
-        """只读预览对话框"""
-        from py.calibration.profile import CalibrationProfile
-        try:
-            profile = CalibrationProfile.load(name)
-        except Exception as e:
-            QMessageBox.critical(self, "预览失败", str(e))
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"预览: {name}"); dlg.resize(500, 600)
-        layout = QVBoxLayout(dlg)
-        te = QTextEdit(); te.setReadOnly(True)
-        lines = [
-            f"配置名称: {name}",
-            f"创建时间: {profile.created_at}",
-            f"源文件: {profile.file_path}",
-            f"文件格式: {profile.file_format}",
-            f"",
-            f"--- Phase A ---",
-            f"温度范围: {profile.temp_min}–{profile.temp_max} °C, 步长 {profile.temp_step}",
-            f"暗号映射: {len(profile.annotation)} 个",
-        ]
-        for k, v in profile.annotation.items():
-            lines.append(f"  {k} → {v}")
-        lines.append(f"S_eff 结果: {len(profile.s_eff_results)} 个光栅")
-        for k, v in profile.s_eff_results.items():
-            lines.append(f"  {k}: S_eff={v.get('slope',0):.2f} pm/°C, R²={v.get('r2',0):.5f}")
-        lines.append(f"")
-        lines.append(f"--- Phase B ---")
-        lines.append(f"Ke 输入: {len(profile.ke_table)} 个传感器")
-        for k, v in profile.ke_table.items():
-            if isinstance(v, dict):
-                lines.append(f"  {k}: Ke1={v.get('Ke1', '?')}, Ke2={v.get('Ke2', '?')}")
-            elif isinstance(v, (list, tuple)) and len(v) == 2:
-                lines.append(f"  {k}: Ke1={v[0]}, Ke2={v[1]}")
-        lines.append(f"解耦结果: {len(profile.decoupling_results)} 个传感器")
-        for k, v in profile.decoupling_results.items():
-            lines.append(f"  {k}: ε_std={v.get('e_std',0):.1f} με, 评级={v.get('rating','—')}")
-        te.setPlainText("\n".join(lines))
-        layout.addWidget(te)
-        layout.addWidget(create_button("关闭", dlg.accept, "secondary"))
-        dlg.exec()
+            QMessageBox.information(self, "已删除", f"项目配置 '{name}' 已删除。")
 
     # ── 对话框 ──
 
@@ -2156,10 +2148,18 @@ class StrainCalibrationPage(QWidget):
             "n_cycles": 1, "grating_kind": "single",
             "anchored_grating": None,
         }
-        self._levels = [0.0, 0.008, 0.016, 0.024, 0.032, 0.040]
+        self._levels = self._generate_default_levels()
         self._readings = {}
+        self._grating_map: dict[str, str] = {}   # {"G1": "A1-W1", "G2": "A1-W2"}
+        self._ke_results: dict[str, float] = {}  # {"Ke1": 1.23, "Ke2": 0.98}
+        self._dialog_table = None  # 每次 _open_readings 新建
+        self._annotation_combos: dict[int, QComboBox] = {}  # grating_index → ComboBox
+        # ── 多传感器列表管理 ──
+        self._strain_configs: dict[str, object] = {}   # sensor_name → StrainSubConfig (镜像 project.strain)
+        self._current_sensor: str | None = None          # 当前选中传感器名
+        self._working_result: object | None = None        # 当前分析结果 (尚未加入列表)
+        self._project_dirty: bool = False                 # 项目有未保存更改
         self._build_ui()
-        self._rebuild_table()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -2175,14 +2175,57 @@ class StrainCalibrationPage(QWidget):
         top_row.addStretch()
         layout.addLayout(top_row)
 
-        # ── 提交 ──
+        # ── 项目配置管理 ──
+        proj_row = QHBoxLayout()
+        proj_row.addWidget(create_button("💾 保存项目", self._save_project, "secondary",
+            tooltip="保存温度+应变全部标定参数"))
+        proj_row.addWidget(create_button("📂 加载项目", self._load_project, "secondary",
+            tooltip="从文件恢复温度+应变标定参数"))
+        self._dirty_label = QLabel("")
+        self._dirty_label.setStyleSheet("color: #fa8c16; font-weight: bold; padding: 2px 6px;")
+        proj_row.addWidget(self._dirty_label)
+        proj_row.addStretch()
+        layout.addLayout(proj_row)
+
+        # ── 提交 + 加入列表 ──
+        analyze_row = QHBoxLayout()
         self.analyze_btn = create_button("▶ 提交并分析", self._run_analysis, "primary")
-        layout.addWidget(self.analyze_btn)
+        analyze_row.addWidget(self.analyze_btn)
+        self.commit_list_btn = create_button("📋 加入已标定列表", self._commit_to_list, "success")
+        self.commit_list_btn.setEnabled(False)
+        analyze_row.addWidget(self.commit_list_btn)
+        analyze_row.addStretch()
+        layout.addLayout(analyze_row)
         self.strain_progress = create_info_label("")
         layout.addWidget(self.strain_progress)
 
-        # ── 结果区 (4 个 ChartPanel) ──
+        # ── 结果区: 左右分栏 (传感器列表 + 图表) ──
         result_group, result_layout = create_form_group("分析结果")
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # ── 左: 传感器列表面板 ──
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 4, 0)
+        left_layout.addWidget(QLabel("📋 已标定传感器"))
+        self.sensor_list = QListWidget()
+        self.sensor_list.setMinimumWidth(200)
+        self.sensor_list.currentRowChanged.connect(self._on_sensor_selected)
+        left_layout.addWidget(self.sensor_list, stretch=1)
+
+        list_btn_row = QHBoxLayout()
+        list_btn_row.addWidget(create_button("+ 新建标定", self._new_calibration, "secondary"))
+        self.delete_sensor_btn = create_button("🗑 删除", self._delete_sensor, "secondary")
+        self.delete_sensor_btn.setEnabled(False)
+        list_btn_row.addWidget(self.delete_sensor_btn)
+        left_layout.addLayout(list_btn_row)
+
+        splitter.addWidget(left_panel)
+
+        # ── 右: 现有结果标签页 ──
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
         self.strain_result_tabs = QTabWidget()
         self.strain_result_tabs.setMinimumHeight(450)
 
@@ -2195,18 +2238,22 @@ class StrainCalibrationPage(QWidget):
         self.strain_result_text = QTextEdit(); self.strain_result_text.setReadOnly(True)
         self.strain_result_tabs.addTab(self.strain_result_text, "结果数据")
 
-        result_layout.addWidget(self.strain_result_tabs)
+        right_layout.addWidget(self.strain_result_tabs)
+
+        splitter.addWidget(right_panel)
+        splitter.setSizes([220, 800])  # 初始比例: 左侧约 1/4
+        result_layout.addWidget(splitter)
         layout.addWidget(result_group)
 
         # ── 操作按钮 ──
         op_row = QHBoxLayout()
-        self.apply_coef_btn = create_button("📌 应用系数到当前传感器", self._apply_coefficients, "success")
+        self.apply_coef_btn = create_button("📌 应用全部系数到温度标定", self._apply_coefficients, "success")
         self.apply_coef_btn.setEnabled(False)
         op_row.addWidget(self.apply_coef_btn)
         self.export_se_btn = create_button("导出 Excel", self._export_strain_excel, "secondary")
         self.export_se_btn.setEnabled(False)
         op_row.addWidget(self.export_se_btn)
-        self.export_sw_btn = create_button("生成 Word 报告", self._export_strain_word, "secondary")
+        self.export_sw_btn = create_button("生成检测报告", self._on_generate_report, "secondary")
         self.export_sw_btn.setEnabled(False)
         op_row.addWidget(self.export_sw_btn)
         op_row.addStretch()
@@ -2219,33 +2266,30 @@ class StrainCalibrationPage(QWidget):
         grating_name = {"single": "单栅", "dual_anchored": "双栅-锚固", "dual_both": "双栅-双工作"}[c["grating_kind"]]
         return f"{c['gauge_length_mm']:.0f}mm, {mode_name}, {c['n_cycles']}循环, {grating_name}"
 
-    # ── 读数录入表 (隐藏在主页面中，打开对话框时 reparent) ──
+    # ── 读数录入表 (每次 _open_readings 新建独立 QTableWidget) ──
 
-    def _rebuild_table(self):
-        c = self._config
-        is_return = c["mode"] == "tension_return"
-        n_gratings = 1 if c["grating_kind"] == "single" else 2
+    # _rebuild_table 已删除 — 无持久表格，每次对话框独立创建
 
-        cols = ["位移(mm)", "理论应变(με)"]
-        for gi in range(n_gratings):
-            for ci in range(c["n_cycles"]):
-                cols.append(f"G{gi+1}_C{ci+1}_张拉(nm)")
-                if is_return:
-                    cols.append(f"G{gi+1}_C{ci+1}_退回(nm)")
+    def _generate_default_levels(self, n: int = 11) -> list[float]:
+        """根据标距生成默认位移等级列表（含零点基线行）。
 
-        if not hasattr(self, '_strain_table'):
-            self._strain_table = QTableWidget(len(self._levels), len(cols))
-            self._strain_table.cellChanged.connect(self._on_strain_cell_changed)
-        else:
-            self._strain_table.setRowCount(len(self._levels))
-            self._strain_table.setColumnCount(len(cols))
-        self._strain_table.setHorizontalHeaderLabels(cols)
+        位移 = i × L / 10000  (i=0→0.000 即 0με, i=10→0.080 即 1000με for L=80)
+        标距 80mm → [0.000, 0.008, 0.016, ..., 0.080]  共 11 行
+        """
+        L = self._config["gauge_length_mm"]
+        return [i * L / 10000.0 for i in range(n)]
 
     def _on_strain_cell_changed(self, row: int, col: int):
-        """位移列(col=0)编辑后，自动计算理论应变列(col=1)"""
-        if col != 0:
+        """位移列(col=0)编辑后，自动计算理论应变列(col=1)
+
+        Row 0 = 备注行，不触发自动计算。
+        """
+        if row < 1 or col != 0:  # 跳过备注行
             return
-        item = self._strain_table.item(row, col)
+        table = self._dialog_table
+        if table is None:
+            return
+        item = table.item(row, col)
         if item is None:
             return
         try:
@@ -2256,27 +2300,294 @@ class StrainCalibrationPage(QWidget):
         eps = disp_mm / gauge * 1e6 if gauge > 0 else 0.0
         strain_item = QTableWidgetItem(f"{eps:.2f}")
         strain_item.setFlags(strain_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        # blockSignals 防自动更新死循环
-        self._strain_table.blockSignals(True)
+        table.blockSignals(True)
         try:
-            self._strain_table.setItem(row, 1, strain_item)
+            table.setItem(row, 1, strain_item)
         finally:
-            self._strain_table.blockSignals(False)
+            table.blockSignals(False)
 
-    def _fill_table_from_levels(self):
-        """填充位移 + 理论应变列"""
+    def _get_temp_page(self):
+        """从兄弟页获取温度标定页引用。
+
+        走 parent 链 (StrainCalibrationPage → QTabWidget → CalibrationTabWidget)
+        浅层嵌套，parent 指针稳定，不走 window() 全树搜索。
+        """
+        w = self.parent()   # QTabWidget (sub_tabs)
+        if w is not None:
+            w2 = w.parent()  # CalibrationTabWidget
+            if w2 is not None and hasattr(w2, 'temp_page'):
+                return w2.temp_page
+        # 回退: 通过 window() 搜索 (仅当 parent 链不可用)
+        win = self.window()
+        if win is not None and hasattr(win, 'findChildren'):
+            for child in win.findChildren(QWidget):
+                if hasattr(child, '_annotation_groups') and hasattr(child, '_loaded_df'):
+                    return child
+        return None
+
+    def _get_cal_tab_widget(self):
+        """获取 CalibrationTabWidget (持有 project_config)。
+
+        向上遍历 parent 链，最多 3 层 (strain_page → sub_tabs → ctw 或 strain_page → ctw)。
+        """
+        w: object = self
+        for _ in range(3):
+            w = getattr(w, 'parent', lambda: None)()
+            if w is not None and hasattr(w, 'project_config'):
+                return w
+        return None
+
+    def _get_or_create_project_config(self):
+        """获取或创建 ProjectConfig 实例。
+
+        优先从 CalibrationTabWidget.project_config 获取，
+        若不存在则创建并缓存到 self._project_config。
+        """
+        from py.calibration.project_config import ProjectConfig
+        # 先查缓存在页面上的
+        cached = getattr(self, '_project_config', None)
+        if cached is not None:
+            return cached
+        ctw = self._get_cal_tab_widget()
+        if ctw is not None and ctw.project_config is not None:
+            self._project_config = ctw.project_config
+            return ctw.project_config
+        # 创建新项目
+        now = datetime.now().isoformat()
+        pc = ProjectConfig(name=f"应变标定_{now[:16]}", created_at=now, last_modified=now)
+        self._project_config = pc
+        if ctw is not None:
+            ctw.project_config = pc
+        return pc
+
+    def _parse_sensor_from_grating_map(self) -> str:
+        """从 grating_map 解析传感器名。
+
+        'G1' → 'A1-W1' → sensor_name = 'A1'
+        若 grating_map 为空或多暗号时取第一个的有效前缀。
+        """
+        if not self._grating_map:
+            return ""
+        # 取第一个标注
+        first_ann = next(iter(self._grating_map.values()), "")
+        if '-' in first_ann:
+            return first_ann.split('-')[0]
+        return first_ann
+
+    def _build_strain_subconfig(self):
+        """从当前应变标定状态构造 StrainSubConfig。"""
+        from py.calibration.project_config import StrainSubConfig
+        kind = self._config["grating_kind"]
+        sensor_mode_map = {"single": "single", "dual_anchored": "dual_anchored", "dual_both": "dual_working"}
+        # 构建 readings 列表
+        readings_list: list[dict] = []
+        for r in range(len(self._levels)):
+            row: dict = {"disp_mm": self._levels[r]}
+            row["eps_theory"] = self._levels[r] / self._config["gauge_length_mm"] * 1e6 if self._config["gauge_length_mm"] > 0 else 0.0
+            readings_list.append(row)
+        return StrainSubConfig(
+            sensor_name=self._parse_sensor_from_grating_map(),
+            sensor_mode=sensor_mode_map.get(kind, "single"),
+            gauge_length_mm=self._config["gauge_length_mm"],
+            n_cycles=self._config["n_cycles"],
+            grating_map=dict(self._grating_map),
+            readings=readings_list,
+            ke_results=dict(self._ke_results),
+            charts_meta={},
+        )
+
+    def _is_dual_in_temperature(self) -> tuple[bool, str]:
+        """检查当前传感器在温度配置中是否为双栅。
+
+        Returns:
+            (is_dual, found_name): is_dual 为 True 表示温度配置有该传感器且≥2光栅
+                                   found_name 为传感器名
+        """
+        sensor_name = self._parse_sensor_from_grating_map()
+        if not sensor_name:
+            return False, ""
+        tp = self._get_temp_page()
+        if tp is None:
+            return False, sensor_name
+        groups = getattr(tp, '_annotation_groups', None) or {}
+        gratings = groups.get(sensor_name, [])
+        return len(gratings) >= 2, sensor_name
+
+    def _has_temperature_data(self) -> bool:
+        """温度标定是否已有数据 (暗号 + Phase A 完成)。"""
+        tp = self._get_temp_page()
+        if tp is None:
+            return False
+        df = getattr(tp, '_loaded_df', None)
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            return False
+        return getattr(tp, '_phase_a_done', False)
+
+    def _get_temp_annotations(self) -> list[str]:
+        """获取温度标定页已识别的全部暗号，供备注行下拉使用。
+
+        只有当温度页已完成 Phase A (有暗号) 时才返回列表；
+        未加载或未标注返回空列表，ComboBox 切换为自由输入模式。
+        """
+        tp = self._get_temp_page()
+        if tp is None:
+            return []
+        groups = getattr(tp, '_annotation_groups', None) or {}
+        codes: list[str] = []
+        for _pfx, gratings in groups.items():
+            for g in gratings:
+                name = str(g.get("name", "")).strip()
+                if is_valid_annotation(name):
+                    codes.append(name)
+        # 去重 + 排序
+        return sorted(set(codes))
+
+    def _grating_col_indices(self) -> dict[int, list[int]]:
+        """返回 {grating_index: [column_indices]} 映射。
+
+        基于当前 _build_table_columns 的列布局，遍历所有数据列
+        (从 col=2 开始)，归入对应光栅的列索引列表。
+        供备注行 ComboBox 定位 + 同光栅其余列灰显。
+        """
+        c = self._config
+        is_return = c["mode"] == "tension_return"
+        n_gratings = 1 if c["grating_kind"] == "single" else 2
+        grating_cols: dict[int, list[int]] = {i + 1: [] for i in range(n_gratings)}
+        col_idx = 2
+        for _ci in range(c["n_cycles"]):
+            for gi in range(n_gratings):
+                grating_cols[gi + 1].append(col_idx)
+                col_idx += 1
+            if is_return:
+                for gi in range(n_gratings):
+                    grating_cols[gi + 1].append(col_idx)
+                    col_idx += 1
+        return grating_cols
+
+    def _build_table_columns(self):
+        """根据当前 config 返回列名列表。
+
+        列顺序: 位移, 理论应变, 循环外层→方向中层→光栅内层
+        例如双栅+3循环+退回:
+          G1_C1_张, G2_C1_张, G1_C1_退, G2_C1_退,
+          G1_C2_张, G2_C2_张, G1_C2_退, G2_C2_退,
+          G1_C3_张, G2_C3_张, G1_C3_退, G2_C3_退
+        """
+        c = self._config
+        is_return = c["mode"] == "tension_return"
+        n_gratings = 1 if c["grating_kind"] == "single" else 2
+        cols = ["位移(mm)", "理论应变(με)"]
+        for ci in range(c["n_cycles"]):
+            for gi in range(n_gratings):
+                cols.append(f"G{gi+1}_C{ci+1}_张拉(nm)")
+            if is_return:
+                for gi in range(n_gratings):
+                    cols.append(f"G{gi+1}_C{ci+1}_退回(nm)")
+        return cols
+
+    def _populate_table(self, table):
+        """从 self._levels / self._readings 填充位移、理论应变、波长读数
+
+        Row 0 = 备注行 (annotation row)，数据从 row 1 开始。
+        """
         gauge = self._config["gauge_length_mm"]
-        for r, disp in enumerate(self._levels):
-            self._strain_table.blockSignals(True)
-            try:
-                item = QTableWidgetItem(f"{disp:.3f}")
-                self._strain_table.setItem(r, 0, item)
+        c = self._config
+        is_return = c["mode"] == "tension_return"
+        n_gratings = 1 if c["grating_kind"] == "single" else 2
+
+        table.blockSignals(True)
+        try:
+            for r, disp in enumerate(self._levels):
+                data_row = r + 1  # 偏移: row 0 = 备注行
+                # 位移
+                table.setItem(data_row, 0, QTableWidgetItem(f"{disp:.3f}"))
+                # 理论应变 (自动计算，不可编辑)
                 eps = disp / gauge * 1e6 if gauge > 0 else 0.0
-                item2 = QTableWidgetItem(f"{eps:.2f}")
-                item2.setFlags(item2.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self._strain_table.setItem(r, 1, item2)
-            finally:
-                self._strain_table.blockSignals(False)
+                strain_item = QTableWidgetItem(f"{eps:.2f}")
+                strain_item.setFlags(strain_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                table.setItem(data_row, 1, strain_item)
+
+            # 波长读数 — 列顺序: 循环外层 → 光栅内层 → 方向 (与 _build_table_columns 同序)
+            col_idx = 2
+            for ci in range(c["n_cycles"]):
+                for gi in range(n_gratings):
+                    load_vals = self._readings.get(gi + 1, {}).get(ci + 1, {}).get("load", [])
+                    for r in range(len(self._levels)):
+                        data_row = r + 1
+                        val = load_vals[r] if r < len(load_vals) else 0.0
+                        text = f"{val:.3f}" if val != 0.0 else ""
+                        table.setItem(data_row, col_idx, QTableWidgetItem(text))
+                    col_idx += 1
+                if is_return:
+                    for gi in range(n_gratings):
+                        unload_vals = self._readings.get(gi + 1, {}).get(ci + 1, {}).get("unload", [])
+                        for r in range(len(self._levels)):
+                            data_row = r + 1
+                            val = unload_vals[r] if r < len(unload_vals) else 0.0
+                            text = f"{val:.3f}" if val != 0.0 else ""
+                            table.setItem(data_row, col_idx, QTableWidgetItem(text))
+                        col_idx += 1
+        finally:
+            table.blockSignals(False)
+
+    def _extract_table_data(self, table):
+        """从对话框表格提取 self._levels + self._readings + self._grating_map
+
+        Row 0 = 备注行 (QComboBox)，数据从 row 1 开始。
+        """
+        c = self._config
+        is_return = c["mode"] == "tension_return"
+        n_gratings = 1 if c["grating_kind"] == "single" else 2
+        n_rows = table.rowCount()
+
+        # ── 提取 grating_map (row 0, QComboBox) ──
+        grating_map: dict[str, str] = {}
+        grating_cols = self._grating_col_indices()
+        for gi, col_indices in grating_cols.items():
+            if not col_indices:
+                continue
+            widget = table.cellWidget(0, col_indices[0])
+            if isinstance(widget, QComboBox):
+                text = widget.currentText().strip()
+                if text and is_valid_annotation(text):
+                    grating_map[f"G{gi}"] = text
+
+        # ── 提取 levels (row 1+) ──
+        levels = []
+        for r in range(1, n_rows):
+            item = table.item(r, 0)
+            try:
+                levels.append(float(item.text()) if item and item.text().strip() else 0.0)
+            except ValueError:
+                levels.append(0.0)
+
+        # ── 提取 readings (row 1+, 列顺序同 _build_table_columns) ──
+        readings: dict[int, dict] = {}
+        col_idx = 2
+        for ci in range(c["n_cycles"]):
+            for gi in range(n_gratings):
+                load_vals = []
+                for r in range(1, n_rows):
+                    item = table.item(r, col_idx)
+                    try:
+                        load_vals.append(float(item.text()) if item and item.text().strip() else 0.0)
+                    except ValueError:
+                        load_vals.append(0.0)
+                readings.setdefault(gi + 1, {})[ci + 1] = {"load": load_vals}
+                col_idx += 1
+            if is_return:
+                for gi in range(n_gratings):
+                    unload_vals = []
+                    for r in range(1, n_rows):
+                        item = table.item(r, col_idx)
+                        try:
+                            unload_vals.append(float(item.text()) if item and item.text().strip() else 0.0)
+                        except ValueError:
+                            unload_vals.append(0.0)
+                    readings[gi + 1][ci + 1]["unload"] = unload_vals
+                    col_idx += 1
+
+        return levels, readings, grating_map
 
     # ── 对话框 ──
 
@@ -2304,6 +2615,7 @@ class StrainCalibrationPage(QWidget):
         grid.addWidget(grating_combo, 1, 3)
         grid.addWidget(QLabel("锚固栅:"), 2, 2)
         anchored_combo = QComboBox(); anchored_combo.addItems(["光栅1", "光栅2"])
+        anchored_combo.setCurrentIndex((self._config.get("anchored_grating") or 2) - 1)
         grid.addWidget(anchored_combo, 2, 3)
         gl.addLayout(grid)
         layout.addWidget(gb)
@@ -2314,18 +2626,33 @@ class StrainCalibrationPage(QWidget):
         layout.addLayout(btn_row)
 
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            old_gauge = self._config["gauge_length_mm"]
+            old_kind = self._config["grating_kind"]
+            new_gauge = gauge_spin.value()
+            new_kind = ["single", "dual_anchored", "dual_both"][grating_combo.currentIndex()]
             self._config.update({
-                "gauge_length_mm": gauge_spin.value(),
+                "gauge_length_mm": new_gauge,
                 "mode": "tension_only" if mode_combo.currentIndex() == 0 else "tension_return",
                 "n_cycles": cycles_spin.value(),
-                "grating_kind": ["single", "dual_anchored", "dual_both"][grating_combo.currentIndex()],
+                "grating_kind": new_kind,
                 "anchored_grating": anchored_combo.currentIndex() + 1 if grating_combo.currentIndex() == 1 else None,
             })
             self.config_btn.setText(f"⚙ 标定参数: {self._config_label()}")
-            self._rebuild_table()
+            self._readings = {}  # 列结构可能已变，清空旧读数
+            if new_kind != old_kind:
+                self._grating_map = {}  # 光栅数量/类型变化 → 清空旧映射
+            if abs(new_gauge - old_gauge) > 0.001:
+                self._levels = self._generate_default_levels()  # 标距变化 → 重建位移等级
 
     def _open_readings(self):
-        self._fill_table_from_levels()
+        """每次新建 QDialog + 独立 QTableWidget，关闭时提取数据写回。
+
+        Row 0 = 备注行:
+          - 每个光栅的第一个数据列放 QComboBox (暗号标注)
+          - 同光栅其余列灰显只读
+          - 下拉项: 温度标定已加载 → 温度暗号列表; 未加载 → 可编辑自由输入
+        """
+        cols = self._build_table_columns()
         dlg = QDialog(self)
         dlg.setWindowTitle("读数录入 — 应变标定"); dlg.resize(1000, 600); dlg.setSizeGripEnabled(True)
         layout = QVBoxLayout(dlg)
@@ -2338,25 +2665,57 @@ class StrainCalibrationPage(QWidget):
         toolbar.addWidget(create_button("⛶ 全屏", lambda: self._toggle_readings_fs(dlg), "secondary"))
         layout.addLayout(toolbar)
 
-        self._strain_table.setParent(dlg)
-        layout.addWidget(self._strain_table)
+        # Table = 备注行 + levels 数据行
+        table = _StrainPasteTable(len(self._levels) + 1, len(cols))
+        table._paste_gauge_mm = self._config["gauge_length_mm"]  # 供粘贴位移列应变计算
+        table.setHorizontalHeaderLabels(cols)
+        table.cellChanged.connect(self._on_strain_cell_changed)
+        self._dialog_table = table
+        self._populate_table(table)
+        layout.addWidget(table)
+
+        # ── 备注行 (row 0): QComboBox 标注 ──
+        self._annotation_combos = {}
+        grating_cols = self._grating_col_indices()
+        temp_codes = self._get_temp_annotations()
+        for gi, col_indices in grating_cols.items():
+            if not col_indices:
+                continue
+            first_col = col_indices[0]
+            combo = QComboBox()
+            combo.setEditable(True)
+            combo.setMinimumWidth(100)
+            if temp_codes:
+                combo.addItems(temp_codes)
+            # 回填已保存的 grating_map
+            existing = self._grating_map.get(f"G{gi}", "")
+            if existing:
+                combo.setCurrentText(existing)
+            table.setCellWidget(0, first_col, combo)
+            self._annotation_combos[gi] = combo
+            # Ctrl+V 在 ComboBox 焦点下 → 转发给表格粘贴、不吞进下拉文本
+            combo.installEventFilter(_ComboPasteRedirect(table, combo))
+
+            # 同光栅其余列: 灰显 (不可编辑)
+            for other_col in col_indices[1:]:
+                gray_item = QTableWidgetItem("—")
+                gray_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                gray_item.setBackground(QColor(230, 230, 230))
+                table.setItem(0, other_col, gray_item)
 
         btn_row = QHBoxLayout()
         btn_row.addWidget(create_button("确定", dlg.accept, "primary"))
         btn_row.addWidget(create_button("取消", dlg.reject, "secondary"))
         layout.addLayout(btn_row)
 
+        # ── 关闭时统一提取数据 (覆盖 accept/reject/Esc/X/Alt+F4) ──
         def _on_closed():
-            layout.removeWidget(self._strain_table)
-            self._strain_table.setParent(None)
-            layout2 = self.layout()
-            if layout2:
-                # Insert at correct position (before result group)
-                pos = layout2.indexOf(self.strain_result_tabs.parent()) - 1 if hasattr(self, '_strain_table_pos') else 2
-                layout2.insertWidget(3, self._strain_table)
-            self._strain_table.hide()
+            self._levels, self._readings, self._grating_map = self._extract_table_data(table)
+            self._dialog_table = None
+            self._annotation_combos = {}
 
         dlg.finished.connect(_on_closed)
+
         from PyQt6.QtCore import QObject as _QObj
         from PyQt6.QtCore import Qt as _Qt
 
@@ -2380,63 +2739,49 @@ class StrainCalibrationPage(QWidget):
 
     def _add_level(self):
         self._levels.append(0.0)
-        self._strain_table.setRowCount(len(self._levels))
+        if self._dialog_table is not None:
+            self._dialog_table.setRowCount(len(self._levels) + 1)  # +1 = 备注行
 
     def _remove_level(self):
         if len(self._levels) > 1:
             self._levels.pop()
-            self._strain_table.setRowCount(len(self._levels))
+            if self._dialog_table is not None:
+                self._dialog_table.setRowCount(len(self._levels) + 1)  # +1 = 备注行
 
     # ── 分析 ──
 
     def _get_table_data(self):
-        n_rows = self._strain_table.rowCount()
-        levels = []
-        for r in range(n_rows):
-            item = self._strain_table.item(r, 0)
-            try:
-                levels.append(float(item.text()) if item and item.text().strip() else 0.0)
-            except ValueError:
-                levels.append(0.0)
+        """读取已持久化的 self._levels + self._readings (对话框关闭时 _on_closed 已写回)"""
+        return self._levels, self._readings
 
-        c = self._config
-        is_return = c["mode"] == "tension_return"
-        n_gratings = 1 if c["grating_kind"] == "single" else 2
-        readings = {}
-        col_idx = 2
-        for gi in range(n_gratings):
-            readings[gi + 1] = {}
-            for ci in range(c["n_cycles"]):
-                load_vals = []
-                for r in range(n_rows):
-                    item = self._strain_table.item(r, col_idx)
-                    try:
-                        load_vals.append(float(item.text()) if item and item.text().strip() else 0.0)
-                    except ValueError:
-                        load_vals.append(0.0)
-                readings[gi + 1][ci + 1] = {"load": load_vals}
-                col_idx += 1
-                if is_return:
-                    unload_vals = []
-                    for r in range(n_rows):
-                        item = self._strain_table.item(r, col_idx)
-                        try:
-                            unload_vals.append(float(item.text()) if item and item.text().strip() else 0.0)
-                        except ValueError:
-                            unload_vals.append(0.0)
-                    readings[gi + 1][ci + 1]["unload"] = unload_vals
-                    col_idx += 1
-        return levels, readings
+    def _compute_ke_results(self, result) -> dict[str, float]:
+        """从 StrainCalibrationResult 提取 Ke (pm/με) 结果。
+
+        规则:
+          - 每个光栅的 k_pm_per_ue = Ke
+          - dual_anchored: 锚固栅 Ke=0，工作栅参与计算 (动态判断)
+          - single: Ke2=0
+          - dual_both: G1 → Ke1, G2 → Ke2
+        """
+        ke: dict[str, float] = {}
+        kind = self._config["grating_kind"]
+        for g in result.gratings:
+            val = float(g.k_pm_per_ue) if not math.isnan(g.k_pm_per_ue) else 0.0
+            ke[f"Ke{g.grating_index}"] = val
+
+        if kind == "dual_anchored":
+            anchor_idx = self._config.get("anchored_grating") or 2
+            ke[f"Ke{anchor_idx}"] = 0.0
+        elif kind == "single":
+            ke["Ke2"] = 0.0
+        elif "Ke2" not in ke:
+            ke["Ke2"] = 0.0
+
+        return ke
 
     def _run_analysis(self):
-        self._levels, readings = self._get_table_data()
+        _, readings = self._get_table_data()
         gauge = self._config["gauge_length_mm"]
-        for r, disp in enumerate(self._levels):
-            if r < self._strain_table.rowCount():
-                eps = disp / gauge * 1e6 if gauge > 0 else 0.0
-                item = QTableWidgetItem(f"{eps:.2f}")
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self._strain_table.setItem(r, 1, item)
 
         config = StrainCalibrationConfig(
             gauge_length_mm=gauge, mode=self._config["mode"],
@@ -2456,11 +2801,33 @@ class StrainCalibrationPage(QWidget):
 
     def _on_strain_result(self, result):
         self._last_result = result
+        self._ke_results = self._compute_ke_results(result)
+
+        # ── 校验一致性 ──
+        err = self._validate_grating_map_consistency()
+        if err:
+            self.strain_progress.setText(f"❌ {err}")
+            self.analyze_btn.setEnabled(True)
+            self.apply_coef_btn.setEnabled(False)
+            self.export_se_btn.setEnabled(False)
+            self.export_sw_btn.setEnabled(False)
+            self.commit_list_btn.setEnabled(False)
+            return
+
+        sensor_name = self._parse_sensor_from_grating_map() or "未知"
+
+        # ── 存为当前工作结果（不自动入列表）──
+        sub = self._build_strain_subconfig()
+        self._working_result = sub
+
         self.analyze_btn.setEnabled(True)
         self.apply_coef_btn.setEnabled(True)
         self.export_se_btn.setEnabled(True)
         self.export_sw_btn.setEnabled(True)
-        self.strain_progress.setText("✅ 分析完成")
+        self.commit_list_btn.setEnabled(True)  # 允许加入列表
+        self.strain_progress.setText(f"✅ 分析完成 — {sensor_name}: Ke1={self._ke_results.get('Ke1', 0):.4f}"
+                                     + (f", Ke2={self._ke_results.get('Ke2', 0):.4f}" if self._ke_results.get('Ke2', 0) != 0 else "")
+                                     + "  |  点击「加入已标定列表」保存")
         self._plot_strain(result)
         self._show_strain_text(result)
 
@@ -2477,6 +2844,7 @@ class StrainCalibrationPage(QWidget):
                         label=f"G{g.grating_index}: k={g.k_pm_per_ue:.4f}, R²={g.R2:.5f}")
         ax.set_xlabel("理论应变 (με)"); ax.set_ylabel("波长漂移 (pm)")
         ax.set_title("Δλ-ε 标定曲线"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.set_xlim(left=0); ax.set_ylim(bottom=0)
         self.curve_panel.draw()
 
         # 核心指标柱状图
@@ -2504,25 +2872,470 @@ class StrainCalibrationPage(QWidget):
 
     def _show_strain_text(self, result):
         lines = [f"标距: {result.gauge_length_mm} mm | {result.mode} | {result.n_cycles}循环\n"]
+        # 备注行 (grating_map)
+        if self._grating_map:
+            map_str = ", ".join(f"{k}→{v}" for k, v in self._grating_map.items())
+            lines.append(f"备注映射: {map_str}")
+        # Ke 汇总
+        if self._ke_results:
+            ke_str = ", ".join(f"{k}={v:.4f} pm/με" for k, v in self._ke_results.items())
+            lines.append(f"应变系数: {ke_str}\n")
         for g in result.gratings:
             lines.append(f"光栅{g.grating_index}: k={g.k_pm_per_ue:.6f} R²={g.R2:.6f} "
                          f"NL={g.nonlinearity_pct_fs:.2f}% RP={g.repeatability_pct_fs:.2f}% "
                          f"HY={g.hysteresis_pct_fs:.2f}%")
         self.strain_result_text.setText("\n".join(lines))
 
-    def _apply_coefficients(self):
-        if not self._last_result: return
-        main_win = self.window()
-        ss = getattr(main_win, "sensor_system", None)
-        if not ss or not ss.sensors:
-            QMessageBox.warning(self, "提示", "请先配置传感器")
+    # ── 项目 dirty 标记 ──
+
+    def _set_dirty(self):
+        self._project_dirty = True
+        self._dirty_label.setText("● 有未保存更改")
+
+    def _clear_dirty(self):
+        self._project_dirty = False
+        self._dirty_label.setText("")
+
+    # ── 多传感器列表管理 ──
+
+    def _validate_grating_map_consistency(self) -> str | None:
+        """校验 grating_map 中 G1/G2 暗号前缀一致。返回 None 通过, 否则返回错误消息。"""
+        if not self._grating_map:
+            return None
+        prefixes = set()
+        for ann in self._grating_map.values():
+            if ann and '-' in ann:
+                prefixes.add(ann.split('-')[0])
+        if len(prefixes) > 1:
+            return f"同一次标定的两个光栅必须属于同一传感器，但找到: {', '.join(sorted(prefixes))}"
+        return None
+
+    def _get_list_label(self, sensor_name: str, config: object) -> str:
+        """生成列表条目标签: "A1  双栅-双工作  Ke1=1.23 Ke2=0.98" """
+        mode = getattr(config, 'sensor_mode', 'single')
+        mode_names = {"single": "单栅", "dual_working": "双栅-双工作", "dual_anchored": "双栅-锚固"}
+        mode_label = mode_names.get(mode, mode)
+        ke = getattr(config, 'ke_results', {}) or {}
+        ke1 = ke.get("Ke1", 0)
+        ke2 = ke.get("Ke2", 0)
+        ke_str = f"Ke1={ke1:.4f}"
+        if mode != "single":
+            anchor_suffix = "(固定)" if mode == "dual_anchored" else ""
+            ke_str += f"  Ke2={ke2:.4f}{anchor_suffix}"
+        return f"{sensor_name}  {mode_label}  {ke_str}"
+
+    def _refresh_sensor_list(self, select_sensor: str | None = None):
+        """重新生成 QListWidget，可指定选中项。"""
+        self.sensor_list.blockSignals(True)
+        try:
+            self.sensor_list.clear()
+            for s_name in sorted(self._strain_configs.keys()):
+                cfg = self._strain_configs[s_name]
+                label = self._get_list_label(s_name, cfg)
+                self.sensor_list.addItem(label)
+            # 选中指定项
+            if select_sensor is not None:
+                for i in range(self.sensor_list.count()):
+                    item = self.sensor_list.item(i)
+                    if item and select_sensor in (item.text() or ""):
+                        self.sensor_list.setCurrentRow(i)
+                        break
+            # 更新按钮状态
+            has_selection = self.sensor_list.currentRow() >= 0
+            self.delete_sensor_btn.setEnabled(has_selection)
+        finally:
+            self.sensor_list.blockSignals(False)
+
+    def _upsert_strain_config(self, sensor_name: str):
+        """从当前活动态 (_config/_levels/_readings/_grating_map/_ke_results) 构造 StrainSubConfig，
+        写入 self._strain_configs, 同步 project.strain, 刷新列表。"""
+        from py.calibration.project_config import StrainSubConfig
+        sub = self._build_strain_subconfig()
+        self._strain_configs[sensor_name] = sub
+        # 同步到 project.strain
+        pc = self._get_or_create_project_config()
+        pc.strain[sensor_name] = sub
+        self._set_dirty()
+        self._refresh_sensor_list(select_sensor=sensor_name)
+
+    def _commit_to_list(self):
+        """将当前工作结果显式加入已标定列表"""
+        if self._working_result is None:
+            return  # 按钮 disabled 时不会触发，正常路径无此情况
+
+        sub = self._working_result
+        sensor_name = getattr(sub, 'sensor_name', '') or self._parse_sensor_from_grating_map()
+        if not sensor_name:
+            QMessageBox.warning(self, "提示", "请在读数录入的备注行指定光栅暗号 (如 A1-W1)。")
             return
-        for g in self._last_result.gratings:
-            if not np.isnan(g.k_pm_per_ue):
-                ss.sensors[0].constants[f"k{g.grating_index}"] = float(g.k_pm_per_ue)
-                QMessageBox.information(self, "已应用",
-                    f"传感器 k{g.grating_index} = {g.k_pm_per_ue:.4f} pm/με\n⚠ 仅本次会话有效")
-                break
+
+        # 同名覆盖确认
+        if sensor_name in self._strain_configs:
+            r = QMessageBox.question(self, "覆盖确认",
+                f"传感器 '{sensor_name}' 已在列表中，是否覆盖？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
+
+        # 加入列表
+        self._strain_configs[sensor_name] = sub
+        pc = self._get_or_create_project_config()
+        pc.strain[sensor_name] = sub
+        self._set_dirty()
+        self._refresh_sensor_list(select_sensor=sensor_name)
+        self._current_sensor = sensor_name
+        self.strain_progress.setText(f"✅ 已加入列表 — {sensor_name}: Ke1={self._ke_results.get('Ke1', 0):.4f}")
+
+    def _clear_workspace(self):
+        """清空工作态 (不删列表)"""
+        self._current_sensor = None
+        self._working_result = None
+        self._last_result = None
+        self._ke_results = {}
+        self._grating_map = {}
+        self._readings = {}
+        self._levels = self._generate_default_levels()
+        self._config.update({
+            "gauge_length_mm": 80.0, "mode": "tension_only",
+            "n_cycles": 1, "grating_kind": "single",
+            "anchored_grating": None,
+        })
+        self.config_btn.setText(f"⚙ 标定参数: {self._config_label()}")
+        self.strain_progress.setText("")
+        self.apply_coef_btn.setEnabled(False)
+        self.export_se_btn.setEnabled(False)
+        self.export_sw_btn.setEnabled(False)
+        self.commit_list_btn.setEnabled(False)
+        # 清空图表
+        for panel in [self.curve_panel, self.resid_panel, self.bar_panel]:
+            fig = panel.get_figure(); fig.clear()
+            panel.draw()
+        self.strain_result_text.clear()
+
+    def _load_sensor_to_workspace(self, sensor_name: str):
+        """加载已保存传感器的配置到当前工作态 (config/levels/readings/grating_map/ke_results)"""
+        cfg = self._strain_configs.get(sensor_name)
+        if cfg is None:
+            return
+        # 恢复 config
+        mode_map = {"single": "single", "dual_working": "dual_both", "dual_anchored": "dual_anchored"}
+        self._config.update({
+            "gauge_length_mm": getattr(cfg, 'gauge_length_mm', 80.0),
+            "mode": "tension_only",  # readings 结构决定了 mode; 保持简单
+            "n_cycles": getattr(cfg, 'n_cycles', 1),
+            "grating_kind": mode_map.get(getattr(cfg, 'sensor_mode', 'single'), 'single'),
+            "anchored_grating": None,
+        })
+        self._levels = self._generate_default_levels()  # 标距可能变了
+        self._grating_map = dict(getattr(cfg, 'grating_map', {}) or {})
+        self._ke_results = dict(getattr(cfg, 'ke_results', {}) or {})
+        # 从 readings 重建 _levels
+        rd_list = getattr(cfg, 'readings', []) or []
+        if rd_list and isinstance(rd_list, list) and isinstance(rd_list[0], dict):
+            levels_from_cfg = [r.get("disp_mm", 0.0) for r in rd_list]
+            if levels_from_cfg:
+                self._levels = levels_from_cfg
+        self._readings = {}  # readings 存的是 raw dict 格式，这里不清零等 _open_readings 载入
+        self._current_sensor = sensor_name
+        self.config_btn.setText(f"⚙ 标定参数: {self._config_label()}")
+        # 按钮使能
+        if self._ke_results:
+            self.apply_coef_btn.setEnabled(True)
+            self.export_se_btn.setEnabled(True)
+            self.export_sw_btn.setEnabled(True)
+
+    def _lazy_recompute_charts(self, sensor_name: str):
+        """从 StrainSubConfig 的 readings/ke_results 懒重算图表。
+
+        DataFrame None+empty 守卫生效，dict 访问全用 .get()。
+        """
+        cfg = self._strain_configs.get(sensor_name)
+        if cfg is None:
+            return
+        ke = getattr(cfg, 'ke_results', {}) or {}
+        rd_list = getattr(cfg, 'readings', []) or []
+        gauge = getattr(cfg, 'gauge_length_mm', 80.0)
+        mode = getattr(cfg, 'sensor_mode', 'single')
+        # 从 readings 提取 eps_theory
+        levels = []
+        eps_theory = []
+        for r in rd_list:
+            if not isinstance(r, dict):
+                continue
+            d = r.get("disp_mm", 0.0)
+            levels.append(d)
+            eps_theory.append(d / gauge * 1e6 if gauge > 0 else 0.0)
+
+        # 文本
+        mode_names = {"single": "单栅", "dual_working": "双栅-双工作", "dual_anchored": "双栅-锚固"}
+        lines = [f"传感器: {sensor_name}  |  模式: {mode_names.get(mode, mode)}  |  标距: {gauge:.0f} mm\n"]
+        if self._grating_map:
+            lines.append(f"备注映射: {', '.join(f'{k}→{v}' for k, v in self._grating_map.items())}")
+        if ke:
+            lines.append(f"应变系数: {', '.join(f'{k}={v:.4f} pm/με' for k, v in ke.items())}\n")
+        lines.append("(图表从保存的 readings 懒重算)")
+        self.strain_result_text.setText("\n".join(lines))
+
+        # 标定曲线 (从 Ke 重画拟合线)
+        fig = self.curve_panel.get_figure(); fig.clear()
+        ax = fig.add_subplot(111)
+        if eps_theory:
+            eps_arr = np.array(eps_theory, dtype=np.float64)
+            for gi, key in enumerate(["Ke1", "Ke2"], start=1):
+                k_val = ke.get(key, 0)
+                if abs(k_val) > 1e-10:
+                    ax.plot(eps_arr, k_val * eps_arr, "-", lw=2,
+                            label=f"G{gi}: k={k_val:.4f} pm/με")
+        ax.set_xlabel("理论应变 (με)"); ax.set_ylabel("波长漂移 (pm)")
+        ax.set_title(f"Δλ-ε 标定曲线 — {sensor_name}"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.set_xlim(left=0); ax.set_ylim(bottom=0)
+        self.curve_panel.draw()
+
+        # 柱状图
+        fig2 = self.bar_panel.get_figure(); fig2.clear()
+        ax2 = fig2.add_subplot(111)
+        labels_ok = []; k_vals = []
+        for gi, key in enumerate(["Ke1", "Ke2"], start=1):
+            k_val = ke.get(key, 0)
+            if abs(k_val) > 1e-10:
+                labels_ok.append(f"G{gi}")
+                k_vals.append(k_val)
+        if labels_ok:
+            x = np.arange(len(labels_ok)); w = 0.3
+            ax2.bar(x, k_vals, w, label="Ke (pm/με)")
+            ax2.set_xticks(x); ax2.set_xticklabels(labels_ok)
+        ax2.set_title(f"核心指标 — {sensor_name}"); ax2.legend(fontsize=7); ax2.grid(alpha=0.3, axis="y")
+        self.bar_panel.draw()
+
+        # 残差图 (暂无残差数据 → 空白)
+        fig3 = self.resid_panel.get_figure(); fig3.clear()
+        fig3.add_subplot(111).set_title("线性残差 — (需重新标定以获取残差数据)")
+        self.resid_panel.draw()
+
+    def _on_sensor_selected(self, row: int):
+        """列表选中项变化 → 加载传感器配置为当前工作结果 + 懒重算图表"""
+        if row < 0:
+            self._current_sensor = None
+            self.delete_sensor_btn.setEnabled(False)
+            return
+        item = self.sensor_list.item(row)
+        if item is None:
+            return
+        text = item.text() or ""
+        # 从标签首段提取传感器名 ("A1  双栅-双工作...")
+        sensor_name = text.split("  ")[0].strip()
+        if sensor_name not in self._strain_configs:
+            return
+        cfg = self._strain_configs[sensor_name]
+        self._load_sensor_to_workspace(sensor_name)
+        self._working_result = cfg  # 同步为当前工作结果
+        self._lazy_recompute_charts(sensor_name)
+        self.delete_sensor_btn.setEnabled(True)
+        self.commit_list_btn.setEnabled(True)
+
+    def _new_calibration(self):
+        """清空工作态，准备录入新传感器"""
+        # 只在有未分析草稿 (未进列表) 时警告
+        has_draft = bool(self._grating_map or self._readings)
+        has_saved = self._current_sensor is not None and self._current_sensor in self._strain_configs
+        if has_draft and not has_saved:
+            r = QMessageBox.question(self, "新建标定",
+                "当前读数录入尚未提交分析，新建将丢弃草稿，是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        # 已分析传感器安全留在列表，直接新建
+        self.sensor_list.clearSelection()
+        self._clear_workspace()
+        self.sensor_list.setCurrentRow(-1)
+
+    def _delete_sensor(self):
+        """删除选中传感器 (同步 project.strain)"""
+        if self._current_sensor is None:
+            return
+        s_name = self._current_sensor
+        r = QMessageBox.question(self, "确认删除",
+            f"确定删除传感器 '{s_name}' 的标定数据？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        # 从活状态移除
+        self._strain_configs.pop(s_name, None)
+        # 从 project.strain 移除
+        pc = self._get_or_create_project_config()
+        pc.strain.pop(s_name, None)
+        self._set_dirty()
+        # 清空工作态 + 刷新列表
+        self._clear_workspace()
+        self._refresh_sensor_list()
+        self.sensor_list.setCurrentRow(-1)
+
+    # ── 项目配置管理 ──
+
+    def _save_project(self):
+        """保存项目配置 (温度段 + 应变段)，可从温度页或应变页调用"""
+        from py.calibration.project_config import ProjectConfigManager
+        ctw = self._get_cal_tab_widget()
+        tp = ctw.temp_page if ctw is not None else None
+        pc = ProjectConfigManager.capture(tp, self)
+
+        default_name = f"项目_{datetime.now().strftime('%Y%m%d_%H%M')}"
+
+        name, ok = QInputDialog.getText(
+            self, "保存项目配置", "配置名称:", text=default_name)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        pc.name = name
+
+        try:
+            path = ProjectConfigManager.save(pc)
+            if ctw is not None:
+                ctw.project_config = pc
+            self._clear_dirty()
+            QMessageBox.information(self, "已保存",
+                f"项目配置已保存到:\n{path}\n\n"
+                f"温度段: {'有' if pc.temperature else '无'}  |  "
+                f"应变传感器: {len(pc.strain)} 个")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", str(e))
+
+    def _load_project(self):
+        """加载项目配置，回填温度段 + 应变段"""
+        if self._project_dirty:
+            r = QMessageBox.question(self, "未保存更改",
+                "项目有未保存的更改，是否先保存再加载？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel)
+            if r == QMessageBox.StandardButton.Cancel:
+                return
+            if r == QMessageBox.StandardButton.Yes:
+                self._save_project()
+                if self._project_dirty:  # 用户取消了保存对话框
+                    return
+
+        from py.calibration.project_config import ProjectConfigManager
+
+        projects = ProjectConfigManager.list_all()
+        if not projects:
+            QMessageBox.information(self, "无配置", "还没有保存的项目配置文件。")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("加载项目配置"); dlg.resize(650, 400)
+        layout = QVBoxLayout(dlg)
+
+        lst = QListWidget()
+        for p in projects:
+            key = p.get("_key", p.get("name", "?"))
+            created = str(p.get("created_at", ""))[:16]
+            n_strain = len(p.get("strain", {}) or {})
+            n_temp = len((p.get("temperature", {}) or {}).get("s_eff_results", {}) or {})
+            lst.addItem(f"{key}\n  创建: {created}  |  温度S_eff: {n_temp}  |  应变传感器: {n_strain}")
+        layout.addWidget(lst)
+
+        btn_row = QHBoxLayout()
+        load_btn = create_button("加载选中", dlg.accept, "primary")
+        btn_row.addWidget(load_btn)
+        btn_row.addWidget(create_button("取消", dlg.reject, "secondary"))
+        layout.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted or lst.currentRow() < 0:
+            return
+
+        proj_dict = projects[lst.currentRow()]
+        name = proj_dict.get("_key", proj_dict.get("name", ""))
+
+        try:
+            pc = ProjectConfigManager.load(name)
+
+            ctw = self._get_cal_tab_widget()
+            tp = ctw.temp_page if ctw is not None else None
+            ProjectConfigManager.restore(pc, tp, self)
+
+            QMessageBox.information(self, "已加载",
+                f"项目 '{name}' 已恢复。\n\n"
+                f"温度段: {'有' if pc.temperature else '无'}  |  "
+                f"应变传感器: {len(pc.strain)} 个")
+        except Exception as e:
+            QMessageBox.critical(self, "加载失败", str(e))
+
+    def _apply_coefficients(self):
+        """批量应用列表全部传感器的 Ke 系数到项目配置/Phase B。
+
+        遍历 self._strain_configs 中每个传感器：
+          - 双栅 (dual_working / dual_anchored) → 写 ke_table + strain 子配置 + 同步 phase_b_state
+          - 单栅 (single) → 仅存 strain 子配置
+        """
+        if not self._strain_configs:
+            return  # 按钮 disabled 时不会触发
+
+        pc = self._get_or_create_project_config()
+        has_temp = self._has_temperature_data()
+        tp = self._get_temp_page()
+
+        dual_count = 0
+        single_count = 0
+        applied: list[str] = []
+
+        for s_name, cfg in self._strain_configs.items():
+            mode = getattr(cfg, 'sensor_mode', 'single')
+            ke = getattr(cfg, 'ke_results', {}) or {}
+            if not ke:
+                continue
+
+            ke_dict = {str(k): float(v) for k, v in ke.items()}
+
+            # 写入 strain 子配置 (所有模式都存)
+            if s_name not in pc.strain:
+                pc.strain[s_name] = cfg
+
+            # 判单栅/双栅 (在温度数据中的角色)
+            is_dual = mode in ("dual_working", "dual_anchored")
+
+            if has_temp and is_dual:
+                # 双栅 → 写 ke_table + 同步 phase_b_state
+                if pc.temperature is None:
+                    pc.temperature = {}
+                pc.temperature["ke_table"] = pc.temperature.get("ke_table", {})
+                pc.temperature["ke_table"][s_name] = ke_dict
+
+                if tp is not None:
+                    pb_state = getattr(tp, '_phase_b_state', None) or {}
+                    pb_state["ke_table"] = pb_state.get("ke_table", {})
+                    pb_state["ke_table"][s_name] = ke_dict
+                    tp._phase_b_state = pb_state
+
+                dual_count += 1
+            else:
+                # 单栅 (或温度未做) → 仅 strain
+                single_count += 1
+
+            applied.append(s_name)
+
+        if not applied:
+            QMessageBox.warning(self, "提示", "没有传感器有有效的 Ke 系数。")
+            return
+
+        # 汇总
+        parts = [f"已应用 {len(applied)} 个传感器："]
+        if dual_count:
+            parts.append(f"  • {dual_count} 个双栅 — 已写入 Phase B Ke 表，下次打开 Phase B 即可使用")
+        if single_count:
+            if has_temp:
+                parts.append(f"  • {single_count} 个单栅/无温度 — 仅保存应变配置，不参与 Phase B 解耦")
+            else:
+                parts.append(f"  • {single_count} 个 — 温度标定未做，Coeff保存至项目配置")
+
+        QMessageBox.information(self, "应用完成", "\n".join(parts))
+
+        # 保留旧行为: 写 sensor_system.constants (会话级 — 仅第一个传感器)
+        if self._last_result is not None:
+            main_win = self.window()
+            ss = getattr(main_win, "sensor_system", None)
+            if ss is not None and ss.sensors:
+                for g in self._last_result.gratings:
+                    if not math.isnan(g.k_pm_per_ue):
+                        ss.sensors[0].constants[f"k{g.grating_index}"] = float(g.k_pm_per_ue)
 
     def _export_strain_excel(self):
         if not self._last_result: return
@@ -2531,21 +3344,19 @@ class StrainCalibrationPage(QWidget):
             export_strain_excel(self._last_result, path)
             QMessageBox.information(self, "完成", f"已保存: {path}")
 
-    def _export_strain_word(self):
-        if not self._last_result: return
-        from py.report_builder.word_builder import WordBuilder
-        from py.report_builder.models import WordReport, WordSection
-        r = self._last_result
-        lines = [f"标距: {r.gauge_length_mm}mm, {r.mode}, {r.n_cycles}循环"]
-        for g in r.gratings:
-            lines.append(f"光栅{g.grating_index}: k={g.k_pm_per_ue:.6f} R²={g.R2:.6f} NL={g.nonlinearity_pct_fs:.2f}%")
-        report = WordReport(title="应变标定报告", author="DataProcessor Pro", date=datetime.now().strftime("%Y-%m-%d"),
-                            sections=[WordSection(heading="标定结果", content_paragraphs=lines)])
-        doc = WordBuilder().build(report)
-        path, _ = QFileDialog.getSaveFileName(self, "保存", "应变标定报告.docx", "Word (*.docx)")
-        if path:
-            with open(path, "wb") as f: f.write(doc)
-            QMessageBox.information(self, "完成", f"已保存: {path}")
+    def _on_generate_report(self):
+        """检测报告 — 占位，功能开发中"""
+        QMessageBox.information(self, "检测报告",
+            "检测报告功能开发中。\n\n"
+            "当前已持久化的数据字段:\n"
+            "• 应变系数 Ke_results (pm/με)\n"
+            "• 应变标定曲线 (charts_meta)\n"
+            "• 温度系数 S_eff (pm/°C)\n"
+            "• 解耦诊断结果 (e_mean/e_std/rating)\n\n"
+            "上述字段已完整保存在项目配置中，为后续报告生成预留。")
+
+    # 保留旧方法名向后兼容 (不再被按钮调用，但可能被外部引用)
+    _export_strain_word = _on_generate_report
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2553,10 +3364,14 @@ class StrainCalibrationPage(QWidget):
 # ═══════════════════════════════════════════════════════════════════════
 
 class CalibrationTabWidget(QWidget):
-    """传感器标定 — 温度标定 + 应变标定 双子页"""
+    """传感器标定 — 温度标定 + 应变标定 双子页
+
+    持有跨模块共享的 ProjectConfig 实例。
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.project_config = None  # ProjectConfig | None — 阶段 5 统一 save/load
         self._build_ui()
 
     def _build_ui(self):

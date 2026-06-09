@@ -31,6 +31,21 @@
 - 任何 `.py` 文件编辑后、提交前，**必须**跑 `pyright <changed_files>`，红错全清才能 commit。
 - 若 pre-commit hook 已启用，`git commit` 会自动 enforce 这条。
 
+**7. 类型忽略注解使用规范（硬纪律）**
+- **禁止**使用整体跳过的 `# type: ignore`（无具体规则名），它会吞掉该行所有未来真正的类型错误。
+- 只准用 `# pyright: ignore[<具体rule>]` 并**必须**在同一行附原因注释。例：
+  ```python
+  _ = not df  # pyright: ignore[reportGeneralTypeIssues]  # intentional: testing DataFrame __bool__ raises
+  ```
+- 文件级关 rule（`# pyright: reportGeneralTypeIssues=false`）**仅限**第三方库 stub 已知误报（如 python-pptx/python-docx 构造器被误识为函数签名），**必须**附注释说明原因。
+- **ignore 是最后手段，不是第一手段**。优先用 `cast()` / `field(default_factory=...)` / 补字段 / `str()` 转换等类型收窄手段让 pyright 满意。
+
+**8. 配置/字典取值缺键 + None 双守卫（硬纪律）**
+- 若字典键可能存在但值为 `None`（如 `self._config["anchored_grating"] = None`），**必须**用 `d.get(key) or default` 而非 `d.get(key, default)`。
+- `d.get(key, default)` 的 default 只在**缺键**时生效，不挡 `None` 值。
+- 例 `(self._config.get("anchored_grating") or 2) - 1` — 同时挡缺键和 None。
+- 同样的陷阱也存在于 `str(dict).get(...)` — 关了 `reportAttributeAccessIssue` 让这类错误静默通过（已改回 warning，见 `pyproject.toml` 行 15-17 注释）。
+
 ---
 
 ## 🏗 项目拓扑与架构

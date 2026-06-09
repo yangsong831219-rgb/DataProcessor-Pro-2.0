@@ -1,4 +1,4 @@
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional
 import json
 from pathlib import Path
@@ -17,7 +17,7 @@ class FileTemplate:
     delimiter: str = ","
     skip_rows: int = 0
     data_start_row: int = 1
-    columns: list[ColumnDef] = None
+    columns: list[ColumnDef] = field(default_factory=list)
 
     def __post_init__(self):
         if self.columns is None:

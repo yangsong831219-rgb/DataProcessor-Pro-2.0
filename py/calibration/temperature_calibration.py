@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, cast
 
 import numpy as np
 import pandas as pd
@@ -43,7 +43,7 @@ def compute_dL(
 
     # 丢弃波长为空的行
     valid = df[wavelength_cols].notna().all(axis=1)
-    df = df[valid].reset_index(drop=True)
+    df = cast(pd.DataFrame, df[valid].reset_index(drop=True))
 
     if len(df) == 0:
         raise ValueError("有效波长数据为空")
