@@ -250,6 +250,83 @@ class TestClassifyOpenAIError:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+class TestGenerateNeverReturnsEmpty:
+    """【契约核心】generate() 失败必须抛 AIClientError，绝不再返回 ""。此测试是整个阶段一+阶段二+阶段三的基石。"""
+
+    def _make_mock_client(self, monkeypatch):
+        from core.ai_client import AIClient
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test-key")
+        return client
+
+    def test_empty_string_is_never_returned_not_configured(self, monkeypatch):
+        """API Key 未配置 → 抛 AIClientNotConfiguredError，不是 return ''"""
+        from core.ai_client import AIClient
+        from core.ai_errors import AIClientNotConfiguredError
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "api_key", "")
+        with pytest.raises(AIClientNotConfiguredError):
+            result = client.generate("hello")
+            # 安全带：万一没抛，断言结果不是 ""
+            assert result != "", "generate() returned empty string instead of raising"
+
+    def test_empty_string_is_never_returned_auth_error(self, monkeypatch):
+        """401 → 抛 AIClientAuthError，不是 return ''"""
+        from core.ai_errors import AIClientAuthError
+        client = self._make_mock_client(monkeypatch)
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: (_ for _ in ()).throw(
+            AIClientAuthError("bad key", status_code=401)))
+        with pytest.raises(AIClientAuthError):
+            result = client.generate_with_retry("test", max_retries=0)
+            assert result != "", "generate_with_retry returned empty string instead of raising"
+
+    def test_empty_string_is_never_returned_server_error(self, monkeypatch):
+        """500 → 抛 AIClientServerError，不是 return ''"""
+        from core.ai_errors import AIClientServerError
+        client = self._make_mock_client(monkeypatch)
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: (_ for _ in ()).throw(
+            AIClientServerError("internal error", status_code=500)))
+        with pytest.raises(AIClientServerError):
+            result = client.generate_with_retry("test", max_retries=0)
+            assert result != "", "generate_with_retry returned empty string instead of raising"
+
+    def test_empty_string_is_never_returned_timeout(self, monkeypatch):
+        """超时 → 抛 AIClientTimeoutError，不是 return ''"""
+        from core.ai_errors import AIClientTimeoutError
+        client = self._make_mock_client(monkeypatch)
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: (_ for _ in ()).throw(
+            AIClientTimeoutError("timed out")))
+        with pytest.raises(AIClientTimeoutError):
+            result = client.generate_with_retry("test", max_retries=0)
+            assert result != "", "generate_with_retry returned empty string instead of raising"
+
+    def test_empty_string_is_never_returned_empty_response(self, monkeypatch):
+        """200 但空 content → 抛 AIClientEmptyResponseError，不是 return ''"""
+        from core.ai_errors import AIClientEmptyResponseError
+        client = self._make_mock_client(monkeypatch)
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: (_ for _ in ()).throw(
+            AIClientEmptyResponseError("空响应")))
+        with pytest.raises(AIClientEmptyResponseError):
+            result = client.generate_with_retry("test", max_retries=0)
+            assert result != "", "空响应绝不能静默通过"
+
+    def test_generate_fn_callback_also_throws(self, monkeypatch):
+        """get_generate_fn() 返回的回调失败也抛异常（非 return ''），契约穿透到 engine 层"""
+        from core.ai_errors import AIClientServerError
+        from core.ai_client import AIClient
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: (_ for _ in ()).throw(
+            AIClientServerError("boom", status_code=500)))
+        fn = client.get_generate_fn()
+        with pytest.raises(AIClientServerError, match="boom"):
+            result = fn("hello")
+            assert result != "", "generate_fn returned '' instead of raising"
+
+
 class TestAIClientGenerateErrors:
     """AIClient.generate 按错误抛出类型化异常，无网络调用"""
 
@@ -405,3 +482,91 @@ class TestGenerateWithRetry:
         import pytest
         with pytest.raises(AIClientEmptyResponseError):
             client.generate_with_retry("hi", max_retries=2, base_backoff_s=0.01)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test 8: ReportWorker 错误链路 — generate() 异常 → error 信号 → UI
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestReportWorkerErrorChain:
+    """【调用点契约】generate() 抛 AIClientError → ReportWorker.run() 捕获
+    → error 信号发射 → 调用方收到错误文本，绝不静默。"""
+
+    def _wait_worker_error(self, worker, timeout_ms: int = 3000):
+        """启动 worker 并等待 error 信号触发，返回发射的错误文本。超时返回 None。"""
+        from PyQt6.QtCore import QEventLoop, QTimer
+
+        result = []
+        loop = QEventLoop()
+
+        worker.error.connect(lambda val: (result.append(val), loop.quit()))
+        QTimer.singleShot(timeout_ms, loop.quit)
+        worker.start()
+        loop.exec()
+        return result[0] if result else None
+
+    def test_worker_error_signal_on_auth_failure(self, qapp):
+        """work_fn 抛 AIClientAuthError → ReportWorker.error 发射错误文本"""
+        from core.ai_errors import AIClientAuthError
+        from ui.report_worker import ReportWorker
+
+        def bad_fn(*args, **kwargs):
+            raise AIClientAuthError("API Key 无效", status_code=401)
+
+        worker = ReportWorker(bad_fn)
+        error_text = self._wait_worker_error(worker)
+        assert error_text is not None, "ReportWorker must emit error signal"
+        assert "401" in error_text or "API Key" in error_text or "无效" in error_text, \
+            f"error signal should contain diagnostic info, got: {error_text!r}"
+
+    def test_worker_error_signal_on_server_error(self, qapp):
+        """work_fn 抛 AIClientServerError → error 信号含 status_code"""
+        from core.ai_errors import AIClientServerError
+        from ui.report_worker import ReportWorker
+
+        def bad_fn(*args, **kwargs):
+            raise AIClientServerError("服务端爆炸", status_code=500)
+
+        worker = ReportWorker(bad_fn)
+        error_text = self._wait_worker_error(worker)
+        assert error_text is not None, "ReportWorker must emit error signal"
+        assert "500" in error_text or "服务端" in error_text or "Server" in error_text, \
+            f"error should contain diagnostic info, got: {error_text!r}"
+
+    def test_worker_error_signal_on_empty_response(self, qapp):
+        """空响应 → error 信号发射，绝不静默"""
+        from core.ai_errors import AIClientEmptyResponseError
+        from ui.report_worker import ReportWorker
+
+        def bad_fn(*args, **kwargs):
+            raise AIClientEmptyResponseError("AI 返回了空响应")
+
+        worker = ReportWorker(bad_fn)
+        error_text = self._wait_worker_error(worker)
+        assert error_text is not None, "空响应必须通过 error 信号报告"
+        assert "空" in error_text or "Empty" in error_text or "empty" in error_text.lower(), \
+            f"error should mention empty response, got: {error_text!r}"
+
+    def test_worker_finished_does_not_fire_on_error(self, qapp):
+        """work_fn 抛异常 → finished 信号不触发，只有 error（防止误当成功）"""
+        from core.ai_errors import AIClientServerError
+        from ui.report_worker import ReportWorker
+
+        finished_fired = []
+
+        def bad_fn(*args, **kwargs):
+            raise AIClientServerError("fail", status_code=500)
+
+        worker = ReportWorker(bad_fn)
+        worker.finished.connect(lambda v: finished_fired.append(v))
+        # 等待 error 信号确认 worker 已跑完
+        error_text = self._wait_worker_error(worker)
+        assert error_text is not None
+        # 给 finished 信号一点时间——它不应该触发
+        from PyQt6.QtCore import QTimer, QEventLoop
+        loop = QEventLoop()
+        QTimer.singleShot(300, loop.quit)
+        loop.exec()
+        assert len(finished_fired) == 0, \
+            f"finished 不应在异常时触发，但触发了: {finished_fired}"
