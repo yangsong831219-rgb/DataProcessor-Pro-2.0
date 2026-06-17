@@ -391,29 +391,11 @@ class DataProcessorWindow(QMainWindow):
     def _auto_populate_fbgs(self, df):
         """从数据文件列名自动识别FBG传感器并填充FBG定义表。
 
-        优先使用正则 r'^[wW]\d+' 捕获新版暗号列名，
-        回退到 '波长'/'FBG_' 传统列名（过渡兼容）。
+        检测逻辑委托给 utils.column_utils.detect_fbg_columns。
         """
-        if df is None or df.empty:
-            return 0
+        from utils.column_utils import detect_fbg_columns
 
-        import re
-        W_PATTERN = re.compile(r'^[wW](\d+)(?:-.*)?$')
-        w_matches = sorted(
-            [(int(m.group(1)), c) for c in df.columns for m in [W_PATTERN.match(str(c))] if m],
-            key=lambda x: x[0]
-        )
-        fbg_cols = [c[1] for c in w_matches]
-
-        if not fbg_cols:
-            fbg_cols = [str(c) for c in df.columns if '波长' in str(c) or 'wavelength' in str(c).lower()]
-        if not fbg_cols:
-            fbg_cols = [str(c) for c in df.columns if str(c).upper().startswith('FBG_')]
-        if not fbg_cols:
-            w_digit_cols = [str(c) for c in df.columns
-                           if str(c).upper().startswith('W') and str(c)[1:].isdigit()]
-            if len(w_digit_cols) >= 2:
-                fbg_cols = w_digit_cols
+        fbg_cols = detect_fbg_columns(df)
         if not fbg_cols:
             return 0
 
@@ -1926,34 +1908,9 @@ class DataProcessorWindow(QMainWindow):
 
     @staticmethod
     def _is_data_row(parts):
-        """判断一行数据是真实数据还是表头
-
-        返回: True=数据行, False=表头行
-        """
-        import re
-        data_count = 0
-        header_count = 0
-        for p in parts:
-            p = p.strip()
-            if not p:
-                continue
-            try:
-                float(p)
-                data_count += 1
-                continue
-            except ValueError:
-                pass
-            if re.match(r'^\d{2,4}[/-]\d{1,2}[/-]\d{1,2}', p):
-                data_count += 1
-                continue
-            if re.match(r'^[A-Za-z_]', p) or '波长' in p or '时间' in p or '温度' in p or '应变' in p:
-                header_count += 1
-                continue
-            data_count += 1
-        total = data_count + header_count
-        if total > 0:
-            return data_count / total >= 0.5
-        return True
+        """判断一行数据是真实数据还是表头。委托给 utils.column_utils.is_data_row。"""
+        from utils.column_utils import is_data_row
+        return is_data_row(parts)
 
     def _load_file_header_lines(self, file_path, skip_rows):
         """读取文件的格式头行，最多读取前500行以定位数据起始行"""
@@ -2552,9 +2509,9 @@ class DataProcessorWindow(QMainWindow):
 
     @staticmethod
     def _clean_sensor_keys(results: dict) -> dict:
-        """剥离结果字典键中的中英文括号及单位后缀"""
-        return {re.sub(r'[\(（].*?[\)）]', '', str(k)).strip(): v
-                for k, v in results.items()}
+        """剥离结果字典键中的中英文括号及单位后缀。委托给 utils.column_utils.clean_dict_keys。"""
+        from utils.column_utils import clean_dict_keys
+        return clean_dict_keys(results)
 
     # ============ Cleaning Operations ============
 
