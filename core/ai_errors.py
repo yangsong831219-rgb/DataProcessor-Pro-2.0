@@ -91,6 +91,26 @@ class AIClientNotConfiguredError(AIClientError):
         return False
 
 
+class ReportSchemaError(AIClientError):
+    """AI 返回的 JSON 与约定的 Schema 不匹配 — 不可重试（除非调用方回喂修复）。"""
+
+    def __init__(
+        self,
+        message: str,
+        raw_text: str = "",
+        missing_fields: list[str] | None = None,
+        type_errors: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text[:500] if raw_text else ""
+        self.missing_fields = missing_fields or []
+        self.type_errors = type_errors or []
+
+    @property
+    def retryable(self) -> bool:
+        return False  # 需要修正 prompt/回喂修复，不应盲目重试
+
+
 # ── 错误分类工厂 ──
 
 

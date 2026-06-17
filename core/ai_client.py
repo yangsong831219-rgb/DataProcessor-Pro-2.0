@@ -359,6 +359,96 @@ class AIClient:
         assert last_exc is not None  # pyright 推断
         raise last_exc
 
+    def generate_structured(
+        self,
+        prompt: str,
+        schema: type[BaseModel],
+        system_prompt: str = "",
+        temperature: float = 0.3,
+        max_tokens: int = 2048,
+        *,
+        max_schema_retries: int = 1,
+    ) -> Dict[str, Any]:
+        """调用 LLM 并返回通过指定 Pydantic Schema 校验的 dict。
+
+        对支持 json_schema 的端点使用 OpenAI 原生结构化输出；
+        不支持时回退为 json_object + 后端校验 + 最多 1 次回喂修复重试。
+
+        Args:
+            prompt: 用户提示词
+            schema: Pydantic BaseModel 子类（如 WordSection）
+            system_prompt: 系统提示词
+            temperature: 温度参数
+            max_tokens: 最大生成长度
+            max_schema_retries: schema 校验失败时的回喂重试次数（0=不重试）
+
+        Returns:
+            Pydantic model 的 dict 表示
+
+        Raises:
+            AIClientError: API 调用失败
+            ReportSchemaError: 校验失败（含缺失字段/类型错误详情）
+        """
+        from core.ai_errors import ReportSchemaError
+
+        schema_json = schema.model_json_schema()
+        schema_name = schema_json.get("title", schema.__name__)
+
+        for attempt in range(max_schema_retries + 1):
+            raw = self.generate(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+            # 提取 JSON 块
+            import re as _re
+            m = _re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', raw)
+            json_str = m.group(1).strip() if m else raw.strip()
+            # 若首尾不是 { 或 [, 尝试提取
+            if not json_str.startswith(("{", "[")):
+                m2 = _re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', json_str)
+                if m2:
+                    json_str = m2.group(1)
+
+            try:
+                validated = schema.model_validate_json(json_str)
+                return validated.model_dump()
+            except Exception as e:
+                if attempt < max_schema_retries:
+                    fix_hint = (
+                        f"\n\n[系统提示：上次输出 JSON 格式校验失败，错误为: {e}。"
+                        f"请严格按 JSON Schema 修正输出。]"
+                    )
+                    prompt = prompt + fix_hint
+                else:
+                    missing: list[str] = []
+                    type_errs: list[str] = []
+                    if hasattr(e, "errors"):
+                        for err in e.errors():
+                            err_type = err.get("type", "")
+                            loc = err.get("loc", ("?",))
+                            if err_type == "missing":
+                                missing.append(str(loc[0]))
+                            else:
+                                loc_str = ".".join(str(x) for x in loc)
+                                type_errs.append(f"{loc_str}: {err.get('msg', '')}")
+                    else:
+                        type_errs = [str(e)]
+                    raise ReportSchemaError(
+                        f"AI 输出与 Schema '{schema_name}' 不匹配"
+                        + (f"（已回馈修复 {max_schema_retries} 次）" if max_schema_retries > 0 else ""),
+                        raw_text=raw,
+                        missing_fields=missing,
+                        type_errors=type_errs,
+                    ) from e
+
+        # 理论上不会到达这里（所有路径均 return 或 raise）
+        raise ReportSchemaError(
+            f"generate_structured 意外退出：Schema '{schema_name}' 校验失败"
+        )
+
     def get_generate_fn(self) -> Callable[..., str]:
         """返回兼容 report_engine 的 generate_fn 回调。
 

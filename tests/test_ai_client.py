@@ -570,3 +570,197 @@ class TestReportWorkerErrorChain:
         loop.exec()
         assert len(finished_fired) == 0, \
             f"finished 不应在异常时触发，但触发了: {finished_fired}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 2: ReportSchemaError + generate_structured + Pydantic 校验
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestReportSchemaError:
+    """ReportSchemaError 构造 + 诊断字段"""
+
+    def test_constructor_with_diagnostics(self):
+        from core.ai_errors import ReportSchemaError
+        e = ReportSchemaError(
+            "Schema 不匹配",
+            raw_text='{"heading": 123}',
+            missing_fields=["heading"],
+            type_errors=["heading: Input should be a string"],
+        )
+        assert e.retryable is False
+        assert e.raw_text == '{"heading": 123}'
+        assert "heading" in e.missing_fields
+        assert len(e.type_errors) == 1
+
+    def test_no_diagnostics_defaults(self):
+        from core.ai_errors import ReportSchemaError
+        e = ReportSchemaError("bare error")
+        assert e.missing_fields == []
+        assert e.type_errors == []
+        assert e.raw_text == ""
+
+
+class TestMissingFieldsExtraction:
+    """_missing_fields_from_error / _type_errors_from_error 从 ValidationError 提取诊断"""
+
+    def test_missing_fields(self):
+        from pydantic import BaseModel, ValidationError
+        from core.report_engine import _missing_fields_from_error
+
+        class T(BaseModel):
+            name: str
+
+        try:
+            T.model_validate_json('{}')
+        except ValidationError as e:
+            missing = _missing_fields_from_error(e)
+            assert "name" in missing
+
+    def test_type_errors(self):
+        from pydantic import BaseModel, ValidationError
+        from core.report_engine import _type_errors_from_error
+
+        class T(BaseModel):
+            age: int
+
+        try:
+            T.model_validate_json('{"age": "not-a-number"}')
+        except ValidationError as e:
+            type_errs = _type_errors_from_error(e)
+            assert any("age" in te for te in type_errs)
+
+
+class TestGenerateStructured:
+    """generate_structured() — 调用 LLM + Pydantic schema 校验"""
+
+    def test_valid_json_passes_validation(self, monkeypatch):
+        """AI 返回合法 WordSection JSON → 返回 dict"""
+        from core.ai_client import AIClient
+        from core.report_models import WordSection
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        valid_resp = '{"heading": "Test", "paragraphs": ["p1", "p2"], "image_anchors": []}'
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: valid_resp)
+
+        result = client.generate_structured("write a section", WordSection, max_schema_retries=0)
+        assert result["heading"] == "Test"
+        assert len(result["paragraphs"]) == 2
+
+    def test_invalid_json_raises_report_schema_error(self, monkeypatch):
+        """AI 返回非法 JSON → ReportSchemaError（不静默）"""
+        from core.ai_client import AIClient
+        from core.report_models import WordSection
+        from core.ai_errors import ReportSchemaError
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        # 缺失必填字段 heading
+        bad_resp = '{"paragraphs": [], "image_anchors": []}'
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: bad_resp)
+
+        with pytest.raises(ReportSchemaError) as exc_info:
+            client.generate_structured("write", WordSection, max_schema_retries=0)
+        assert "WordSection" in str(exc_info.value.message)
+        # 应有诊断信息（missing_fields 或 type_errors 至少一个非空）
+        assert len(exc_info.value.missing_fields) + len(exc_info.value.type_errors) > 0, \
+            f"expected diagnostics, got missing={exc_info.value.missing_fields} type={exc_info.value.type_errors}"
+
+    def test_retry_succeeds_on_second_attempt(self, monkeypatch):
+        """首次 JSON 非法、第二次合法 → 重试成功"""
+        from core.ai_client import AIClient
+        from core.report_models import PPTSlide
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        calls = [0]
+        responses = [
+            '{"slide_title": 123, "bullet_points": [], "speaker_notes": ""}',
+            '{"slide_title": "Title", "bullet_points": ["a", "b"], "speaker_notes": "OK"}',
+        ]
+
+        def fake_gen(**kw):
+            r = responses[calls[0]]
+            calls[0] += 1
+            return r
+
+        monkeypatch.setattr(client, "generate", fake_gen)
+        result = client.generate_structured("write slide", PPTSlide, max_schema_retries=1)
+        assert result["slide_title"] == "Title"
+        assert calls[0] == 2  # 确实重试了一次
+
+    def test_retry_exhausted_raises(self, monkeypatch):
+        """持续非法 JSON → 重试耗竭后抛 ReportSchemaError"""
+        from core.ai_client import AIClient
+        from core.report_models import WordSection
+        from core.ai_errors import ReportSchemaError
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        bad_resp = '{"paragraphs": [], "image_anchors": []}'  # 缺 heading
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: bad_resp)
+
+        with pytest.raises(ReportSchemaError, match="回馈"):
+            client.generate_structured("write", WordSection, max_schema_retries=1)
+
+
+class TestSchemaRoundtrip:
+    """Pydantic ↔ dict ↔ to_builder_dict 往返"""
+
+    def test_word_section_roundtrip(self):
+        from core.report_models import WordSection
+        data = {
+            "heading": "3.1 测试节",
+            "paragraphs": ["段落一", "段落二"],
+            "image_anchors": ["[INSERT_IMAGE: fig1.png]"],
+        }
+        section = WordSection.model_validate(data)
+        assert section.heading == "3.1 测试节"
+        assert len(section.paragraphs) == 2
+        assert section.image_anchors[0] == "[INSERT_IMAGE: fig1.png]"
+
+    def test_word_report_to_builder_dict(self):
+        from core.report_models import WordReport, WordSection
+        section = WordSection(
+            heading="Ch1",
+            paragraphs=["text"],
+            image_anchors=["img.png"],
+        )
+        report = WordReport(title="R", sections=[section])
+        d = report.to_builder_dict()
+        assert d["title"] == "R"
+        assert d["sections"][0]["heading"] == "Ch1"
+        assert d["sections"][0]["content_paragraphs"] == ["text"]
+
+    def test_ppt_slide_roundtrip(self):
+        from core.report_models import PPTSlide
+        data = {
+            "slide_title": "第1页",
+            "bullet_points": ["要点1", "要点2"],
+            "speaker_notes": "详细论述",
+            "image_anchor": "[INSERT_IMAGE: chart.png]",
+        }
+        slide = PPTSlide.model_validate(data)
+        assert slide.slide_title == "第1页"
+        assert slide.bullet_points == ["要点1", "要点2"]
+
+    def test_ppt_report_to_builder_dict(self):
+        from core.report_models import PPTReport, PPTSlide
+        slide = PPTSlide(
+            slide_title="Slide 1",
+            bullet_points=["a"],
+            speaker_notes="notes",
+        )
+        report = PPTReport(title="PPT", slides=[slide])
+        d = report.to_builder_dict()
+        assert d["title"] == "PPT"
+        assert d["slides"][0]["slide_title"] == "Slide 1"

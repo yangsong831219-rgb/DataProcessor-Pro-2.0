@@ -5,6 +5,7 @@
 2. 分块生成：每章单独调用 AI，降低幻觉
 3. 无状态：所有输入通过参数传递，不持有内部状态
 4. 解耦：通过 generate_fn 回调接入任意 LLM 后端
+5. 结构化输出 (Phase 2)：Section 级别用 Pydantic 校验替换 json.loads fallback
 """
 
 from __future__ import annotations
@@ -14,7 +15,10 @@ import os
 import re
 from typing import Any, Callable, Dict, List, Optional
 
+from pydantic import ValidationError
+
 from core.report_models import PPTReport, PPTSlide, WordReport, WordSection
+from core.ai_errors import ReportSchemaError
 
 # Schema 注入 — 运行时构建
 from core.ai_client import build_schema_prompt
@@ -26,14 +30,14 @@ _PPT_SCHEMA_CACHE: str = ''
 def _get_word_schema() -> str:
     global _WORD_SCHEMA_CACHE
     if not _WORD_SCHEMA_CACHE:
-        _WORD_SCHEMA_CACHE = build_schema_prompt([WordReport, WordSection])
+        _WORD_SCHEMA_CACHE = build_schema_prompt([WordSection])
     return _WORD_SCHEMA_CACHE
 
 
 def _get_ppt_schema() -> str:
     global _PPT_SCHEMA_CACHE
     if not _PPT_SCHEMA_CACHE:
-        _PPT_SCHEMA_CACHE = build_schema_prompt([PPTReport, PPTSlide])
+        _PPT_SCHEMA_CACHE = build_schema_prompt([PPTSlide])
     return _PPT_SCHEMA_CACHE
 
 
@@ -75,14 +79,14 @@ SECTION_PROMPT_WORD = """你是一位工程技术报告撰写专家。请根据�
 项目资料上下文:
 {project_context}
 
-你必须输出合法的 JSON，且严格符合以下 Schema 结构:
+你必须输出一个合法的 JSON 对象，对应一个 ReportSection：
 {word_schema}
 
 要求：
 - 正文段落每段 100-300 字，专业、数据驱动
 - 图表引用使用 [INSERT_IMAGE: 文件名.png] 格式
 - 语言：中文
-- 只输出 JSON，不要额外文字"""
+- 只输出 JSON 对象（不是数组），不要额外文字"""
 
 SECTION_PROMPT_PPT = """你是一位技术汇报演示专家。请根据以下大纲章节，生成该页幻灯片内容。
 
@@ -94,14 +98,14 @@ SECTION_PROMPT_PPT = """你是一位技术汇报演示专家。请根据以下�
 项目资料上下文:
 {project_context}
 
-你必须输出合法的 JSON，且严格符合以下 Schema 结构:
+你必须输出一个合法的 JSON 对象，对应一个 SlideContent：
 {ppt_schema}
 
 要求：
 - 要点**最多 4 条**，每条**不超过 20 字**
 - speaker_notes 可写 50-200 字详细论述
 - 语言：中文
-- 只输出 JSON，不要额外文字"""
+- 只输出 JSON 对象，不要额外文字"""
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -203,6 +207,26 @@ def _extract_json(text: str) -> str:
     return text.strip()
 
 
+def _missing_fields_from_error(e: ValidationError) -> list[str]:
+    """从 Pydantic ValidationError 提取缺失字段名列表。"""
+    missing: list[str] = []
+    for err in e.errors():
+        if err.get("type") == "missing":
+            loc = err.get("loc", ("?",))
+            missing.append(str(loc[0]))
+    return missing
+
+
+def _type_errors_from_error(e: ValidationError) -> list[str]:
+    """从 Pydantic ValidationError 提取类型错误描述列表。"""
+    type_errs: list[str] = []
+    for err in e.errors():
+        if err.get("type") != "missing":
+            loc = ".".join(str(x) for x in err.get("loc", ("?",)))
+            type_errs.append(f"{loc}: {err.get('msg', '')}")
+    return type_errs
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 核心 API
 # ═══════════════════════════════════════════════════════════════════
@@ -279,10 +303,13 @@ def _generate_word_report(
     generate_fn: Callable[..., str],
     tools_config: Optional[dict] = None,
 ) -> dict:
-    """逐章生成 Word 报告（支持 Agentic 工具调用）。"""
+    """逐章生成 Word 报告（支持 Agentic 工具调用）。
+
+    每节输出由 Pydantic WordSection 校验；校验失败抛 ReportSchemaError，绝不静默降级。
+    """
     word_sections: List[WordSection] = []
 
-    for sec in sections:
+    for i, sec in enumerate(sections):
         heading = sec['heading']
         key_points = sec.get('key_points', [])
 
@@ -308,29 +335,20 @@ def _generate_word_report(
             )
         else:
             raw = generate_fn(prompt)
+
         json_str = _extract_json(raw)
 
-        paragraphs: List[str] = []
-        image_anchors: List[str] = []
-
         try:
-            items = json.loads(json_str)
-            if isinstance(items, list):
-                for item in items:
-                    t = item.get('type', '')
-                    if t == 'paragraph':
-                        paragraphs.append(item.get('text', ''))
-                    elif t == 'image':
-                        image_anchors.append(item.get('anchor', ''))
-        except (json.JSONDecodeError, TypeError):
-            # JSON 解析失败，整段当作文本
-            paragraphs.append(raw[:500])
+            section = WordSection.model_validate_json(json_str)
+        except ValidationError as e:
+            raise ReportSchemaError(
+                f"第 {i+1} 节 '{heading}' AI 输出与 WordSection Schema 不匹配",
+                raw_text=raw,
+                missing_fields=_missing_fields_from_error(e),
+                type_errors=_type_errors_from_error(e),
+            ) from e
 
-        word_sections.append(WordSection(
-            heading=heading,
-            paragraphs=paragraphs,
-            image_anchors=image_anchors,
-        ))
+        word_sections.append(section)
 
     report = WordReport(
         title=title,
@@ -346,10 +364,13 @@ def _generate_ppt_report(
     generate_fn: Callable[..., str],
     tools_config: Optional[dict] = None,
 ) -> dict:
-    """逐页生成 PPT 报告（支持 Agentic 工具调用）。"""
+    """逐页生成 PPT 报告（支持 Agentic 工具调用）。
+
+    每页输出由 Pydantic PPTSlide 校验；校验失败抛 ReportSchemaError，绝不静默降级。
+    """
     slides: List[PPTSlide] = []
 
-    for sec in sections:
+    for i, sec in enumerate(sections):
         heading = sec['heading']
         key_points = sec.get('key_points', [])
 
@@ -375,22 +396,20 @@ def _generate_ppt_report(
             )
         else:
             raw = generate_fn(prompt)
+
         json_str = _extract_json(raw)
 
         try:
-            data = json.loads(json_str)
-            slides.append(PPTSlide(
-                slide_title=heading,
-                bullet_points=data.get('bullet_points', key_points[:4])[:4],
-                speaker_notes=data.get('speaker_notes', ''),
-                image_anchor=data.get('image_anchor'),
-            ))
-        except (json.JSONDecodeError, TypeError):
-            slides.append(PPTSlide(
-                slide_title=heading,
-                bullet_points=key_points[:4],
-                speaker_notes=raw[:500],
-            ))
+            slide = PPTSlide.model_validate_json(json_str)
+        except ValidationError as e:
+            raise ReportSchemaError(
+                f"第 {i+1} 页 '{heading}' AI 输出与 PPTSlide Schema 不匹配",
+                raw_text=raw,
+                missing_fields=_missing_fields_from_error(e),
+                type_errors=_type_errors_from_error(e),
+            ) from e
+
+        slides.append(slide)
 
     report = PPTReport(
         title=title,
