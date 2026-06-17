@@ -211,11 +211,17 @@ DATA_AUDITOR_PROMPT_TPL = """你是一名严格的实验数据质量控制官（
 - 光纤数据：重点审查波长漂移趋势、应变/温度耦合、滤波参数
 - 通用数据：重点审查标注列一致性、缺失值处理、异常分布
 
-你的输出格式：
-- 通过：[简短说明] → 进入下一阶段
-- 驳回：[具体问题描述 + 修改建议]
+=== 输出格式（严格 JSON） ===
+你必须仅输出以下格式的 JSON 对象，不要加任何 markdown 包裹或额外文字：
 
-如果发现问题，必须给出具体的驳回理由和修改建议。"""
+{audit_schema}
+
+字段说明：
+- verdict: "pass" 表示审查通过，"reject" 表示驳回需修正
+- reasons: 审查理由列表（至少 1 条）
+- required_fixes: 若驳回，给出数据科学家必须修正的具体事项（每条≤50字）；若通过则为空数组
+
+注意：只输出 JSON 对象，一行都不能多。"""
 
 
 CHIEF_SCIENTIST_PROMPT_TPL = """你是光纤光栅传感器研发总负责人，拥有深厚的材料力学背景。
@@ -341,6 +347,33 @@ CHIEF_SCIENTIST_TOOLS = [
 ]
 
 
+# ============ Audit 裁决 Schema ============
+
+class AuditVerdict(TypedDict):
+    """结构化审查裁决 — 替代字符串匹配 "通过/驳回"。
+
+    字段:
+        verdict: "pass" | "reject"
+        reasons: 具体理由列表
+        required_fixes: 要求数据科学家修正的具体事项（驳回时必填）
+    """
+    verdict: Literal["pass", "reject"]
+    reasons: list[str]
+    required_fixes: list[str]
+
+
+AUDIT_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "reject"]},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+        "required_fixes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["verdict", "reasons", "required_fixes"],
+}
+_AUDIT_SCHEMA_STR = "{\n  \"verdict\": \"pass\",\n  \"reasons\": [\"理由1\", \"理由2\"],\n  \"required_fixes\": []\n}"
+
+
 # ============ 状态定义 ============
 
 class MultiAgentState(TypedDict):
@@ -348,11 +381,11 @@ class MultiAgentState(TypedDict):
     messages: Annotated[List[BaseMessage], lambda x, y: x + y]
     current_csv_path: str
     execution_logs: List[str]
-    audit_result: Optional[str]  # 审查结果：通过/驳回
+    audit_result: Optional[dict]  # AuditVerdict 结构化 dict（Phase 3: 不再用字符串）
     data_scientist_report: Optional[str]  # 数据科学家报告
     chief_scientist_report: Optional[str]  # 首席专家报告
     rejection_count: int  # 驳回次数
-    task_status: str  # pending/data_processing/auditing/diagnosis/complete
+    task_status: str  # pending/data_processing/auditing/diagnosis/failed/complete
 
 
 # ============ LLM 工厂 ============
@@ -383,28 +416,38 @@ def _make_nodes(llm: BaseChatModel, data_context: dict | None = None):
 
     # 预格式化各角色的系统提示词，注入上下文块
     ds_prompt = DATA_SCIENTIST_PROMPT_TPL.format(data_context=ctx_block)
-    auditor_prompt = DATA_AUDITOR_PROMPT_TPL.format(data_context=ctx_block)
+    auditor_prompt = DATA_AUDITOR_PROMPT_TPL.format(
+        data_context=ctx_block, audit_schema=_AUDIT_SCHEMA_STR,
+    )
     chief_prompt = CHIEF_SCIENTIST_PROMPT_TPL.format(
         data_context=ctx_block,
         json_schema=_JSON_SCHEMA_STR,
     )
 
     def data_scientist_node(state: MultiAgentState) -> MultiAgentState:
+        rej_count = state.get("rejection_count", 0)
         system_msg = SystemMessage(content=ds_prompt)
-        messages = [system_msg] + state["messages"]
+        messages = [system_msg] + state.get("messages", [])
         response = llm.invoke(messages)
+        log_entry = (
+            f"[DataScientist] input_msgs={len(state.get('messages',[]))} "
+            f"ouput_len={len(str(response.content))} rejection_count={rej_count}"
+        )
+        new_logs = list(state.get("execution_logs", [])) + [log_entry]
         return {
             "messages": [response],
             "task_status": "data_processing",
             "data_scientist_report": str(response.content),
             "current_csv_path": state.get("current_csv_path", ""),
-            "execution_logs": state.get("execution_logs", []),
+            "execution_logs": new_logs,
             "audit_result": state.get("audit_result"),
             "chief_scientist_report": state.get("chief_scientist_report"),
-            "rejection_count": state.get("rejection_count", 0),
+            "rejection_count": rej_count,
         }
 
     def auditor_node(state: MultiAgentState) -> MultiAgentState:
+        import json, re
+
         audit_user_prompt = f"""请审查以下数据科学家的工作成果：
 
 {state.get('data_scientist_report', '无报告')}
@@ -415,33 +458,80 @@ def _make_nodes(llm: BaseChatModel, data_context: dict | None = None):
 3. 检查数据处理是否符合物理规律
 4. 检查是否有异常遗漏
 
-请给出审查结果（通过/驳回）及理由。"""
+请严格按照系统提示词中的 JSON 格式输出审查结果（verdict + reasons + required_fixes）。"""
 
         messages = [SystemMessage(content=auditor_prompt), HumanMessage(content=audit_user_prompt)]
         response = llm.invoke(messages)
+        raw = str(response.content)
 
-        content = response.content.lower()
-        is_approved = "通过" in content and "驳回" not in content.split("通过")[0]
+        # ── Phase 3: 结构化裁决，杜绝字符串匹配 ──
+        verdict_dict: dict | None = None
+        parse_error: str | None = None
+        try:
+            # 提取 JSON 块
+            m = re.search(r'\{[\s\S]*\}', raw)
+            json_str = m.group(0) if m else raw
+            verdict_dict = json.loads(json_str)
+            # 校验必填字段
+            if verdict_dict.get("verdict") not in ("pass", "reject"):
+                parse_error = f"verdict 字段非法: {verdict_dict.get('verdict')!r}"
+                verdict_dict = None
+            if not isinstance(verdict_dict.get("reasons"), list) or not verdict_dict["reasons"]:
+                parse_error = "reasons 缺失或非数组"
+                verdict_dict = None
+        except (json.JSONDecodeError, AttributeError, KeyError) as e:
+            parse_error = str(e)
+
+        if verdict_dict is None:
+            # 裁决 JSON 非法 → 抛错，绝不默认通过
+            raise ValueError(
+                f"Auditor 未产出合法 AuditVerdict JSON：{parse_error}\n"
+                f"原始输出（前 500 字）: {raw[:500]}"
+            )
+
+        verdict = verdict_dict["verdict"]
+        reasons = verdict_dict.get("reasons", [])
+        required_fixes = verdict_dict.get("required_fixes", [])
+        is_approved = (verdict == "pass")
+        new_rejection_count = state.get("rejection_count", 0) + (0 if is_approved else 1)
+
+        # ── 结构化执行日志 ──
+        log_entry = (
+            f"[Auditor] verdict={verdict} rejection_count={new_rejection_count} "
+            f"reasons={reasons[:3]} "
+            + (f"fixes={required_fixes[:3]}" if not is_approved else "")
+        )
+        new_logs = list(state.get("execution_logs", [])) + [log_entry]
+
+        # ── 驳回时把 required_fixes 注入下一轮 data_scientist 的输入 ──
+        new_messages = list(state.get("messages", [])) + [response]
+        if not is_approved and required_fixes and new_rejection_count < 3:
+            fix_text = "【审查员驳回 —— 请按以下修正要求重新处理】\n" + "\n".join(
+                f"- {f}" for f in required_fixes
+            )
+            new_messages.append(HumanMessage(content=fix_text))
 
         return {
-            "messages": [response],
+            "messages": new_messages,
             "task_status": "auditing",
-            "audit_result": "approved" if is_approved else "rejected",
-            "rejection_count": state.get("rejection_count", 0) + (0 if is_approved else 1),
+            "audit_result": verdict_dict,
+            "rejection_count": new_rejection_count,
             "current_csv_path": state.get("current_csv_path", ""),
-            "execution_logs": state.get("execution_logs", []),
+            "execution_logs": new_logs,
             "data_scientist_report": state.get("data_scientist_report"),
             "chief_scientist_report": state.get("chief_scientist_report"),
         }
 
     def chief_scientist_node(state: MultiAgentState) -> MultiAgentState:
+        audit = state.get("audit_result") or {}
+        reasons_str = "\n".join(f"- {r}" for r in audit.get("reasons", [])) if isinstance(audit, dict) else "（无结构化裁决）"
         diagnosis_prompt = f"""基于以下材料，进行深度物理诊断并生成严格 JSON 格式的最终报告：
 
 数据科学家报告：
 {state.get('data_scientist_report', '无')}
 
-审查员意见：
-{state.get('audit_result', '无')}
+审查员裁决 ({audit.get('verdict', '?')}):
+{reasons_str}
 
 请：
 1. 结合知识库进行物理诊断
@@ -468,29 +558,44 @@ def _make_nodes(llm: BaseChatModel, data_context: dict | None = None):
 
 
 def should_continue_workflow(state: MultiAgentState) -> str:
-    """判断工作流走向，带驳回次数安全阀防止无限循环"""
+    """判断工作流走向 — Phase 3: 基于结构化 AuditVerdict 确定性路由。
+
+    - pass → chief_scientist
+    - reject 且 count < 3 → data_scientist（required_fixes 已注入 messages）
+    - reject 且 count >= 3 → 显式失败终态（task_status="failed"，不再兜圈子）
+    - auditor 产出非法 JSON → 已在 auditor_node 内部抛 ValueError
+    """
     task_status = state.get("task_status", "")
     rejection_count = state.get("rejection_count", 0)
+    audit_result = state.get("audit_result") or {}
 
-    # 安全阀：驳回超过 3 次强制进入首席专家，不再循环
+    # ── 安全阀：驳回 ≥3 次 → 显式失败终态 ──
     if rejection_count >= 3:
-        return "chief"
+        all_reasons: list[str] = []
+        all_fixes: list[str] = []
+        # 汇总历次 reasons + required_fixes（从 audit_result 链中收集）
+        verdict = audit_result if isinstance(audit_result, dict) else {}
+        all_reasons = list(verdict.get("reasons", []))
+        all_fixes = list(verdict.get("required_fixes", []))
+        # 写入终态日志
+        # （execution_logs 由 auditor_node 写入，这里不再重复写 state — 只在返回时设 task_status）
+        return "failed"
 
-    # 从 data_scientist 节点出来：进入 auditor 审查
+    # ── 从 data_scientist 节点出来 → 进入 auditor ──
     if task_status == "data_processing":
         return "auditor"
 
-    # 从 auditor 节点出来
+    # ── 从 auditor 节点出来 → 基于结构化裁决路由 ──
     if task_status == "auditing":
-        audit_result = state.get("audit_result")
-        if audit_result == "approved":
+        verdict = audit_result.get("verdict") if isinstance(audit_result, dict) else None
+        if verdict == "pass":
             return "chief_scientist"
-        if audit_result == "rejected":
+        if verdict == "reject":
             return "data_scientist"
-        # 审查结果不明确时默认通过
-        return "chief_scientist"
+        # 裁决不明确 → 按 reject 处理（安全侧）
+        return "data_scientist"
 
-    # 从 chief_scientist 出来，结束
+    # ── 从 chief_scientist 出来，结束 ──
     if task_status == "diagnosis":
         return END
 
@@ -519,13 +624,13 @@ def create_multi_agent_graph(llm: BaseChatModel, data_context: dict | None = Non
     workflow.add_conditional_edges(
         "data_scientist",
         should_continue_workflow,
-        {"auditor": "auditor", "chief": "chief_scientist", END: END}
+        {"auditor": "auditor", "chief_scientist": "chief_scientist", "failed": END, END: END}
     )
 
     workflow.add_conditional_edges(
         "auditor",
         should_continue_workflow,
-        {"chief_scientist": "chief_scientist", "data_scientist": "data_scientist", "chief": "chief_scientist", END: END}
+        {"chief_scientist": "chief_scientist", "data_scientist": "data_scientist", "failed": END, END: END}
     )
 
     workflow.add_edge("chief_scientist", END)
@@ -574,11 +679,18 @@ def run_multi_agent(
 
     result = graph.invoke(initial_state, config={"recursion_limit": 50})
 
+    task_status = result.get("task_status", "complete")
+    audit = result.get("audit_result") or {}
     return {
         "data_scientist_report": result.get("data_scientist_report", ""),
-        "audit_result": result.get("audit_result", ""),
+        "audit_result": audit,
         "chief_scientist_report": result.get("chief_scientist_report", ""),
         "final_report": result.get("messages", [{}])[-1].content if result.get("messages") else "",
+        "task_status": task_status,
+        "rejection_count": result.get("rejection_count", 0),
+        "execution_logs": result.get("execution_logs", []),
+        # 显式失败标志
+        "is_failed": task_status == "failed",
     }
 
 

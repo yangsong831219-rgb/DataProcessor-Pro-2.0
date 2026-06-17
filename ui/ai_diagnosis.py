@@ -724,9 +724,22 @@ class AiDiagnosisWidget(QWidget):
                 csv_path=csv_path,
                 data_context=ctx,
             )
+            # Phase 3: audit_result 是结构化 dict
+            audit = result.get('audit_result') or {}
+            if isinstance(audit, dict):
+                verdict = audit.get('verdict', '?')
+                reasons = '\n'.join(f"- {r}" for r in audit.get('reasons', []))
+                fixes = '\n'.join(f"- {f}" for f in audit.get('required_fixes', []))
+                audit_str = f"裁决: {verdict}\n理由:\n{reasons}"
+                if fixes:
+                    audit_str += f"\n修正要求:\n{fixes}"
+                if result.get('is_failed'):
+                    audit_str = f"⚠️ 多智能体审查未通过（驳回 {result.get('rejection_count', 0)} 次）\n{audit_str}"
+            else:
+                audit_str = str(audit)
             report = (
                 f"## 数据科学家报告\n\n{result.get('data_scientist_report', '无')}\n\n"
-                f"---\n\n## 审查结果: {result.get('audit_result', '未知')}\n\n"
+                f"---\n\n## 审查结果\n\n{audit_str}\n\n"
                 f"---\n\n## 首席专家报告\n\n{result.get('chief_scientist_report', '无')}\n\n"
                 f"---\n\n## 最终报告\n\n{result.get('final_report', '无')}"
             )
