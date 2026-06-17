@@ -2,15 +2,27 @@
 
 与 report_engine.py 配合：engine 通过 generate_fn 回调调用此客户端，
 引擎不直接依赖 AIClient 类，保持完全解耦。
+
+阶段一 (P0) 升级：generate() 不再吞异常返回空串，改为抛出 AIClientError
+类型化异常。调用方通过 generate_with_retry() 获得指数退避重试。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time as _time
 from typing import Any, Callable, Dict, Optional
 
 from pydantic import BaseModel
+
+from core.ai_errors import (
+    AIClientError,
+    AIClientEmptyResponseError,
+    AIClientNotConfiguredError,
+    AIClientServerError,
+    classify_openai_error,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -104,7 +116,7 @@ class AIClient:
         temperature: float = 0.3,
         max_tokens: int = 2048,
     ) -> str:
-        """同步调用 LLM，返回文本响应.
+        """同步调用 LLM，返回文本响应。
 
         Args:
             prompt: 用户提示词
@@ -113,15 +125,23 @@ class AIClient:
             max_tokens: 最大生成长度
 
         Returns:
-            LLM 响应文本，失败返回空字符串
+            LLM 响应文本
+
+        Raises:
+            AIClientNotConfiguredError: API Key 未配置
+            AIClientAuthError: 认证失败 (401/403)
+            AIClientRequestError: 请求参数错误 (400/422)
+            AIClientRateLimitError: 速率限制 (429), 可重试
+            AIClientServerError: 服务端错误 (5xx), 可重试
+            AIClientTimeoutError: 超时/连接失败, 可重试
+            AIClientEmptyResponseError: 200 但 content 为空
         """
         if not self.is_available():
-            print('[AIClient] API Key 未配置')
-            return ''
+            raise AIClientNotConfiguredError("AI API Key 未配置，请在设置中配置 AI 模型")
+
+        from openai import OpenAI  # pyright: ignore[reportImplicitRelativeImport]
 
         try:
-            from openai import OpenAI
-
             client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
@@ -139,12 +159,17 @@ class AIClient:
                 max_tokens=max_tokens,
             )
 
-            content = response.choices[0].message.content or ''
-            return content.strip()
+            content = (response.choices[0].message.content or '').strip()
+            if not content:
+                raise AIClientEmptyResponseError(
+                    "AI 返回了空响应，可能模型不支持当前请求或输入格式有误"
+                )
+            return content
 
+        except AIClientError:
+            raise
         except Exception as e:
-            print(f'[AIClient] 调用失败: {e}')
-            return ''
+            raise classify_openai_error(e) from e
 
     # ── 多轮工具调用 (Function Calling / Agent Loop) ──
 
@@ -173,12 +198,11 @@ class AIClient:
             最终模型回复文本，失败或超轮次返回空字符串
         """
         if not self.is_available():
-            print('[AIClient] API Key 未配置')
-            return ''
+            raise AIClientNotConfiguredError("AI API Key 未配置，请在设置中配置 AI 模型")
+
+        from openai import OpenAI  # pyright: ignore[reportImplicitRelativeImport]
 
         try:
-            from openai import OpenAI
-
             client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
@@ -249,17 +273,20 @@ class AIClient:
                     continue  # 进入下一轮 Agent Loop
 
                 # ── 情况 B：模型正常输出 ──
-                return (msg.content or '').strip()
+                content = (msg.content or '').strip()
+                if not content:
+                    raise AIClientEmptyResponseError("AI 工具调用返回了空响应")
+                return content
 
             # 超轮次保护
-            print(
-                '[AIClient] 工具调用超过最大轮次，强制终止'
+            raise AIClientServerError(
+                f"工具调用超过最大轮次 ({MAX_TOOL_TURNS})，强制终止"
             )
-            return ''
 
+        except AIClientError:
+            raise
         except Exception as e:
-            print(f'[AIClient] 工具调用失败: {e}')
-            return ''
+            raise classify_openai_error(e) from e
 
     def reset(self, api_key: str = '', base_url: str = '', model_name: str = '') -> None:
         """重置配置（允许运行时切换模型）."""
@@ -278,9 +305,64 @@ class AIClient:
             cls._instance = cls()
         return cls._instance
 
-    def get_generate_fn(self) -> Callable[..., str]:
-        """返回兼容 report_engine 的 generate_fn 回调.
+    def generate_with_retry(
+        self,
+        prompt: str,
+        system_prompt: str = '',
+        temperature: float = 0.3,
+        max_tokens: int = 2048,
+        *,
+        max_retries: int = 2,
+        base_backoff_s: float = 2.0,
+    ) -> str:
+        """同步调用 LLM，带指数退避重试。
 
-        返回的闭包签名: (prompt: str) -> str
+        仅对 retryable=True 的异常重试；不可重试的异常（如 401/403/400/422）立即抛出。
+
+        Args:
+            prompt: 用户提示词
+            system_prompt: 系统提示词（可选）
+            temperature: 温度参数
+            max_tokens: 最大生成长度
+            max_retries: 最大重试次数（默认 2 次，共 3 次尝试）
+            base_backoff_s: 基础退避秒数（指数递增）
+
+        Returns:
+            LLM 响应文本
+
+        Raises:
+            AIClientError 及其子类：重试耗尽或不可重试时抛出最后一个异常
+        """
+        last_exc: AIClientError | None = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                return self.generate(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except AIClientError as e:
+                last_exc = e
+                if not e.retryable:
+                    raise
+                if attempt < max_retries:
+                    wait = base_backoff_s * (2 ** attempt)
+                    print(
+                        f"[AIClient] 可重试错误 {type(e).__name__}，"
+                        f"第 {attempt + 1}/{max_retries} 次重试，等待 {wait:.1f}s"
+                    )
+                    _time.sleep(wait)
+
+        # 重试耗尽
+        assert last_exc is not None  # pyright 推断
+        raise last_exc
+
+    def get_generate_fn(self) -> Callable[..., str]:
+        """返回兼容 report_engine 的 generate_fn 回调。
+
+        返回的闭包签名: (prompt: str) -> str，失败时抛 AIClientError。
+        调用方负责捕获异常并呈现给用户。
         """
         return self.generate
