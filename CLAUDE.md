@@ -40,7 +40,13 @@
 - 文件级关 rule（`# pyright: reportGeneralTypeIssues=false`）**仅限**第三方库 stub 已知误报（如 python-pptx/python-docx 构造器被误识为函数签名），**必须**附注释说明原因。
 - **ignore 是最后手段，不是第一手段**。优先用 `cast()` / `field(default_factory=...)` / 补字段 / `str()` 转换等类型收窄手段让 pyright 满意。
 
-**8. 配置/字典取值缺键 + None 双守卫（硬纪律）**
+**8. LLM 边界禁止静默失败 — 输出必须经 Schema 校验（硬纪律）**
+- `AIClient.generate()` / `generate_with_tools()` 失败**必须**抛 `AIClientError` 子类，**严禁**返回空字符串。
+- 所有 LLM 输出的结构化数据**必须**经 Pydantic `model_validate_json()` 或等价的显式 schema 校验；校验失败**必须**抛 `ReportSchemaError`（含 `missing_fields`/`type_errors`/`raw_text` 诊断），**严禁** `json.loads` 静默降级为 `raw[:500]` 或空字段。
+- 审查裁决（auditor node）**必须**产出结构化 `AuditVerdict`（`{"verdict":"pass"|"reject","reasons":[...],"required_fixes":[...]}`），**严禁**字符串匹配 `"通过"` / `"驳回"`。
+- AI 调用链的三条失败路径都必须显式到达用户：`AIClientError` → `ReportWorker.error` → `QMessageBox`；`ReportSchemaError` → 同上；`AuditVerdict.reject` × 3 → `task_status="failed"` → UI 显式呈现。
+
+**9. 配置/字典取值缺键 + None 双守卫（硬纪律）**
 - 若字典键可能存在但值为 `None`（如 `self._config["anchored_grating"] = None`），**必须**用 `d.get(key) or default` 而非 `d.get(key, default)`。
 - `d.get(key, default)` 的 default 只在**缺键**时生效，不挡 `None` 值。
 - 例 `(self._config.get("anchored_grating") or 2) - 1` — 同时挡缺键和 None。
@@ -59,7 +65,12 @@
     - `column_utils.py` — 列名清洗 (`strip_bracket_units`/`clean_dict_keys`, 即"卸妆"正则)、行分类 (`is_data_row`)、FBG 列检测 (`detect_fbg_columns`)。
     - `dataframe_utils.py` — DataFrame 行定位 (`find_first_timestamp_row`)。
     - `data_cleaning.py` — 数据清洗 (`clean_data`, `detect_anomalies`, `fill_missing`)。
-- **后端引擎 (`py/`):** 信号处理 (`analyzer.py`)、数学公式解析 (`formula.py`)，Word/PPT 报告引擎 (`report_builder/`)、LangGraph 多智能体审查系统 (`multi_agent.py`)。
+- **AI 与报告模块 (`core/`):**
+    - `ai_client.py` — `AIClient` 单例 (OpenAI 兼容接口)；`generate()` / `generate_with_tools()` 失败抛 `AIClientError` 子类（不再返回 `""`）；`generate_with_retry()` 指数退避仅重试 `retryable=True` 的错误；`generate_structured()` 调用 LLM + Pydantic schema 校验。
+    - `ai_errors.py` — 类型化异常层级：`AIClientAuthError`(401)/`RequestError`(400)/`RateLimitError`(429,retryable)/`ServerError`(5xx,retryable)/`TimeoutError`(retryable)/`EmptyResponseError`/`NotConfiguredError`/`ReportSchemaError`(含 missing_fields/type_errors 诊断) + `classify_openai_error()` 分类工厂。
+    - `report_models.py` — Pydantic `WordReport`/`WordSection`/`PPTReport`/`PPTSlide` — report_engine 和渲染器的唯一数据契约。
+    - `report_engine.py` — `generate_outline`(人审 Markdown 不变) + `generate_structured_report` → 逐节 Pydantic 校验 (Phase 2)。
+- **后端引擎 (`py/`):** 信号处理 (`analyzer.py`)、数学公式解析 (`formula.py`)，Word/PPT 报告引擎 (`report_builder/`)、LangGraph 多智能体审查系统 (`multi_agent.py` — Phase 3: Auditor 产出结构化 `AuditVerdict`，第 3 次驳回 → `task_status="failed"` 显式失败终态)。
 - **标定引擎 (`py/calibration/`):** 温度标定 (平台检测 + KMeans 映射 + 灵敏度回归 + 解耦诊断)、应变标定 (手填表驱动 + 灵敏度/线性度/重复性/迟滞/双栅分析)、Excel 导出。
 - **标定 UI (`ui/calibration_tab.py`):** 温度标定子页 (文件加载/列角色指派/设定温度/诊断图/Word报告) + 应变标定子页 (动态填表/自动计算/指标图表/系数闭环)。
   - **对话框 (`ui/` 独立文件):**
