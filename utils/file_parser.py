@@ -11,6 +11,8 @@ from typing import Any, Optional, Tuple
 
 import pandas as pd
 
+from core.models import DataTemplate
+
 from utils.parse_validation import validate_parsed_data, ParseValidationError  # noqa: F401  # re-exported for callers
 
 
@@ -970,3 +972,187 @@ def persist_custom_template(template: object, templates_dir: str) -> None:
 
     with open(templates_file, "w", encoding="utf-8") as f:
         _json.dump(existing, f, ensure_ascii=False, indent=2)
+
+
+# ==================================================================
+# 自动模板检测 + 文件头读取（从 main.py 抽离）
+# ==================================================================
+
+def auto_detect_template(file_path: str):
+    """自动检测数据格式并创建模板"""
+    try:
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
+            lines = f.readlines()[:300]  # 读取足够多行覆盖长元数据块
+
+        if not lines:
+            return None
+
+        # ── 检查是否是 ENLIGHT 格式 ──
+        has_timestamp_header = any(
+            ln.startswith("Timestamp\t") or ln.startswith("时间戳\t")
+            for ln in lines
+        )
+        has_ch = any('# CH' in ln for ln in lines)
+        has_hyperion = any(
+            kw in ln for kw in ("ENLIGHT Version", "Module Type: Hyperion")
+            for ln in lines
+        )
+
+        # ★ Peaks: 有 # CH 计数列表头 → 走 Peaks 解析
+        if has_timestamp_header and has_ch:
+            for i, line in enumerate(lines):
+                if line.startswith("Timestamp\t") and '# CH' in line:
+                    headers = line.strip().split('\t')
+                    columns = []
+                    for h in headers:
+                        h = h.strip()
+                        if 'Timestamp' in h:
+                            columns.append({'name': '时间', 'comment': '时间戳', 'data_type': 'time'})
+                        elif 'CH' in h:
+                            columns.append({'name': h, 'comment': h, 'data_type': 'numeric'})
+                    skip = i  # 真实 header_idx
+                    return DataTemplate('enlight_type', 'ENLIGHT (光纤传感)', 'enlight', '\t', skip, columns)
+
+        # ★ Sensors/公式版: 有 Timestamp\t 表头但无 # CH (Peaks 已排前面)
+        if has_timestamp_header:
+            # 找到 Timestamp\t 表头行
+            for i, line in enumerate(lines):
+                if line.startswith("Timestamp\t"):
+                    headers = line.strip().split('\t')
+                    columns = []
+                    for h in headers:
+                        h = h.strip()
+                        if not h:
+                            continue
+                        if h == "Timestamp":
+                            columns.append({'name': '时间', 'comment': '时间戳', 'data_type': 'time'})
+                        elif h.startswith("FBG_"):
+                            columns.append({'name': h, 'comment': f'FBG {h}', 'data_type': 'wavelength'})
+                        else:
+                            columns.append({'name': h, 'comment': h, 'data_type': 'numeric'})
+                    skip = i
+                    return DataTemplate('enlight_sensors', 'ENLIGHT (光纤传感·公式版)', 'enlight', '\t', skip, columns)
+
+        # 尝试通用格式检测：扫描找到第一个多列行
+        delimiter = '\t'
+        for line in lines:
+            if ',' in line and '\t' not in line:
+                delimiter = ','
+                break
+
+        header_line_idx = -1
+        header_parts = None
+        for i, line in enumerate(lines):
+            parts = line.strip().split(delimiter)
+            if len(parts) > 1:
+                header_line_idx = i
+                header_parts = parts
+                break
+
+        if header_parts is None:
+            return None
+
+        from utils.column_utils import is_data_row
+        is_data = is_data_row(header_parts)
+        is_fiber = False
+
+        if is_data:
+            # 无表头：生成合成列名
+            columns = []
+            import re
+            for i, h in enumerate(header_parts):
+                h = h.strip()
+                if not h:
+                    continue
+                if i == 0 and re.match(r'^\d{2,4}[/-]', h):
+                    columns.append({'name': '时间', 'comment': '时间戳', 'data_type': 'time'})
+                else:
+                    columns.append({'name': f'列{i+1}', 'comment': '', 'data_type': 'numeric'})
+            # 检查是否可能是光纤文件（通过后续行判断）
+            for line in lines[header_line_idx+1:]:
+                parts2 = line.strip().split(delimiter)
+                if len(parts2) > 1:
+                    try:
+                        float(parts2[1].strip())
+                        is_fiber = len(parts2) > 2  # 多列数值 → 可能是光纤
+                    except ValueError:
+                        pass
+                    break
+            if is_fiber:
+                # 重新生成光纤列名
+                for c in columns:
+                    if c['name'] != '时间' and c['name'].startswith('列'):
+                        idx = int(c['name'][1:]) - 1
+                        c['name'] = f'波长{idx}'
+                        c['comment'] = f'FBG 波长{idx}'
+                        c['data_type'] = 'wavelength'
+            skip_rows = header_line_idx
+        else:
+            # 有表头：使用文件列名
+            columns = []
+            for col_name in header_parts:
+                col_name = col_name.strip()
+                if not col_name:
+                    continue
+                data_type = 'numeric'
+                if '时间' in col_name or 'time' in col_name.lower():
+                    data_type = 'time'
+                elif '温度' in col_name:
+                    data_type = 'temperature'
+                elif '波长' in col_name or 'wavelength' in col_name.lower():
+                    data_type = 'wavelength'
+                elif '应变' in col_name or 'strain' in col_name.lower():
+                    data_type = 'strain'
+                columns.append({'name': col_name, 'comment': col_name, 'data_type': data_type})
+            skip_rows = header_line_idx + 1
+
+        has_wavelength = any(
+            '波长' in c['name'] or 'wavelength' in c['name'].lower()
+            or c['name'].upper().startswith('FBG')
+            or (c['name'].upper().startswith('W') and c['name'][1:].isdigit())
+            for c in columns
+        )
+        if has_wavelength:
+            is_fiber = True
+        template_type = 'fiber_custom' if is_fiber else 'csv'
+
+        return DataTemplate(
+            f'{template_type}_custom',
+            f'自定义{"光纤" if is_fiber else "数据"}模板',
+            template_type,
+            delimiter,
+            skip_rows,
+            columns
+        )
+    except Exception as e:
+        print(f"Auto detect error: {e}")
+        return None
+
+
+
+def read_file_header_lines(file_path: str, skip_rows: int) -> list[str]:
+    """读取文件的格式头行，最多读取前500行以定位数据起始行"""
+    try:
+        for enc in ('utf-8', 'gbk', 'latin-1'):
+            try:
+                with open(file_path, 'r', encoding=enc) as f:
+                    head_lines = []
+                    for _ in range(500):
+                        line = f.readline()
+                        if not line:
+                            break
+                        head_lines.append(line)
+                break
+            except UnicodeDecodeError:
+                continue
+
+        data_start = skip_rows
+        for i, line in enumerate(head_lines):
+            if 'Timestamp' in line and ('# CH' in line or 'CH' in line):
+                data_start = i + 1
+                break
+
+        return head_lines[:data_start] if data_start > 0 else []
+    except Exception:
+        return []
+
