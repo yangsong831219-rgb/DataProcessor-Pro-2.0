@@ -50,10 +50,24 @@
 
 ## 🏗 项目拓扑与架构
 
-- **巨石架构警告:** 前端 UI 集中在庞大的单文件（`main.py`，约 8800 行）中。当你使用 `edit_file` 工具时，**必须**提供极其明确的上下文特征字符串，以防止灾难性的全局搜索替换错误。
+- **main.py (`~2294 行`):** 主窗口骨架 + 标签页装配 + 信号连线 + `DataProcessorWindow(QMainWindow)`。
+  已从原始 3240 行拆出纯函数层和 Qt 对话框（详见下方重构记录），保留 16 个 3-5 行委托壳调用 `utils/` 中的实际实现。
+  - **解析与校验层 (`utils/`):** 纯函数模块，零 Qt 依赖。
+    - `file_parser.py` — ENLIGHT/Hyperion Peaks/Sensors/Legacy 统一解析 + 模板检测 (`auto_detect_template`) + 文件头读取 + 自定义模板持久化。
+    - `parse_validation.py` — **解析后硬门禁**（`validate_parsed_data`, `ParseValidationError`）。strict 模式 (ENLIGHT/Hyperion) 校验 Timestamp 列、FBG 波长区间 1400-1700nm、数值纯度、元数据泄漏；lenient 模式 (通用 TXT/CSV/XLSX) 只做空表/行数/元数据泄漏基础校验。`parse_enlight_file` 的三分支和 `parse_file` 的通用路径均在返回前调用。
+    - `annotation_utils.py` — 暗号行构建 (`build_annotation_row`, `insert_blank_row`, `apply_annotation_row`)、暗号扫描与列角色解析 (`extract_annotation_info`)、分析数据提取 (`get_analysis_data`, `build_sensor_results_dict`)、波长列判定 (`is_wave_col`, 1400-1700nm)。
+    - `column_utils.py` — 列名清洗 (`strip_bracket_units`/`clean_dict_keys`, 即"卸妆"正则)、行分类 (`is_data_row`)、FBG 列检测 (`detect_fbg_columns`)。
+    - `dataframe_utils.py` — DataFrame 行定位 (`find_first_timestamp_row`)。
+    - `data_cleaning.py` — 数据清洗 (`clean_data`, `detect_anomalies`, `fill_missing`)。
 - **后端引擎 (`py/`):** 信号处理 (`analyzer.py`)、数学公式解析 (`formula.py`)，Word/PPT 报告引擎 (`report_builder/`)、LangGraph 多智能体审查系统 (`multi_agent.py`)。
 - **标定引擎 (`py/calibration/`):** 温度标定 (平台检测 + KMeans 映射 + 灵敏度回归 + 解耦诊断)、应变标定 (手填表驱动 + 灵敏度/线性度/重复性/迟滞/双栅分析)、Excel 导出。
 - **标定 UI (`ui/calibration_tab.py`):** 温度标定子页 (文件加载/列角色指派/设定温度/诊断图/Word报告) + 应变标定子页 (动态填表/自动计算/指标图表/系数闭环)。
+  - **对话框 (`ui/` 独立文件):**
+    - `fbg_edit_dialog.py` — FBG 编辑/添加对话框。
+    - `sensor_edit_dialog.py` — 传感器编辑/添加对话框 (含解耦矩阵配置面板)。
+    - `ai_model_config_dialog.py` — AI 模型 API 配置对话框。
+    - `report_worker.py` — 通用后台 `ReportWorker(QThread)`，在子线程执行 AI/渲染任务。
+    - `global_parameter_dialog.py` — 全局参数编辑对话框（"笨组件"模式，纯信号驱动）。
 - **标定图表工具 (`core/tools/calibration_chart_tool.py`):** 封装标定图表渲染函数 (回归图/诊断四联图/应变曲线/指标柱状图)，供报告引擎调用。
 - **核心数据流向:** `文件解析 -> _auto_populate_fbgs (正则提取 FBG_) -> SensorSystem.calculate (公式计算) -> 异常清洗/FFT分析 -> 导出报告`。
 - **机密隔离:** `ai_models_config.json` 文件内含有敏感的 API 密钥。**严禁**在对话中打印其内容或将其提交入库（commit）。
@@ -90,7 +104,11 @@
 
 ## 🚧 已知待办 (v2.1 未完成)
 
-- **main.py 整体拆分**: 目前约 8600 行，仍是巨石架构。本次更新仅以标定模块为样板做了局部控制器抽离（`ui/calibration_tab.py`），整体拆分仍是待办。
+- **main.py 重构状态 (Phase 1 ✅ + Phase 3 ✅, Phase 2 缓做):**
+  - Phase 1 — 16 个纯函数已提取至 `utils/` 模块 (`annotation_utils`, `column_utils`, `dataframe_utils`, `file_parser`)，main.py 保留委托壳（3-5 行/个）调用 `utils.*`，签名不变。
+  - Phase 3 — 4 个嵌入的 QDialog/QThread 类已提取至 `ui/` 独立文件 (`fbg_edit_dialog`, `sensor_edit_dialog`, `ai_model_config_dialog`, `report_worker`)。
+  - Phase 2 — Mixin 多继承方案评估后缓做：按职责分拆 DataTabMixin/SensorFbgMixin/ReportMixin 等的收益主要是文件组织而非解耦，多继承+Protocol 维护成本需权衡。ConfigMixin 的方向是改走 AppState 序列化(SSOT)而非横切全属性。
+  - main.py 中 16 个委托壳可逐步去壳（调用点直指 utils 函数），但非紧急，不阻塞其他功能。
 - **test_run.py**: 需要 GUI 环境才能运行，无头环境（CI）下会崩溃。
 
 ## 🚀 常用开发命令
