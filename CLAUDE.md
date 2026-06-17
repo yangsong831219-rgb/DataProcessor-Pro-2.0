@@ -121,6 +121,10 @@
   - Phase 2 — Mixin 多继承方案评估后缓做：按职责分拆 DataTabMixin/SensorFbgMixin/ReportMixin 等的收益主要是文件组织而非解耦，多继承+Protocol 维护成本需权衡。ConfigMixin 的方向是改走 AppState 序列化(SSOT)而非横切全属性。
   - main.py 中 16 个委托壳可逐步去壳（调用点直指 utils 函数），但非紧急，不阻塞其他功能。
 - **test_run.py**: 需要 GUI 环境才能运行，无头环境（CI）下会崩溃。
+- **积压（不阻塞）**:
+  - `py/report_builder/flow_controller.py` — `ReportFlowController.generate_outline()` / `expand_section()` 当前无外部调用者，是死代码；若被调用会裸抛异常。建议或删或补兜底。
+  - `AIClient.generate_structured()` 当前走 Pydantic 校验 + 1 次回喂修复，在线模型（DeepSeek/GPT）可切原生 `response_format=json_schema` 强约束省掉重试往返。不必现在做。
+  - `py/agent_worker.py` — `DeepSeekAgentWorker` 当前无 Python 调用者（仅文档引用）；有 `except Exception → error_signal` 守卫。若未来启用需确认 caller 同时绑定 `error_signal`。
 
 ## 🚀 常用开发命令
 
