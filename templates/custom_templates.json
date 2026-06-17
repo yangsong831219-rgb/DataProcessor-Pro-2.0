@@ -2,7 +2,7 @@
   {
     "id": "custom_ENLIGHT（光纤传感）公式版",
     "name": "ENLIGHT（光纤传感）公式版",
-    "file_format": "fiber_custom",
+    "file_format": "enlight",
     "delimiter": "\t",
     "skip_rows": 123,
     "columns": [

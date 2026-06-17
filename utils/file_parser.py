@@ -211,7 +211,31 @@ def parse_file(file_path: str, template: Any) -> pd.DataFrame:
 _QUOTE_CHARS = "'\"‘’“”"
 _QUOTE_RE = re.compile(rf"^[{_QUOTE_CHARS}](.*?)[{_QUOTE_CHARS}]$")
 _UNWRAP_RE = re.compile(rf"^[{_QUOTE_CHARS}](.*?)[{_QUOTE_CHARS}]$")
+_STRIP_RE = re.compile(rf"^[{_QUOTE_CHARS}]+|[{_QUOTE_CHARS}]+$")
 _TIMESTAMP_LIKE = re.compile(r'^\d{2,4}[-/.]\d{1,2}[-/.]\d{1,2}')
+
+
+def _strip_code_quotes(s: str) -> str:
+    """剥离暗号单元首尾引号（兼容直/弯/中英双引号）。"""
+    return _STRIP_RE.sub("", s.strip())
+
+
+def _looks_like_annotation_row(cells: list[str]) -> bool:
+    """暗号行判定：存在引号包裹的非数值单元，且无任何裸数值。"""
+    has_quoted = False
+    for c in cells:
+        c = c.strip()
+        if not c:
+            continue
+        if c and c[0] in _QUOTE_CHARS:
+            has_quoted = True
+            continue
+        try:
+            float(c)
+            return False  # 出现裸数值 → 不是暗号行（是数据行）
+        except ValueError:
+            continue
+    return has_quoted
 
 
 def parse_enlight_file(
@@ -235,19 +259,22 @@ def parse_enlight_file(
           - annotation: {列名: 暗号字符串} 从引号包裹格提取
           - meta:       {format, header_idx, num_meta_skipped, num_numeric_cols, ...}
     """
-    import struct
-
     meta: dict = {"format": "unknown", "header_idx": 0, "num_meta_skipped": 0}
 
-    # ── 读取前 200 行做内容感知探查 ──
-    probe_enc = encoding or "utf-8"
+    # ── 读取全文件做内容感知探查 ──
+    probe_enc = "utf-8-sig"
     try:
         with open(path, "r", encoding=probe_enc, errors="replace") as f:
-            probe_lines = [f.readline() for _ in range(200)]
-    except UnicodeDecodeError:
-        probe_enc = "gb18030"
-        with open(path, "r", encoding=probe_enc, errors="replace") as f:
-            probe_lines = [f.readline() for _ in range(200)]
+            probe_lines = [ln.rstrip("\r") for ln in f.readlines()]
+    except (UnicodeDecodeError, UnicodeError):
+        probe_enc = encoding or "utf-8"
+        try:
+            with open(path, "r", encoding=probe_enc, errors="replace") as f:
+                probe_lines = [ln.rstrip("\r") for ln in f.readlines()]
+        except UnicodeDecodeError:
+            probe_enc = "gb18030"
+            with open(path, "r", encoding=probe_enc, errors="replace") as f:
+                probe_lines = [ln.rstrip("\r") for ln in f.readlines()]
 
     # ── 检查 UTF-8 BOM ──
     has_bom = False
@@ -267,125 +294,436 @@ def parse_enlight_file(
         if line.startswith("Timestamp\t") or line.startswith("时间戳\t"):
             has_timestamp_header = True
 
-    # ── 分支 1: Hyperion Peaks ──
-    if is_hyperion:
+    # ── 分支 1: Hyperion Peaks (元数据标志 + # CH 计数列表头) ──
+    _peaks_hdr = _find_peaks_header(probe_lines)
+    if is_hyperion and _peaks_hdr is not None:
         meta["format"] = "hyperion_peaks"
         return _parse_hyperion_peaks(path, probe_enc, meta, has_bom)
 
     # ── 分支 2: Hyperion Sensors ──
-    if has_bom and has_timestamp_header:
+    # 条件: 找到 Timestamp\\t 表头 + 非 Peaks (# CH 已排前面)
+    # Sensors 公式版文件不一定有 BOM 或 Hyperion 元数据标志 —
+    #   只要全文件内存在 Timestamp\\t 表头就可能是 Sensors。
+    if has_timestamp_header:
         meta["format"] = "hyperion_sensors"
-        return _parse_hyperion_sensors(path, meta)
+        return _parse_hyperion_sensors(path, meta, has_bom)
 
     # ── 分支 3: Legacy ──
     meta["format"] = "legacy_enlight"
     return _parse_legacy_enlight(path, probe_enc, meta)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Peaks 格式专用解析器 — 显式按字段解析，消费 16 个计数列
+# ═══════════════════════════════════════════════════════════════════════
+
+_N_CH = 16
+
+
+def _is_peaks_data_row(f: list[str]) -> bool:
+    """判定一行是否为合法的 Peaks 数据行。
+
+    合法条件:
+      1. 字段数 >= 1 + 16 计数列
+      2. 第一个字段非空 (时间戳)
+      3. 16 个计数列字段全为整数 (仅检查 f[1:1+_N_CH]，波长列不参与)
+    """
+    if len(f) < 1 + _N_CH or not f[0].strip():
+        return False
+    for x in f[1:1 + _N_CH]:
+        s = x.strip()
+        if not s:
+            return False
+        try:
+            int(s)
+        except ValueError:
+            return False
+    return True
+
+
+def _find_peaks_header(lines: list[str]) -> int | None:
+    """返回数据表头行号；非 Peaks 文件返回 None。"""
+    for i, ln in enumerate(lines):
+        if ln.startswith("Timestamp\t# CH 1"):
+            return i
+    return None
+
+
+def _wl_column_name(flat_index: int, channel: int, k: int) -> str:
+    """波长列命名钩子。flat_index 从 0 起；channel 为 1..16；k 为该通道内第几个峰(从1起)。"""
+    return f"w{flat_index + 1}"
+
+
+def parse_hyperion_peaks(lines: list[str], header_idx: int) -> pd.DataFrame:
+    """解析 Hyperion Peaks 数据块。
+
+    行布局: <时间戳> \\t <16个峰值数量整数> \\t <sum(数量)个波长>。
+    '# CH n' 是峰值数量，不是波长。返回 [Timestamp, <N个波长列>]，
+    按通道槽位对齐（峰丢失填 NaN），列集合在全文件内稳定。
+    """
+    # 1) 扫描数据行，按"每通道峰数的全局最大值"确定稳定槽位布局
+    raw_rows: list[list[str]] = []
+    max_counts = [0] * _N_CH
+    skipped_count = 0
+    _diag_printed = 0
+    for ln in lines[header_idx + 1:]:
+        ln = ln.rstrip("\r")
+        if not ln.strip():
+            continue
+        f = ln.split("\t")
+        if not _is_peaks_data_row(f):
+            if _diag_printed < 3:
+                import sys
+                print(
+                    f"[Peaks][skip] len={len(f)} f0={f[0]!r} "
+                    f"counts(f[1:{1 + _N_CH}])={f[1:1 + _N_CH]!r}",
+                    file=sys.stderr,
+                )
+                _diag_printed += 1
+            skipped_count += 1
+            continue
+        counts = [int(x.strip()) for x in f[1:1 + _N_CH]]
+        for c in range(_N_CH):
+            if counts[c] > max_counts[c]:
+                max_counts[c] = counts[c]
+        raw_rows.append(f)
+
+    if skipped_count > 0:
+        import sys
+        print(f"[Peaks] 跳过 {skipped_count} 行畸形行 (共 {len(lines) - header_idx - 1} 行候选)",
+              file=sys.stderr)
+
+    if not raw_rows:
+        # 0 行有效数据 → 硬错误，禁止静默成功
+        preview = ""
+        if header_idx + 1 < len(lines):
+            preview = repr(lines[header_idx + 1][:200])
+        raise ValueError(
+            f"Peaks 解析得到 0 行有效数据；表头行={header_idx}，"
+            f"首条原始数据行={preview}"
+        )
+
+    # 2) 固定列名（通道顺序展开槽位）
+    slot_channel: list[int] = []  # 每个输出波长列对应的通道(1..16)
+    for ch in range(_N_CH):
+        slot_channel.extend([ch + 1] * max_counts[ch])
+    n_wl = len(slot_channel)
+    wl_names: list[str] = []
+    per_ch_k = [0] * _N_CH
+    for idx, ch in enumerate(slot_channel):
+        per_ch_k[ch - 1] += 1
+        wl_names.append(_wl_column_name(idx, ch, per_ch_k[ch - 1]))
+
+    # 3) 逐行填充，通道槽位对齐，峰丢失填 NaN
+    timestamps: list[str] = []
+    matrix: list[list[float | None]] = []
+    for f in raw_rows:
+        counts = [int(x.strip()) for x in f[1:1 + _N_CH]]
+        vals = f[1 + _N_CH:]  # 该行波长（可能含末尾空 pad）
+        timestamps.append(f[0].strip())
+        row_out: list[float | None] = [None] * n_wl
+        vi = 0  # 该行波长游标
+        oi = 0  # 输出槽位游标
+        for ch in range(_N_CH):
+            for _k in range(max_counts[ch]):
+                if _k < counts[ch] and vi < len(vals):
+                    txt = vals[vi].strip()
+                    row_out[oi] = float(txt) if txt else None
+                    vi += 1
+                oi += 1
+        matrix.append(row_out)
+
+    df = pd.DataFrame(matrix, columns=wl_names)
+    df.insert(0, "Timestamp", timestamps)
+    return df
+
+
+def _parse_peaks_rectangular(
+    lines: list[str], header_idx: int
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Timestamp + N个标量列 的矩形 Peaks 文件（可带内嵌暗号行，时间戳可真可0）。
+
+    返回 (df, annotation):
+      df         — 列 = [Timestamp, w1..wN]; Timestamp 保留原字符串; w 列为 float
+      annotation — {列名: 暗号字符串}，引号已剥，稀疏（未标注列不入字典）
+    """
+    annotation: dict[str, str] = {}
+    data_start = header_idx + 1
+    ann_cells: list[str] | None = None
+
+    # ── 检测内嵌暗号行 ──
+    if data_start < len(lines):
+        c = lines[data_start].split("\t")
+        if _looks_like_annotation_row(c):
+            ann_cells = c
+            data_start += 1
+
+    # ── 取第一条真实数据行确定列宽 ──
+    probe = ann_cells
+    if probe is None:
+        probe = next(
+            (ln.split("\t") for ln in lines[data_start:] if ln.strip()), None
+        )
+    if probe is None:
+        raise ValueError("矩形 Peaks 文件无数据行")
+
+    width = len(probe)
+    n_wl = width - 1
+    wl_names = [f"w{i + 1}" for i in range(n_wl)]
+    columns = ["Timestamp"] + wl_names
+
+    # ── 从暗号行抽取 annotation ──
+    if ann_cells is not None:
+        for col, cell in zip(columns, ann_cells):
+            cell = cell.strip()
+            if cell:
+                annotation[col] = _strip_code_quotes(cell)
+
+    # ── 逐行填充 ──
+    ts: list[str] = []
+    mat: list[list[float | None]] = []
+    for ln in lines[data_start:]:
+        if not ln.strip():
+            continue
+        f = ln.split("\t")
+        if len(f) < width:
+            f = f + [""] * (width - len(f))
+        f = f[:width]
+        ts.append(f[0])
+        mat.append(
+            [float(x.strip()) if x.strip() else None for x in f[1:width]]
+        )
+
+    df = pd.DataFrame(mat, columns=wl_names)
+    df.insert(0, "Timestamp", ts)
+    return df, annotation
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sensors 格式专用解析器 — 去 BOM + 暗号行抽取 + 混合引号剥离
+# ═══════════════════════════════════════════════════════════════════════
+
+def parse_enlight_sensors(
+    path: str,
+) -> tuple[pd.DataFrame, dict[str, str], dict[str, object]]:
+    """解析 ENLIGHT Sensors（公式版）。
+
+    支持两种变体:
+      (a) 原始仪器导出: 无 BOM、有元数据块、Timestamp\\t 表头(不在第0行)、无暗号行
+      (b) 旧保存样本:   有 BOM、无元数据块、Timestamp\\t 表头(在第0行)、有/无暗号行
+
+    返回 (df, annotation, meta)：
+      df         — 干净数值 DataFrame（不含暗号行；Timestamp 为字符串，其余列 float）
+      annotation — {列名: 暗号字符串}，引号已剥；稀疏（未标注列不入字典）
+      meta       — {format, header_idx, had_bom, annotation_row, num_data_cols, fbg_cols, ...}
+    """
+    import io as _io
+
+    text: str = open(path, "rb").read().decode("utf-8-sig")  # ★ 兼容有无 BOM
+    lines = [ln.rstrip("\r") for ln in text.split("\n")]
+
+    # ── 定位真实表头: 以 "Timestamp\\t" 开头 (制表符, 排除 "Timestamp Format: Full" 空格行) ──
+    header_idx: int | None = None
+    for i, ln in enumerate(lines):
+        if ln.startswith("Timestamp\t"):
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError("未找到 Sensors 数据表头 (Timestamp\\t...)")
+
+    header = lines[header_idx].split("\t")
+
+    # ── 可选: 若误投 Peaks 文件, 第二列是 "# CH" 则提示 ──
+    if len(header) > 1 and header[1].startswith("# CH"):
+        raise ValueError(
+            "这是 Peaks 计数列文件，请改用『ENLIGHT(光纤传感)』模板"
+        )
+
+    # ── 检测暗号行 (表头后紧跟的行) ──
+    annotation: dict[str, str] = {}
+    data_start = header_idx + 1
+    if (
+        data_start < len(lines)
+        and lines[data_start].strip()
+        and _looks_like_annotation_row(lines[data_start].split("\t"))
+    ):
+        ann = lines[data_start].split("\t")
+        for col, cell in zip(header, ann):
+            cell = cell.strip()
+            if cell:
+                annotation[str(col)] = _strip_code_quotes(cell)
+        data_start += 1
+
+    # ── 逐行解析数据 ──
+    ncol = len(header)
+    ts: list[str] = []
+    rows: list[list[str | None]] = []
+    for ln in lines[data_start:]:
+        if not ln.strip():
+            continue
+        f = ln.split("\t")
+        if len(f) < ncol:
+            f = f + [""] * (ncol - len(f))
+        f = f[:ncol]
+        ts.append(f[0])
+        rows.append(f[1:ncol])
+
+    if not ts:
+        raise ValueError("Sensors 文件无数据行")
+
+    df = pd.DataFrame(rows, columns=header[1:ncol])
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df.insert(0, "Timestamp", ts)
+
+    # ── FBG_ 列识别 ──
+    fbg_cols = [str(c) for c in header if str(c).startswith("FBG_")]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # ★ 硬断言 — 杜绝静默失败（把元数据行当表头）
+    # ═══════════════════════════════════════════════════════════════════
+    if "Timestamp" not in df.columns:
+        raise ValueError(
+            f"Sensors 硬断言失败: Timestamp 列缺失, 表头={df.columns[:3].tolist()!r} "
+            f"header_idx={header_idx}"
+        )
+    if len(df) < 1:
+        raise ValueError(
+            f"Sensors 硬断言失败: 无数据行 header_idx={header_idx}"
+        )
+    if len(df) < 10 and len(lines) > 200:
+        # 文件很大但数据行极少 → 几乎肯定是表头定位错误
+        raise ValueError(
+            f"Sensors 硬断言失败: 文件 {len(lines)} 行但仅解析出 {len(df)} 行数据, "
+            f"表头定位错误 header_idx={header_idx}, "
+            f"首列={df.columns[0]!r}"
+        )
+    bad_cols = [c for c in df.columns if "(FBG):" in str(c) or "Range (" in str(c)]
+    if bad_cols:
+        raise ValueError(
+            f"表头定位错误，疑似把元数据行当成了表头: {bad_cols[:3]!r} "
+            f"(header_idx={header_idx})\n"
+            f"请确认文件 Timestamp\\t 表头行号与 scan 结果一致。"
+        )
+    if fbg_cols:
+        actual_fbg = len([c for c in df.columns if str(c).startswith("FBG_")])
+        if actual_fbg != len(fbg_cols):
+            raise ValueError(
+                f"Sensors FBG 列数不一致: 表头声明 {len(fbg_cols)} 个 "
+                f"({fbg_cols[:5]}...), DataFrame 实际 {actual_fbg} 个"
+            )
+
+    # ── 检测是否真的有 BOM ──
+    had_bom = False
+    try:
+        with open(path, "rb") as f:
+            had_bom = (f.read(3) == b"\xef\xbb\xbf")
+    except Exception:
+        pass
+
+    meta: dict[str, object] = {
+        "format": "hyperion_sensors",
+        "header_idx": header_idx,
+        "had_bom": had_bom,
+        "annotation_row": (data_start != header_idx + 1),
+        "num_data_cols": ncol - 1,
+        "fbg_cols": fbg_cols,
+    }
+    return df, annotation, meta
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 分支实现
+# ═══════════════════════════════════════════════════════════════════════
+
 def _parse_hyperion_peaks(
     path: str, encoding: str, meta: dict, has_bom: bool
 ) -> tuple[pd.DataFrame, dict[str, str], dict]:
-    """Hyperion Peaks 格式:
-      - 前 N 行是元数据
-      - 找到首行 "Timestamp\t..." → header_idx
-      - pd.read_csv 跳过元数据行
-      - 逐元素清理 \r
-      - 首行数据是暗号行，抽出
-    """
-    # 找出 header 所在行
-    header_idx = 0
-    with open(path, "r", encoding=encoding, errors="replace") as f:
-        for i, line in enumerate(f):
-            if line.startswith("Timestamp\t"):
-                header_idx = i
-                break
-
-    if header_idx == 0:
-        raise ValueError("Hyperion Peaks: 未找到 Timestamp 表头行")
-
-    meta["header_idx"] = header_idx
-    meta["num_meta_skipped"] = header_idx
-
-    # 读取 — 用 lineterminator 处理双 CR
+    """Hyperion Peaks 格式: 显式字段解析，消费 # CH 计数列，输出矩形波长表。"""
     use_enc = "utf-8-sig" if has_bom else encoding
-    df = pd.read_csv(
-        path, sep="\t", skiprows=header_idx,
-        encoding=use_enc, dtype=str, low_memory=False,
-        lineterminator="\n", on_bad_lines="skip",
+    with open(path, "r", encoding=use_enc, errors="replace") as f:
+        text = f.read()
+
+    lines = [ln.rstrip("\r") for ln in text.split("\n")]
+    header_idx = _find_peaks_header(lines)
+    if header_idx is None:
+        raise ValueError("Hyperion Peaks: 未找到 Timestamp\t# CH 1 表头行")
+
+    # ── 格式判别: 计数列(A) vs 矩形(B) ──
+    # 1) 检测表头后是否紧跟内嵌暗号行，确定数据起点
+    data_start = header_idx + 1
+    if data_start < len(lines) and _looks_like_annotation_row(
+        lines[data_start].split("\t")
+    ):
+        data_start += 1
+
+    # 2) 取第一条真实数据行，判别 A/B
+    first = next(
+        (ln.split("\t") for ln in lines[data_start:] if ln.strip()), None
+    )
+    if first is None:
+        raise ValueError("Peaks 文件无数据行")
+
+    is_count_format = (
+        len(first) > 1 + _N_CH
+        and all(
+            first[i].strip().lstrip("+-").isdigit()
+            for i in range(1, 1 + _N_CH)
+        )
     )
 
-    # ── 归一化空列名 (trailing tab 导致空字符串) ──
-    df.columns = [
-        c if (isinstance(c, str) and c.strip()) else f"Unnamed: {i}"
-        for i, c in enumerate(df.columns)
-    ]
+    # 3) 分流
+    if is_count_format:
+        df = parse_hyperion_peaks(lines, header_idx)
+        annotation: dict[str, str] = {}
+        meta["format"] = "hyperion_peaks_count"
 
-    # 清理: 每格 strip + rstrip('\r')
-    for col in df.columns:
-        df[col] = df[col].apply(
-            lambda x: str(x).strip().rstrip("\r") if pd.notna(x) else ""
-        )
-
-    # 首行 = 暗号行
-    annotation: dict[str, str] = {}
-    if len(df) > 0:
-        first_row = df.iloc[0]
+        # 构建 channel_slots 供排查
+        channel_slots: dict[str, int] = {}
         for col in df.columns:
-            val = str(first_row[col]).strip()
-            m = _UNWRAP_RE.match(val)
-            if m:
-                annotation[str(col)] = m.group(1).strip()
-        # 删除暗号行
-        df = df.iloc[1:].reset_index(drop=True)
+            if str(col) == "Timestamp":
+                continue
+        n_wl = df.shape[1] - 1  # 减去 Timestamp
+        meta["header_idx"] = header_idx
+        meta["num_meta_skipped"] = header_idx
+        meta["num_wavelength_cols"] = n_wl
+        meta["channel_slots"] = channel_slots
 
-    # 列名去引号
-    df.columns = [_unwrap_quotes(str(c)) for c in df.columns]
-    df.columns = df.columns.astype(str)
+        # 暗号提取 — 原始 Peaks 文件无暗号行，返回空 dict
+        if len(df) > 0:
+            first_row = df.iloc[0]
+            for col in df.columns:
+                val = str(first_row[col]).strip()
+                m = _UNWRAP_RE.match(val)
+                if m:
+                    annotation[str(col)] = m.group(1).strip()
+            # 若首行含引号包裹值（已嵌入暗号），删除该行
+            if annotation:
+                df = df.iloc[1:].reset_index(drop=True)
+    else:
+        df, annotation = _parse_peaks_rectangular(lines, header_idx)
+        meta["format"] = "hyperion_peaks_rect"
+        n_wl = df.shape[1] - 1
+        meta["header_idx"] = header_idx
+        meta["num_meta_skipped"] = header_idx
+        meta["num_wavelength_cols"] = n_wl
 
     return df, annotation, meta
 
 
 def _parse_hyperion_sensors(
-    path: str, meta: dict
+    path: str, meta: dict, has_bom: bool = False
 ) -> tuple[pd.DataFrame, dict[str, str], dict]:
-    """Hyperion Sensors 格式:
-      - UTF-8 BOM
-      - 首行即 "Timestamp\t..." 表头
-      - 使用 utf-8-sig 编码
-    """
-    meta["header_idx"] = 0
-    meta["num_meta_skipped"] = 0
+    """Hyperion Sensors 格式: 委托给 parse_enlight_sensors。"""
+    df, annotation, sensors_meta = parse_enlight_sensors(path)
 
-    df = pd.read_csv(
-        path, sep="\t", encoding="utf-8-sig",
-        dtype=str, low_memory=False,
-        lineterminator="\n", on_bad_lines="skip",
-    )
-
-    # ── 归一化空列名 ──
-    df.columns = [
-        c if (isinstance(c, str) and c.strip()) else f"Unnamed: {i}"
-        for i, c in enumerate(df.columns)
-    ]
-
-    for col in df.columns:
-        df[col] = df[col].apply(
-            lambda x: str(x).strip().rstrip("\r") if pd.notna(x) else ""
-        )
-
-    # 首行 = 暗号行
-    annotation: dict[str, str] = {}
-    if len(df) > 0:
-        first_row = df.iloc[0]
-        for col in df.columns:
-            val = str(first_row[col]).strip()
-            m = _UNWRAP_RE.match(val)
-            if m:
-                annotation[str(col)] = m.group(1).strip()
-        df = df.iloc[1:].reset_index(drop=True)
-
-    df.columns = [_unwrap_quotes(str(c)) for c in df.columns]
-    df.columns = df.columns.astype(str)
+    # 合并 meta — Sensors 内部已定位真实 header_idx
+    header_idx = sensors_meta.get("header_idx", 0)
+    meta["header_idx"] = header_idx
+    meta["num_meta_skipped"] = header_idx
+    for key in ("format", "had_bom", "annotation_row", "num_data_cols", "fbg_cols"):
+        if key in sensors_meta:
+            meta[key] = sensors_meta[key]
 
     return df, annotation, meta
 

@@ -197,7 +197,7 @@ def _build_annotation_info_parts(
 ) -> list[str]:
     """构建信息条文案片段"""
     parts = []
-    if fmt == "hyperion_peaks":
+    if fmt and fmt.startswith("hyperion_peaks"):
         parts.append("已识别 Hyperion Peaks")
     if skipped:
         parts.append(f"跳过 {skipped} 行元数据")
@@ -2151,6 +2151,8 @@ class StrainCalibrationPage(QWidget):
         self._levels = self._generate_default_levels()
         self._readings = {}
         self._grating_map: dict[str, str] = {}   # {"G1": "A1-W1", "G2": "A1-W2"}
+        self._grating_map_version: int = 0           # ★ 每次 _extract_table_data 写入递增，防缓存污染
+        self._grating_map_fresh: bool = False         # ★ True = _extract_table_data 刚写入 (用户编辑态)
         self._ke_results: dict[str, float] = {}  # {"Ke1": 1.23, "Ke2": 0.98}
         self._dialog_table = None  # 每次 _open_readings 新建
         self._annotation_combos: dict[int, QComboBox] = {}  # grating_index → ComboBox
@@ -2360,19 +2362,45 @@ class StrainCalibrationPage(QWidget):
             ctw.project_config = pc
         return pc
 
-    def _parse_sensor_from_grating_map(self) -> str:
-        """从 grating_map 解析传感器名。
+    def _get_grating_sources(self) -> dict[str, str]:
+        """返回 {光栅标识: 暗号标签} 映射，如 {'G1': 'C2-1', 'G2': 'C2-2'}。
 
-        'G1' → 'A1-W1' → sensor_name = 'A1'
-        若 grating_map 为空或多暗号时取第一个的有效前缀。
+        单一真源 — 传感器名解析 + 图表图例 + 结果文本均从此读取。
+        数据由 _extract_table_data 在对话框关闭时直接写入 self._grating_map。
         """
-        if not self._grating_map:
+        return dict(self._grating_map)
+
+    def _get_grating_label(self, grating_index: int) -> str:
+        """光栅显示标签。优先暗号名 (如 'C2-1')，无暗号回退 'G1'/'G2'。"""
+        sources = self._get_grating_sources()
+        key = f"G{grating_index}"
+        ann = sources.get(key, "").strip()
+        return ann if ann else key
+
+    def _parse_sensor_from_grating_map(self) -> str:
+        """从 _get_grating_sources() 解析传感器名。
+
+        G1→'C2-1', G2→'C2-2' → 返回 'C2'。
+        前缀按最后一个 '-' 或 '_' 切分 (rsplit)，兼容 'C2-1'/'C2_1'/'A1-W1' 等。
+        要求所有光栅解析出的前缀一致；不一致或空则返回空字符串。
+        """
+        sources = self._get_grating_sources()
+        if not sources:
             return ""
-        # 取第一个标注
-        first_ann = next(iter(self._grating_map.values()), "")
-        if '-' in first_ann:
-            return first_ann.split('-')[0]
-        return first_ann
+        prefixes: set[str] = set()
+        for ann in sources.values():
+            ann = ann.strip()
+            if not ann:
+                continue
+            if '-' in ann:
+                prefixes.add(ann.rsplit('-', 1)[0])
+            elif '_' in ann:
+                prefixes.add(ann.rsplit('_', 1)[0])
+            else:
+                prefixes.add(ann)  # 无分隔符时整串即为传感器名
+        if len(prefixes) == 1:
+            return next(iter(prefixes))
+        return ""  # 多前缀不一致 → 调用方提示
 
     def _build_strain_subconfig(self):
         """从当前应变标定状态构造 StrainSubConfig。"""
@@ -2472,6 +2500,8 @@ class StrainCalibrationPage(QWidget):
           G1_C1_张, G2_C1_张, G1_C1_退, G2_C1_退,
           G1_C2_张, G2_C2_张, G1_C2_退, G2_C2_退,
           G1_C3_张, G2_C3_张, G1_C3_退, G2_C3_退
+
+        注意: C{n} = 循环号 (非传感器名); 传感器名由备注行暗号下拉框确定。
         """
         c = self._config
         is_return = c["mode"] == "tension_return"
@@ -2541,7 +2571,9 @@ class StrainCalibrationPage(QWidget):
         n_rows = table.rowCount()
 
         # ── 提取 grating_map (row 0, QComboBox) ──
-        grating_map: dict[str, str] = {}
+        # ★ 直接写入 self._grating_map（单一真源），使用 clear+update 保持引用稳定
+        self._grating_map.clear()
+        grating_map: dict[str, str] = self._grating_map  # 别名，最终写入同一个 dict
         grating_cols = self._grating_col_indices()
         for gi, col_indices in grating_cols.items():
             if not col_indices:
@@ -2551,6 +2583,8 @@ class StrainCalibrationPage(QWidget):
                 text = widget.currentText().strip()
                 if text and is_valid_annotation(text):
                     grating_map[f"G{gi}"] = text
+        self._grating_map_version += 1
+        self._grating_map_fresh = True  # ★ 用户编辑态，禁止 _load_sensor_to_workspace 覆盖
 
         # ── 提取 levels (row 1+) ──
         levels = []
@@ -2641,6 +2675,7 @@ class StrainCalibrationPage(QWidget):
             self._readings = {}  # 列结构可能已变，清空旧读数
             if new_kind != old_kind:
                 self._grating_map = {}  # 光栅数量/类型变化 → 清空旧映射
+                self._grating_map_fresh = False
             if abs(new_gauge - old_gauge) > 0.001:
                 self._levels = self._generate_default_levels()  # 标距变化 → 重建位移等级
 
@@ -2814,7 +2849,20 @@ class StrainCalibrationPage(QWidget):
             self.commit_list_btn.setEnabled(False)
             return
 
-        sensor_name = self._parse_sensor_from_grating_map() or "未知"
+        sensor_name = self._parse_sensor_from_grating_map()
+        if not sensor_name:
+            if not self._grating_map:
+                msg = "请在读数录入的备注行为每个光栅选择暗号源（如 C2-1 / C2-2）。"
+            else:
+                anns = list(self._grating_map.values())
+                msg = f"光栅暗号前缀不一致: {', '.join(anns)}。请确保 G1、G2 属于同一传感器。"
+            self.strain_progress.setText(f"❌ {msg}")
+            self.analyze_btn.setEnabled(True)
+            self.apply_coef_btn.setEnabled(False)
+            self.export_se_btn.setEnabled(False)
+            self.export_sw_btn.setEnabled(False)
+            self.commit_list_btn.setEnabled(False)
+            return
 
         # ── 存为当前工作结果（不自动入列表）──
         sub = self._build_strain_subconfig()
@@ -2841,7 +2889,7 @@ class StrainCalibrationPage(QWidget):
             for g in result.gratings:
                 if np.isnan(g.k_pm_per_ue): continue
                 ax.plot(eps, g.k_pm_per_ue * np.array(eps), "-", lw=2,
-                        label=f"G{g.grating_index}: k={g.k_pm_per_ue:.4f}, R²={g.R2:.5f}")
+                        label=f"{self._get_grating_label(g.grating_index)}: k={g.k_pm_per_ue:.4f}, R²={g.R2:.5f}")
         ax.set_xlabel("理论应变 (με)"); ax.set_ylabel("波长漂移 (pm)")
         ax.set_title("Δλ-ε 标定曲线"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
         ax.set_xlim(left=0); ax.set_ylim(bottom=0)
@@ -2853,7 +2901,7 @@ class StrainCalibrationPage(QWidget):
         labels, k_vals, r2_vals, nl_vals, rp_vals, hy_vals = [], [], [], [], [], []
         for g in result.gratings:
             if np.isnan(g.k_pm_per_ue): continue
-            labels.append(f"G{g.grating_index}")
+            labels.append(self._get_grating_label(g.grating_index))
             k_vals.append(g.k_pm_per_ue)
             r2_vals.append(g.R2 * 10 if not np.isnan(g.R2) else 0)
             nl_vals.append(g.nonlinearity_pct_fs if not np.isnan(g.nonlinearity_pct_fs) else 0)
@@ -2881,7 +2929,7 @@ class StrainCalibrationPage(QWidget):
             ke_str = ", ".join(f"{k}={v:.4f} pm/με" for k, v in self._ke_results.items())
             lines.append(f"应变系数: {ke_str}\n")
         for g in result.gratings:
-            lines.append(f"光栅{g.grating_index}: k={g.k_pm_per_ue:.6f} R²={g.R2:.6f} "
+            lines.append(f"{self._get_grating_label(g.grating_index)}: k={g.k_pm_per_ue:.6f} R²={g.R2:.6f} "
                          f"NL={g.nonlinearity_pct_fs:.2f}% RP={g.repeatability_pct_fs:.2f}% "
                          f"HY={g.hysteresis_pct_fs:.2f}%")
         self.strain_result_text.setText("\n".join(lines))
@@ -2966,7 +3014,12 @@ class StrainCalibrationPage(QWidget):
         sub = self._working_result
         sensor_name = getattr(sub, 'sensor_name', '') or self._parse_sensor_from_grating_map()
         if not sensor_name:
-            QMessageBox.warning(self, "提示", "请在读数录入的备注行指定光栅暗号 (如 A1-W1)。")
+            if not self._grating_map:
+                msg = "请在读数录入的备注行为每个光栅选择暗号源（如 C2-1 / C2-2）。"
+            else:
+                anns = list(self._grating_map.values())
+                msg = f"光栅暗号前缀不一致: {', '.join(anns)}。请确保 G1、G2 属于同一传感器。"
+            QMessageBox.warning(self, "传感器名缺失", msg)
             return
 
         # 同名覆盖确认
@@ -2983,6 +3036,7 @@ class StrainCalibrationPage(QWidget):
         pc.strain[sensor_name] = sub
         self._set_dirty()
         self._refresh_sensor_list(select_sensor=sensor_name)
+        self._grating_map_fresh = False  # ★ 已持久化到列表，后续 _load_sensor_to_workspace 可安全恢复
         self._current_sensor = sensor_name
         self.strain_progress.setText(f"✅ 已加入列表 — {sensor_name}: Ke1={self._ke_results.get('Ke1', 0):.4f}")
 
@@ -2993,6 +3047,8 @@ class StrainCalibrationPage(QWidget):
         self._last_result = None
         self._ke_results = {}
         self._grating_map = {}
+        self._grating_map_version = 0   # ★ 清空时重置版本，下次 _extract_table_data 写入递增
+        self._grating_map_fresh = False  # ★ 已清空，允许 _load_sensor_to_workspace 恢复
         self._readings = {}
         self._levels = self._generate_default_levels()
         self._config.update({
@@ -3027,7 +3083,9 @@ class StrainCalibrationPage(QWidget):
             "anchored_grating": None,
         })
         self._levels = self._generate_default_levels()  # 标距可能变了
-        self._grating_map = dict(getattr(cfg, 'grating_map', {}) or {})
+        # ★ 仅当 _grating_map 非用户刚编辑态时才从存档恢复，避免覆盖 _extract_table_data 的最新值
+        if not self._grating_map_fresh:
+            self._grating_map = dict(getattr(cfg, 'grating_map', {}) or {})
         self._ke_results = dict(getattr(cfg, 'ke_results', {}) or {})
         # 从 readings 重建 _levels
         rd_list = getattr(cfg, 'readings', []) or []
@@ -3085,7 +3143,7 @@ class StrainCalibrationPage(QWidget):
                 k_val = ke.get(key, 0)
                 if abs(k_val) > 1e-10:
                     ax.plot(eps_arr, k_val * eps_arr, "-", lw=2,
-                            label=f"G{gi}: k={k_val:.4f} pm/με")
+                            label=f"{self._get_grating_label(gi)}: k={k_val:.4f} pm/με")
         ax.set_xlabel("理论应变 (με)"); ax.set_ylabel("波长漂移 (pm)")
         ax.set_title(f"Δλ-ε 标定曲线 — {sensor_name}"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
         ax.set_xlim(left=0); ax.set_ylim(bottom=0)
@@ -3098,7 +3156,7 @@ class StrainCalibrationPage(QWidget):
         for gi, key in enumerate(["Ke1", "Ke2"], start=1):
             k_val = ke.get(key, 0)
             if abs(k_val) > 1e-10:
-                labels_ok.append(f"G{gi}")
+                labels_ok.append(self._get_grating_label(gi))
                 k_vals.append(k_val)
         if labels_ok:
             x = np.arange(len(labels_ok)); w = 0.3

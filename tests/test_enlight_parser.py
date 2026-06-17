@@ -44,7 +44,7 @@ class TestHyperionPeaks:
     def test_format_detection(self, path):
         """检测为 hyperion_peaks 格式"""
         _df, _annotation, meta = parse_enlight_file(path)
-        assert meta["format"] == "hyperion_peaks", f"expected hyperion_peaks, got {meta['format']}"
+        assert meta["format"] == "hyperion_peaks_count", f"expected hyperion_peaks_count, got {meta['format']}"
 
     def test_header_idx(self, path):
         """跳过 104 行元数据"""
@@ -52,9 +52,9 @@ class TestHyperionPeaks:
         assert meta["header_idx"] == 104, f"expected 104, got {meta['header_idx']}"
 
     def test_df_shape(self, path):
-        """清洗后形状 (44049, 25)"""
+        """清洗后形状 (44049, 9) — Timestamp + 8 波长列 (w1..w8)，计数列已消费"""
         df, _annotation, _meta = parse_enlight_file(path)
-        assert df.shape == (44049, 25), f"expected (44049, 25), got {df.shape}"
+        assert df.shape == (44049, 9), f"expected (44049, 9), got {df.shape}"
 
     def test_wavelength_columns(self, path):
         """8 个波长列均值在 [1525, 1551] 范围内"""
@@ -107,9 +107,9 @@ class TestHyperionSensors:
         assert meta["format"] == "hyperion_sensors", f"expected hyperion_sensors, got {meta['format']}"
 
     def test_df_shape(self, path):
-        """清洗后形状 (15657, 17)"""
+        """清洗后形状 (15656, 17) — 暗号行已剔除，仅保留数值数据行"""
         df, _annotation, _meta = parse_enlight_file(path)
-        assert df.shape == (15657, 17), f"expected (15657, 17), got {df.shape}"
+        assert df.shape == (15656, 17), f"expected (15656, 17), got {df.shape}"
 
     def test_wavelength_columns(self, path):
         """8 个波长列均值在 [1526, 1551] 范围内"""

@@ -1741,28 +1741,57 @@ class DataProcessorWindow(QMainWindow):
     def auto_detect_template(self, file_path):
         """自动检测数据格式并创建模板"""
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()[:200]
+            with open(file_path, 'r', encoding='utf-8-sig') as f:
+                lines = f.readlines()[:300]  # 读取足够多行覆盖长元数据块
 
             if not lines:
                 return None
 
-            # 检查是否是ENLIGHT格式
-            has_timestamp = any('Timestamp' in line for line in lines)
-            has_ch = any('# CH' in line for line in lines)
+            # ── 检查是否是 ENLIGHT 格式 ──
+            has_timestamp_header = any(
+                ln.startswith("Timestamp\t") or ln.startswith("时间戳\t")
+                for ln in lines
+            )
+            has_ch = any('# CH' in ln for ln in lines)
+            has_hyperion = any(
+                kw in ln for kw in ("ENLIGHT Version", "Module Type: Hyperion")
+                for ln in lines
+            )
 
-            if has_timestamp and has_ch:
+            # ★ Peaks: 有 # CH 计数列表头 → 走 Peaks 解析
+            if has_timestamp_header and has_ch:
                 for i, line in enumerate(lines):
-                    if 'Timestamp' in line and '# CH' in line:
+                    if line.startswith("Timestamp\t") and '# CH' in line:
                         headers = line.strip().split('\t')
                         columns = []
                         for h in headers:
                             h = h.strip()
                             if 'Timestamp' in h:
                                 columns.append({'name': '时间', 'comment': '时间戳', 'data_type': 'time'})
-                            elif 'CH' in h and '计数' in h:
+                            elif 'CH' in h:
                                 columns.append({'name': h, 'comment': h, 'data_type': 'numeric'})
-                        return DataTemplate('enlight_type', 'ENLIGHT (光纤传感)', 'enlight', '\t', 104, columns)
+                        skip = i  # 真实 header_idx
+                        return DataTemplate('enlight_type', 'ENLIGHT (光纤传感)', 'enlight', '\t', skip, columns)
+
+            # ★ Sensors/公式版: 有 Timestamp\t 表头但无 # CH (Peaks 已排前面)
+            if has_timestamp_header:
+                # 找到 Timestamp\t 表头行
+                for i, line in enumerate(lines):
+                    if line.startswith("Timestamp\t"):
+                        headers = line.strip().split('\t')
+                        columns = []
+                        for h in headers:
+                            h = h.strip()
+                            if not h:
+                                continue
+                            if h == "Timestamp":
+                                columns.append({'name': '时间', 'comment': '时间戳', 'data_type': 'time'})
+                            elif h.startswith("FBG_"):
+                                columns.append({'name': h, 'comment': f'FBG {h}', 'data_type': 'wavelength'})
+                            else:
+                                columns.append({'name': h, 'comment': h, 'data_type': 'numeric'})
+                        skip = i
+                        return DataTemplate('enlight_sensors', 'ENLIGHT (光纤传感·公式版)', 'enlight', '\t', skip, columns)
 
             # 尝试通用格式检测：扫描找到第一个多列行
             delimiter = '\t'
@@ -2312,14 +2341,29 @@ class DataProcessorWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════
 
     def _insert_annotation_row_if_timestamp_exists(self):
-        """数据加载后在首行插入空白备注行，供用户填写暗号。
+        """数据加载后在首行插入暗号备注行，供用户填写/确认暗号。
 
         规则：
-          - 如果数据中已有包含'时间戳'的暗号行 → 不再插入空白行
-          - 否则 → 在第 0 行插入一行空白备注行并填充模板暗号
-          - 光纤模板额外执行内容探针法：强制扫描第一行真实数据，
-            将以 '15' 开头的值判定为波长列，用 'wN-类型-位置' 覆盖暗号行
+          - 已有暗号行（含'时间戳'）→ 不插入
+          - 新暗号行按列类型填充：
+            · Timestamp → '时间戳'
+            · 波长列（首个非空值 ∈ [1400, 1700]）→ 'wN-类型-位置'
+            · 其它列（公式列等）→ 留空
+          - 暗号行逐列对齐 df.columns，杜绝错位
         """
+        _WAVE_LO, _WAVE_HI = 1400.0, 1700.0
+
+        def _is_wave_col(df: pd.DataFrame, col_name: str) -> bool:
+            """值落在 FBG 波长区间 [1400, 1700] → 波长列。"""
+            s = df[col_name].dropna()
+            if s.empty:
+                return False
+            try:
+                v = float(s.iloc[0])
+            except (ValueError, TypeError):
+                return False
+            return _WAVE_LO <= v <= _WAVE_HI
+
         try:
             if self.current_data is None or self.current_data.empty:
                 return
@@ -2336,8 +2380,10 @@ class DataProcessorWindow(QMainWindow):
                 if existing_signal_row is not None:
                     break
 
-            # ── 2. 无暗号行 → 插入空白行 + 模板填充 ──
             template = getattr(self, 'current_template', None)
+            file_fmt = getattr(template, 'file_format', '') if template else ''
+
+            # ── 2. 无暗号行 → 插入空白行 ──
             if existing_signal_row is None:
                 self._annotation_orig_dtypes = df.dtypes.to_dict()
                 blank_vals = [np.nan] * len(df.columns)
@@ -2349,8 +2395,35 @@ class DataProcessorWindow(QMainWindow):
                     except (ValueError, TypeError):
                         if 'int' in str(dtype):
                             self.current_data[col] = self.current_data[col].astype('float64')
+                annotation_row = 0
+            else:
+                annotation_row = existing_signal_row
 
-                # 模板列定义填充暗号
+            # ── 3. 暗号行填充 — 按实际 DataFrame 列迭代，保证对齐 ──
+            data_row = annotation_row + 1
+            if data_row >= len(self.current_data):
+                return
+
+            if file_fmt in ('enlight', 'fiber_custom'):
+                wi = 0
+                for col_idx in range(len(self.current_data.columns)):
+                    col_name = str(self.current_data.columns[col_idx])
+                    # Timestamp 列
+                    if col_name == "Timestamp":
+                        self.current_data[col_name] = self.current_data[col_name].astype(object)
+                        self.current_data.iloc[annotation_row, col_idx] = "'时间戳'"
+                        continue
+                    # 波长列
+                    if _is_wave_col(self.current_data.iloc[data_row:], col_name):
+                        wi += 1
+                        self.current_data[col_name] = self.current_data[col_name].astype(object)
+                        self.current_data.iloc[annotation_row, col_idx] = f"'w{wi}-类型-位置'"
+                        continue
+                    # 其它列（公式列等）→ 留空，但确保 dtype 兼容 (object)
+                    if pd.api.types.is_numeric_dtype(self.current_data[col_name]):
+                        self.current_data[col_name] = self.current_data[col_name].astype(object)
+            else:
+                # 非光纤文件：仅基于模板列定义填充
                 if template and hasattr(template, 'columns') and template.columns:
                     for col_idx, tc in enumerate(template.columns):
                         if col_idx >= len(self.current_data.columns):
@@ -2359,38 +2432,13 @@ class DataProcessorWindow(QMainWindow):
                         if data_type == 'time':
                             col_name = self.current_data.columns[col_idx]
                             self.current_data[col_name] = self.current_data[col_name].astype(object)
-                            self.current_data.iloc[0, col_idx] = "'时间戳'"
+                            self.current_data.iloc[annotation_row, col_idx] = "'时间戳'"
                         elif data_type and data_type != 'none':
                             ann_text = tc.get('comment', '').strip() or tc.get('name', '').strip()
                             if ann_text:
                                 col_name = self.current_data.columns[col_idx]
                                 self.current_data[col_name] = self.current_data[col_name].astype(object)
-                                self.current_data.iloc[0, col_idx] = f"'{ann_text}'"
-                annotation_row = 0
-            else:
-                annotation_row = existing_signal_row
-
-            # ── 3. 光纤专属：内容探针法（强制扫描 / 覆盖，无论暗号行来源） ──
-            if template and getattr(template, 'file_format', '') in ('enlight', 'fiber_custom'):
-                data_row = annotation_row + 1
-                if data_row < len(self.current_data):
-                    w_counter = 0
-                    # 模板已填充的列索引列表（时间 / CH计数等不覆盖）
-                    tmpl_filled = {i for i in range(len(template.columns))} if template.columns else set()
-                    for col_idx in range(len(self.current_data.columns)):
-                        if col_idx in tmpl_filled:
-                            continue
-                        cell_val = self.current_data.iloc[data_row, col_idx]
-                        try:
-                            fv = float(str(cell_val).strip())
-                            if not pd.isna(fv) and str(cell_val).strip().startswith('15'):
-                                w_counter += 1
-                                col_name = self.current_data.columns[col_idx]
-                                self.current_data[col_name] = self.current_data[col_name].astype(object)
-                                # 强制覆盖暗号行对应单元格
-                                self.current_data.iloc[annotation_row, col_idx] = f"'w{w_counter}-类型-位置'"
-                        except (ValueError, TypeError):
-                            pass
+                                self.current_data.iloc[annotation_row, col_idx] = f"'{ann_text}'"
         except Exception as e:
             print(f'[暗号行插入失败] {e}')
 
