@@ -571,6 +571,36 @@ class TestReportWorkerErrorChain:
         assert len(finished_fired) == 0, \
             f"finished 不应在异常时触发，但触发了: {finished_fired}"
 
+    def test_report_schema_error_reaches_worker_error(self, qapp):
+        """【Phase 1↔2 接缝】逐节生成时抛 ReportSchemaError → worker error 信号发射，
+        finished 不触发。防 someone 把 except Exception 收窄成 except AIClientError
+        导致 ReportSchemaError 裸漏。"""
+        from core.ai_errors import ReportSchemaError
+        from ui.report_worker import ReportWorker
+
+        def build_fn(*args, **kwargs):
+            raise ReportSchemaError(
+                "第 3 节 Schema 校验失败",
+                raw_text='{"heading": missing}',
+                missing_fields=["heading"],
+                type_errors=[],
+            )
+
+        worker = ReportWorker(build_fn)
+        finished_fired = []
+        worker.finished.connect(lambda v: finished_fired.append(v))
+        error_text = self._wait_worker_error(worker)
+        assert error_text is not None, "ReportSchemaError 必须到达 error 信号"
+        assert "Schema" in error_text or "第 3 节" in error_text or "heading" in error_text, \
+            f"error 信号应含诊断信息，got: {error_text!r}"
+        # finished 不应触发
+        from PyQt6.QtCore import QTimer, QEventLoop
+        loop = QEventLoop()
+        QTimer.singleShot(300, loop.quit)
+        loop.exec()
+        assert len(finished_fired) == 0, \
+            "ReportSchemaError 时 finished 不应触发（否则 UI 会误当成功）"
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Phase 2: ReportSchemaError + generate_structured + Pydantic 校验
