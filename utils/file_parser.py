@@ -11,6 +11,26 @@ from typing import Any, Optional, Tuple
 
 import pandas as pd
 
+from utils.parse_validation import validate_parsed_data, ParseValidationError  # noqa: F401  # re-exported for callers
+
+
+def _run_parse_validation(
+    df: pd.DataFrame | None,
+    meta: dict,
+    annotation: dict[str, str],
+    source_path: str,
+) -> None:
+    """对 parse_enlight_file 各分支的解析结果做强制校验。"""
+    try:
+        validate_parsed_data(df, meta, annotation, source_path=source_path, strict=True)
+    except ParseValidationError:
+        raise
+    except Exception as exc:
+        # 校验本身不应崩溃；若意外失败，升级为 ParseValidationError 含原信息
+        raise ParseValidationError(
+            f"校验器内部异常: {exc} [format={meta.get('format','?')} source={source_path!r}]"
+        ) from exc
+
 
 def detect_format(
     file_path: str,
@@ -187,11 +207,19 @@ def parse_file(file_path: str, template: Any) -> pd.DataFrame:
             if len(col_names) == len(df.columns):
                 df.columns = col_names
         df.columns = df.columns.astype(str)
+        # ── 通用路径解析后校验 (lenient 档) ──
+        validate_parsed_data(
+            df, {"format": template.file_format}, source_path=file_path, strict=False,
+        )
         return df
 
     elif template.file_format in ('xlsx', 'xls'):
         df = pd.read_excel(file_path, header=None)
         df.columns = df.columns.astype(str)
+        # ── 通用路径解析后校验 (lenient 档) ──
+        validate_parsed_data(
+            df, {"format": template.file_format}, source_path=file_path, strict=False,
+        )
         return df
 
     elif template.file_format == 'enlight':
@@ -298,7 +326,9 @@ def parse_enlight_file(
     _peaks_hdr = _find_peaks_header(probe_lines)
     if is_hyperion and _peaks_hdr is not None:
         meta["format"] = "hyperion_peaks"
-        return _parse_hyperion_peaks(path, probe_enc, meta, has_bom)
+        df, annotation, sub_meta = _parse_hyperion_peaks(path, probe_enc, meta, has_bom)
+        _run_parse_validation(df, meta, annotation, path)
+        return df, annotation, sub_meta
 
     # ── 分支 2: Hyperion Sensors ──
     # 条件: 找到 Timestamp\\t 表头 + 非 Peaks (# CH 已排前面)
@@ -306,11 +336,15 @@ def parse_enlight_file(
     #   只要全文件内存在 Timestamp\\t 表头就可能是 Sensors。
     if has_timestamp_header:
         meta["format"] = "hyperion_sensors"
-        return _parse_hyperion_sensors(path, meta, has_bom)
+        df, annotation, sub_meta = _parse_hyperion_sensors(path, meta, has_bom)
+        _run_parse_validation(df, meta, annotation, path)
+        return df, annotation, sub_meta
 
     # ── 分支 3: Legacy ──
     meta["format"] = "legacy_enlight"
-    return _parse_legacy_enlight(path, probe_enc, meta)
+    df, annotation, sub_meta = _parse_legacy_enlight(path, probe_enc, meta)
+    _run_parse_validation(df, meta, annotation, path)
+    return df, annotation, sub_meta
 
 
 # ═══════════════════════════════════════════════════════════════════════
