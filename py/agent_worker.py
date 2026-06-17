@@ -55,11 +55,11 @@ class DeepSeekAgentWorker(QThread):
 
         try:
             self._execute_agent()
+            self.finished_signal.emit()
         except Exception as e:
             self.error_signal.emit(f"Agent 执行错误: {str(e)}")
         finally:
             self._is_running = False
-            self.finished_signal.emit()
 
     def _execute_agent(self):
         """执行 Agent 逻辑"""

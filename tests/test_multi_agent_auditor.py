@@ -267,3 +267,103 @@ class TestRejectionAccumulation:
         assert result["is_failed"] is True
         assert result["rejection_count"] == 3
         assert len(result["audit_result"]["reasons"]) >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 端到端：DeepSeekAgentWorker — 异常 → error 信号, report NOT sent
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestDeepSeekAgentWorkerErrorChain:
+    """【Phase 3 接缝】_execute_agent() 内部异常 → error_signal 发射,
+    report_ready_signal 不发射, finished_signal 不发射（防止 UI 误当成功）。"""
+
+    def _wait_signal(self, signal, timeout_ms: int = 3000):
+        from PyQt6.QtCore import QEventLoop, QTimer
+        result = []
+        loop = QEventLoop()
+        signal.connect(lambda v: (result.append(v), loop.quit()))
+        QTimer.singleShot(timeout_ms, loop.quit)
+        loop.exec()
+        return result[0] if result else None
+
+    def test_agent_error_signal_on_auditor_value_error(self, qapp, monkeypatch):
+        """_execute_agent 内 raise ValueError（非法裁决 JSON）→ error_signal 发射"""
+        from py.agent_worker import DeepSeekAgentWorker
+
+        # Mock _execute_agent 以模拟 auditor_node 抛 ValueError 场景
+        monkeypatch.setattr(
+            DeepSeekAgentWorker, "_execute_agent",
+            lambda self: (_ for _ in ()).throw(
+                ValueError("Auditor 未产出合法 AuditVerdict JSON：verdict 字段非法: 'maybe'")
+            ),
+        )
+
+        worker = DeepSeekAgentWorker()
+        worker.set_task("分析传感器数据", "/fake/path.csv")
+
+        error_received = []
+        report_received = []
+        finished_received = []
+
+        worker.error_signal.connect(lambda v: error_received.append(v))
+        worker.report_ready_signal.connect(lambda v: report_received.append(v))
+        worker.finished_signal.connect(lambda: finished_received.append(True))
+
+        worker.run()
+
+        assert len(error_received) >= 1, "error_signal 必须发射"
+        assert "Auditor" in error_received[0] or "ValueError" in error_received[0] or "verdict" in error_received[0], \
+            f"error 消息应含诊断，got: {error_received[0][:200]!r}"
+        assert len(report_received) == 0, \
+            "report_ready_signal 在异常时不应发射（防止 UI 显示垃圾报告）"
+        assert len(finished_received) == 0, \
+            "finished_signal 在异常时不应发射（防止 UI 误当成功）"
+
+    def test_agent_error_signal_on_schema_validation_failure(self, qapp, monkeypatch):
+        """裁决 JSON 缺 reasons 字段 → error_signal, 不误发 report"""
+        from py.agent_worker import DeepSeekAgentWorker
+
+        monkeypatch.setattr(
+            DeepSeekAgentWorker, "_execute_agent",
+            lambda self: (_ for _ in ()).throw(
+                ValueError("Auditor 未产出合法 AuditVerdict JSON：reasons 缺失或非数组")
+            ),
+        )
+
+        worker = DeepSeekAgentWorker()
+        worker.set_task("test", "/f.csv")
+
+        error_received = []
+        report_received = []
+
+        worker.error_signal.connect(lambda v: error_received.append(v))
+        worker.report_ready_signal.connect(lambda v: report_received.append(v))
+
+        worker.run()
+
+        assert len(error_received) >= 1
+        assert len(report_received) == 0, "异常时 report_ready_signal 绝不应发射"
+
+    def test_agent_normal_flow_still_works(self, qapp, monkeypatch):
+        """正常执行路径不受影响 — report + finished 正确发射"""
+        from py.agent_worker import DeepSeekAgentWorker
+
+        monkeypatch.setattr(
+            DeepSeekAgentWorker, "_execute_agent",
+            lambda self: self.report_ready_signal.emit("分析完成"),
+        )
+
+        worker = DeepSeekAgentWorker()
+        worker.set_task("test", "/f.csv")
+
+        report_received = []
+        finished_received = []
+
+        worker.report_ready_signal.connect(lambda v: report_received.append(v))
+        worker.finished_signal.connect(lambda: finished_received.append(True))
+
+        worker.run()
+
+        assert len(report_received) == 1
+        assert len(finished_received) == 1
