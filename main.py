@@ -2347,24 +2347,18 @@ class DataProcessorWindow(QMainWindow):
           - 已有暗号行（含'时间戳'）→ 不插入
           - 新暗号行按列类型填充：
             · Timestamp → '时间戳'
-            · 波长列（首个非空值 ∈ [1400, 1700]）→ 'wN-类型-位置'
-            · 其它列（公式列等）→ 留空
+            · 波长列 → 'wN-类型-位置'
+            · 其它列 → 留空
           - 暗号行逐列对齐 df.columns，杜绝错位
         """
-        _WAVE_LO, _WAVE_HI = 1400.0, 1700.0
-
-        def _is_wave_col(df: pd.DataFrame, col_name: str) -> bool:
-            """值落在 FBG 波长区间 [1400, 1700] → 波长列。"""
-            s = df[col_name].dropna()
-            if s.empty:
-                return False
-            try:
-                v = float(s.iloc[0])
-            except (ValueError, TypeError):
-                return False
-            return _WAVE_LO <= v <= _WAVE_HI
-
         try:
+            from utils.annotation_utils import (
+                is_wave_col,
+                build_annotation_row,
+                insert_blank_row,
+                apply_annotation_row,
+            )
+
             if self.current_data is None or self.current_data.empty:
                 return
             df = self.current_data
@@ -2385,60 +2379,24 @@ class DataProcessorWindow(QMainWindow):
 
             # ── 2. 无暗号行 → 插入空白行 ──
             if existing_signal_row is None:
-                self._annotation_orig_dtypes = df.dtypes.to_dict()
-                blank_vals = [np.nan] * len(df.columns)
-                blank_row = pd.DataFrame([blank_vals], columns=df.columns)
-                self.current_data = pd.concat([blank_row, df], ignore_index=True)
-                for col, dtype in self._annotation_orig_dtypes.items():
-                    try:
-                        self.current_data[col] = self.current_data[col].astype(dtype)
-                    except (ValueError, TypeError):
-                        if 'int' in str(dtype):
-                            self.current_data[col] = self.current_data[col].astype('float64')
+                new_df, dtypes = insert_blank_row(df)
+                self._annotation_orig_dtypes = dtypes
+                self.current_data = new_df
                 annotation_row = 0
             else:
                 annotation_row = existing_signal_row
 
-            # ── 3. 暗号行填充 — 按实际 DataFrame 列迭代，保证对齐 ──
+            # ── 3. 暗号行填充 — 委托给 annotation_utils ──
             data_row = annotation_row + 1
             if data_row >= len(self.current_data):
                 return
 
-            if file_fmt in ('enlight', 'fiber_custom'):
-                wi = 0
-                for col_idx in range(len(self.current_data.columns)):
-                    col_name = str(self.current_data.columns[col_idx])
-                    # Timestamp 列
-                    if col_name == "Timestamp":
-                        self.current_data[col_name] = self.current_data[col_name].astype(object)
-                        self.current_data.iloc[annotation_row, col_idx] = "'时间戳'"
-                        continue
-                    # 波长列
-                    if _is_wave_col(self.current_data.iloc[data_row:], col_name):
-                        wi += 1
-                        self.current_data[col_name] = self.current_data[col_name].astype(object)
-                        self.current_data.iloc[annotation_row, col_idx] = f"'w{wi}-类型-位置'"
-                        continue
-                    # 其它列（公式列等）→ 留空，但确保 dtype 兼容 (object)
-                    if pd.api.types.is_numeric_dtype(self.current_data[col_name]):
-                        self.current_data[col_name] = self.current_data[col_name].astype(object)
-            else:
-                # 非光纤文件：仅基于模板列定义填充
-                if template and hasattr(template, 'columns') and template.columns:
-                    for col_idx, tc in enumerate(template.columns):
-                        if col_idx >= len(self.current_data.columns):
-                            break
-                        data_type = tc.get('data_type', '').strip().lower()
-                        if data_type == 'time':
-                            col_name = self.current_data.columns[col_idx]
-                            self.current_data[col_name] = self.current_data[col_name].astype(object)
-                            self.current_data.iloc[annotation_row, col_idx] = "'时间戳'"
-                        elif data_type and data_type != 'none':
-                            ann_text = tc.get('comment', '').strip() or tc.get('name', '').strip()
-                            if ann_text:
-                                col_name = self.current_data.columns[col_idx]
-                                self.current_data[col_name] = self.current_data[col_name].astype(object)
-                                self.current_data.iloc[annotation_row, col_idx] = f"'{ann_text}'"
+            ann = build_annotation_row(
+                self.current_data.iloc[data_row:], file_format=file_fmt,
+            )
+            apply_annotation_row(
+                self.current_data, ann, annotation_row, self._annotation_orig_dtypes,
+            )
         except Exception as e:
             print(f'[暗号行插入失败] {e}')
 
