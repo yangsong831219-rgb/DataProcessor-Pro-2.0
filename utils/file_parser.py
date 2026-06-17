@@ -903,3 +903,70 @@ def detect_numeric_wavelength_columns(
             continue
 
     return numeric_cols, wavelength_cols
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 自定义模板持久化（从 main.py 抽离）
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def load_custom_templates(templates_dir: str, target_list: list, DataTemplate: type) -> None:
+    """从 custom_templates.json 加载自定义模板，追加到 target_list。
+
+    启动时调用；跳过重复 ID 的模板。
+
+    Args:
+        templates_dir: 模板 JSON 所在目录（如项目 root/templates/）
+        target_list:   目标列表（通常为 DEFAULT_TEMPLATES）
+        DataTemplate:  DataTemplate 构造器类型
+    """
+    import json as _json
+    import os as _os
+
+    templates_file = _os.path.join(templates_dir, "custom_templates.json")
+    if not _os.path.exists(templates_file):
+        return
+
+    try:
+        with open(templates_file, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        for item in data:
+            template = DataTemplate(
+                item.get("id", ""),
+                item.get("name", ""),
+                item.get("file_format", "txt"),
+                item.get("delimiter", "\t"),
+                item.get("skip_rows", 0),
+                item.get("columns", []),
+            )
+            if not any(t.id == template.id for t in target_list):
+                target_list.append(template)
+    except Exception:
+        pass
+
+
+def persist_custom_template(template: object, templates_dir: str) -> None:
+    """将单个自定义模板持久化追加到 custom_templates.json 文件。
+
+    Args:
+        template:      实现了 .to_dict() -> dict 的模板对象
+        templates_dir: 模板 JSON 所在目录
+    """
+    import json as _json
+    import os as _os
+
+    _os.makedirs(templates_dir, exist_ok=True)
+    templates_file = _os.path.join(templates_dir, "custom_templates.json")
+
+    existing: list = []
+    if _os.path.exists(templates_file):
+        try:
+            with open(templates_file, "r", encoding="utf-8") as f:
+                existing = _json.load(f)
+        except Exception:
+            pass
+
+    existing.append(template.to_dict())
+
+    with open(templates_file, "w", encoding="utf-8") as f:
+        _json.dump(existing, f, ensure_ascii=False, indent=2)

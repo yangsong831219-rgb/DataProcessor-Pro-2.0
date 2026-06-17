@@ -1949,26 +1949,9 @@ class DataProcessorWindow(QMainWindow):
         self.status_bar.showMessage('数据已清除')
 
     def _find_first_timestamp_row(self, df):
-        """找到第一个包含有效时间戳的数据行索引"""
-        time_col = None
-        for col in df.columns:
-            col_lower = str(col).lower()
-            if '时间' in col_lower or 'time' in col_lower or 'timestamp' in col_lower:
-                time_col = col
-                break
-        if time_col is None:
-            return 0  # 没有时间列，从第一行开始
-
-        for idx in range(len(df)):
-            val = df.iloc[idx][time_col]
-            if pd.notna(val) and str(val).strip() != '':
-                try:
-                    pd.to_numeric(val)
-                    return idx
-                except (ValueError, TypeError):
-                    # 可能是时间字符串，也算有效
-                    return idx
-        return 0
+        """找到第一个包含有效时间戳的数据行索引。委托给 utils.dataframe_utils。"""
+        from utils.dataframe_utils import find_first_timestamp_row
+        return find_first_timestamp_row(df)
 
     def sample_data(self):
         """按等间隔抽取数据"""
@@ -2206,52 +2189,19 @@ class DataProcessorWindow(QMainWindow):
         QMessageBox.information(self, '成功', f'模板 "{name}" 已保存，下次打开文件时可在模板列表中选择')
 
     def _persist_custom_template(self, template):
-        """持久化自定义模板到JSON文件"""
-        import json
-        templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
-        os.makedirs(templates_dir, exist_ok=True)
-        templates_file = os.path.join(templates_dir, 'custom_templates.json')
+        """持久化自定义模板到JSON文件。委托给 utils.file_parser.persist_custom_template。"""
+        from utils.file_parser import persist_custom_template
 
-        existing = []
-        if os.path.exists(templates_file):
-            try:
-                with open(templates_file, 'r', encoding='utf-8') as f:
-                    existing = json.load(f)
-            except Exception:
-                pass
-
-        existing.append(template.to_dict())
-
-        with open(templates_file, 'w', encoding='utf-8') as f:
-            json.dump(existing, f, ensure_ascii=False, indent=2)
+        templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+        persist_custom_template(template, templates_dir)
 
     @staticmethod
     def load_custom_templates():
-        """启动时加载持久化的自定义模板"""
-        import json
-        templates_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'templates', 'custom_templates.json'
-        )
-        if not os.path.exists(templates_file):
-            return
+        """启动时加载持久化的自定义模板。委托给 utils.file_parser.load_custom_templates。"""
+        from utils.file_parser import load_custom_templates as _load
 
-        try:
-            with open(templates_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            for item in data:
-                template = DataTemplate(
-                    item.get('id', ''),
-                    item.get('name', ''),
-                    item.get('file_format', 'txt'),
-                    item.get('delimiter', '\t'),
-                    item.get('skip_rows', 0),
-                    item.get('columns', [])
-                )
-                # 避免重复添加
-                if not any(t.id == template.id for t in DEFAULT_TEMPLATES):
-                    DEFAULT_TEMPLATES.append(template)
-        except Exception:
-            pass
+        templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+        _load(templates_dir, DEFAULT_TEMPLATES, DataTemplate)
 
     MAX_DISPLAY_ROWS = 1000
 
