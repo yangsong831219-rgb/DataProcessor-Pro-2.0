@@ -2218,11 +2218,10 @@ class DataProcessorWindow(QMainWindow):
             self.analysis_tab_widget.set_current_data(analysis_df, annotated_cols)
 
     def _push_annotation_sensor_results(self, analysis_df, annotated_cols):
-        """将标注数据列转换为 sensor_results 格式，供通用数据使用。"""
-        sensor_results = {}
-        for col in annotated_cols:
-            if col in analysis_df.columns and pd.api.types.is_numeric_dtype(analysis_df[col]):
-                sensor_results[col] = analysis_df[col].tolist()
+        """将标注数据列转换为 sensor_results 格式。委托给 utils.annotation_utils。"""
+        from utils.annotation_utils import build_sensor_results_dict
+
+        sensor_results = build_sensor_results_dict(analysis_df, annotated_cols)
         if sensor_results:
             self.analysis_tab_widget.set_sensor_results(sensor_results)
 
@@ -2343,47 +2342,11 @@ class DataProcessorWindow(QMainWindow):
             - data_cols:     {列索引: 自定义列名} 字典
             - signal_row_idx: 暗号行在 DataFrame 中的行号，None 表示未找到
         """
-        import re as _re
+        from utils.annotation_utils import extract_annotation_info
 
         if self.current_data is None or self.current_data.empty:
             return None, {}, None
-
-        df = self.current_data
-        signal_row_idx = None
-
-        # ── 1. 定位暗号行 ──
-        for idx in range(len(df)):
-            for val in df.iloc[idx]:
-                s = str(val).strip().strip("'"'"'"")
-                if '时间戳' in s:
-                    signal_row_idx = idx
-                    break
-            if signal_row_idx is not None:
-                break
-
-        if signal_row_idx is None:
-            return None, {}, None
-
-        # ── 2. 解析暗号行的列含义 ──
-        signal_row = df.iloc[signal_row_idx]
-        QUOTED_RE = _re.compile(r"^[\'\"‘’“”](.*?)[\'\"‘’“”]$")
-        time_col_idx = None
-        data_cols: dict = {}
-
-        for j in range(len(df.columns)):
-            col_name = df.columns[j]
-            val = str(signal_row[col_name]).strip()
-            cleaned = val.strip("'\"‘’“”").strip()
-
-            if '时间戳' in cleaned:
-                time_col_idx = j
-
-            elif QUOTED_RE.match(val):
-                m = QUOTED_RE.match(val)
-                custom_name = m.group(1).strip()
-                data_cols[j] = custom_name
-
-        return time_col_idx, data_cols, signal_row_idx
+        return extract_annotation_info(self.current_data)
 
     # ══════════════════════════════════════════════════════════
     # 根据暗号标注获取清洗后的分析数据
@@ -2395,67 +2358,11 @@ class DataProcessorWindow(QMainWindow):
         Returns:
             (cleaned_df, time_col_name) — 无暗号时返回 (self.current_data, '时间')
         """
-        time_col_idx, data_cols, signal_row_idx = self.get_annotated_columns()
+        from utils.annotation_utils import get_analysis_data
 
-        if signal_row_idx is None or self.current_data is None:
-            # 无暗号时也执行卸妆清洗，与带暗号路径保持列名格式一致
-            _col_clean = lambda n: re.sub(r'[\(（].*?[\)）]', '', str(n)).strip()
-            if self.current_data is not None:
-                df = self.current_data.copy()
-                df.columns = [_col_clean(c) for c in df.columns]
-                return df, '时间', []
-            return self.current_data, '时间', []
-
-        df = self.current_data
-        # 跳过暗号行及之前的所有行
-        data_df = df.iloc[signal_row_idx + 1:].copy()
-        data_df.reset_index(drop=True, inplace=True)
-
-        # 恢复数值列 dtype：注解行（插入或文件自带）可能已将列污染为 object
-        # 对每个非数值列尝试 to_numeric，若 80%+ 非空值可转换则保留
-        for col in data_df.columns:
-            if not pd.api.types.is_numeric_dtype(data_df[col]):
-                converted = pd.to_numeric(data_df[col], errors='coerce')
-                before = data_df[col].notna().sum()
-                after = converted.notna().sum()
-                if before > 0 and after / before >= 0.8:
-                    data_df[col] = converted
-
-        # 确定时间列名
-        if time_col_idx is not None:
-            time_col_name = str(df.columns[time_col_idx])
-        else:
-            time_col_name = '时间'
-            if time_col_name not in data_df.columns and len(data_df.columns) > 0:
-                time_col_name = str(data_df.columns[0])
-
-        # 重命名数据列（暗号标注名 → DataFrame 列名）
-        rename_map = {}
-        if data_cols:
-            for col_idx, custom_name in data_cols.items():
-                if col_idx < len(df.columns):
-                    rename_map[df.columns[col_idx]] = custom_name
-        # 将时间列统一命名为 '时间'，方便下游（run_analysis）识别
-        if time_col_idx is not None:
-            orig_time_name = str(df.columns[time_col_idx])
-            if orig_time_name not in rename_map:  # 未被用户重命名
-                rename_map[orig_time_name] = '时间'
-                time_col_name = '时间'
-            else:
-                time_col_name = rename_map[orig_time_name]
-        if rename_map:
-            data_df = data_df.rename(columns=rename_map)
-
-        # 返回有暗号标注的列名集合，用于分析页筛选列选择列表
-        annotated_cols = list(data_cols.values()) if data_cols else []
-
-        # 卸妆：剥离所有列名中英文括号及单位后缀
-        _col_clean = lambda n: re.sub(r'[\(（].*?[\)）]', '', str(n)).strip()
-        data_df.columns = [_col_clean(c) for c in data_df.columns]
-        time_col_name = _col_clean(time_col_name)
-        annotated_cols = [_col_clean(c) for c in annotated_cols]
-
-        return data_df, time_col_name, annotated_cols
+        if self.current_data is None:
+            return self.current_data, "时间", []
+        return get_analysis_data(self.current_data)
 
     @staticmethod
     def _clean_sensor_keys(results: dict) -> dict:
