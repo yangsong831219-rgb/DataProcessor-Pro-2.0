@@ -124,6 +124,22 @@ temp = {
     "decoupling_results": {
         "A1": {"e_mean": 3.0, "e_std": 43.5, "e_range": 100.0, "rating": "良"},
     },
+    "compensation": {
+        "A1": {
+            "grade": {"sensor": "A1", "grade": "良", "passed": True,
+                      "reasons": ["test"], "is_single_grating": False},
+            "metrics": {"sensor": "A1", "residual_sigma": 5.0, "fs": 1000.0,
+                        "residual_sigma_pct_fs": 0.5, "low_confidence": False,
+                        "repeatability": 2.0, "repeatability_pct_fs": 0.2,
+                        "hysteresis_max": 15.0, "hysteresis_max_pct_fs": 1.5,
+                        "noise_floor": 1.0, "noise_floor_pct_fs": 0.1,
+                        "temp_sensitivity_max": 2.5,
+                        "worst_case_single": 7.5, "worst_case_single_pct_fs": 0.75},
+            "lut": {"sensor": "A1", "T_base": 25.0,
+                    "T_grid": [10.0, 20.0, 30.0], "eps_app": [0.0, 1.0, 2.0],
+                    "T_min": 10.0, "T_max": 30.0, "n_cycles": 3, "source": "test"},
+        },
+    },
 }
 
 pc = ProjectConfig(

@@ -20,13 +20,15 @@ def export_temperature_excel(
     output_path: str,
     *,
     wavelength_cols: Optional[list[str]] = None,
+    compensation: Optional[dict] = None,
 ) -> str:
     """导出温度标定结果到 Excel。
 
-    Sheet 结构 (参照 FBG.py):
+    Sheet 结构:
       1. 诊断摘要 — 各传感器标定 vs 实测对比
       2. 平台回归数据 — 平台 dL 均值 + T_set
-      3. {sensor}传感器数据 — 时间序列 (dL, 修正温度/应变, 原始温度/应变)
+      3. 出厂指标 — 补偿后指标 (residual_sigma, hysteresis, noise, grade…)
+      4. {sensor}传感器数据 — 时间序列 (dL, 修正温度/应变, 原始温度/应变)
 
     Args:
         df: 含 _d 列的原始数据
@@ -36,6 +38,7 @@ def export_temperature_excel(
         S_eff: 灵敏度回归结果
         output_path: 输出 .xlsx 路径
         wavelength_cols: 波长列名列表
+        compensation: 补偿数据 dict {s_name: {"lut":..., "metrics":..., "grade":...}}
 
     Returns:
         output_path
@@ -69,7 +72,70 @@ def export_temperature_excel(
                 writer, sheet_name="平台回归数据", index=False
             )
 
-        # ── Sheet 3: 各传感器时间序列 ──
+        # ── Sheet 3: 出厂指标 (Phase 3c: compensation model + metrics + grade) ──
+        if compensation:
+            metrics_rows = []
+            for s_name, comp in sorted(compensation.items()):
+                if not isinstance(comp, dict):
+                    continue
+                comp_metrics = comp.get("metrics")
+                comp_grade = comp.get("grade")
+                # compat: old key "lut" vs new "compensation_model"
+                # compat: old key "lut" stores bare LUT dict, new "compensation_model" stores CM dict
+                comp_model_d = comp.get("compensation_model") or comp.get("lut")
+                if isinstance(comp_model_d, dict) and "form" not in comp_model_d:
+                    comp_model_d = {"form": "lut", "model": comp_model_d}
+
+                row: dict = {"传感器": s_name}
+
+                if isinstance(comp_grade, dict):
+                    row["评级"] = str(comp_grade.get("grade", "—"))
+                    row["判定"] = "通过" if comp_grade.get("passed") else "拦截"
+                else:
+                    row["评级"] = "N/A"
+                    row["判定"] = "—"
+
+                if isinstance(comp_metrics, dict):
+                    # ★ 补偿形式: 标明残差对应哪种形式
+                    cm_form = comp_metrics.get("comp_form", "—")
+                    cm_order = comp_metrics.get("poly_order", 0)
+                    if cm_form == "poly" and cm_order:
+                        row["补偿形式"] = f"poly (order {cm_order})"
+                    else:
+                        row["补偿形式"] = cm_form or "—"
+
+                    row["量程(με)"] = comp_metrics.get("fs", "")
+                    row["残余σ_RMS(με)"] = comp_metrics.get("residual_sigma", "")
+                    row["残余σ(%FS)"] = comp_metrics.get("residual_sigma_pct_fs", "")
+                    row["重复性(με)"] = comp_metrics.get("repeatability", "")
+                    row["迟滞_max(με)"] = comp_metrics.get("hysteresis_max", "")
+                    row["迟滞(%FS)"] = comp_metrics.get("hysteresis_max_pct_fs", "")
+                    row["最坏单点(με)"] = comp_metrics.get("worst_case_single", "")
+                    row["最坏单点(%FS)"] = comp_metrics.get("worst_case_single_pct_fs", "")
+                    row["噪声底(με)"] = comp_metrics.get("noise_floor", "")
+                    row["测温灵敏度(με/°C)"] = comp_metrics.get("temp_sensitivity_max", "")
+                    row["低置信度"] = "是" if comp_metrics.get("low_confidence") else "否"
+
+                # model metadata (works for both LUT and poly via CompensationModel dict)
+                if isinstance(comp_model_d, dict):
+                    row["T_base(°C)"] = comp_model_d.get("T_base", "")
+                    row["有效温度范围(°C)"] = (
+                        f"{comp_model_d.get('T_min','')}~{comp_model_d.get('T_max','')}")
+                    row["建表循环数"] = comp_model_d.get("n_cycles", "")
+                    row["建表方法"] = str(comp_model_d.get("source", ""))
+                    if comp_model_d.get("form") == "poly":
+                        row["多项式阶数"] = comp_model_d.get("order", "")
+                    elif "T_grid" in comp_model_d:
+                        row["LUT点数"] = len(comp_model_d.get("T_grid", []))
+
+                metrics_rows.append(row)
+
+            if metrics_rows:
+                pd.DataFrame(metrics_rows).to_excel(
+                    writer, sheet_name="出厂指标", index=False
+                )
+
+        # ── Sheet 4: 各传感器时间序列 ──
         for s_name, r in sensor_results.items():
             out_data = {
                 "时间(h)": np.round(time_h, 4),

@@ -31,6 +31,7 @@ TEMPERATURE_FIELDS: list[str] = [
     "file_path", "file_format",
     "annotation", "temp_min", "temp_max", "temp_step",
     "detection_params", "s_eff_results", "ke_table", "decoupling_results",
+    "compensation",
 ]
 """温度子 dict 完整字段列表 (来自旧 CalibrationProfile, 不含 project 级 meta)"""
 
@@ -283,6 +284,9 @@ class ProjectConfigManager:
                         "rating": str(d.get("rating", "—")),
                     }
 
+            # compensation — 从 _phase_b_state 提取 (Phase 3: LUT/指标/评级)
+            comp_data = pb_state.get("compensation", {}) or {}
+
             has_temp_data = tp_annot or seff or ke_table or decoupling
             if has_temp_data:
                 pa_state = getattr(tp, '_phase_a_state', None) or {}
@@ -298,6 +302,7 @@ class ProjectConfigManager:
                     "s_eff_results": seff,
                     "ke_table": ke_table,
                     "decoupling_results": decoupling,
+                    "compensation": comp_data,
                 }
 
         # ── 应变段 ──
@@ -426,6 +431,7 @@ class ProjectConfigManager:
             tp._phase_b_state = {
                 "ke_table": dict(t.get("ke_table", {})),
                 "decoupling_results": dict(decoupling),
+                "compensation": dict(t.get("compensation", {}) or {}),
             }
 
             # Step 6: UI 按钮门控

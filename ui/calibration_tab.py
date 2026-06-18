@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QComboBox, QSpinBox, QDoubleSpinBox,
     QLineEdit, QTextEdit, QFileDialog, QMessageBox, QTableWidget,
     QTableWidgetItem, QTabWidget, QDialog, QScrollArea, QHeaderView,
-    QCheckBox, QSplitter, QFrame, QApplication,
+    QCheckBox, QSplitter, QFrame, QApplication, QStackedWidget,
     QInputDialog, QListWidget,
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal
@@ -51,6 +51,15 @@ from py.calibration.strain_calibration import (
 )
 from py.calibration.export_utils import (
     export_temperature_excel, export_strain_excel,
+)
+from utils.apparent_strain_comp import (
+    build_apparent_strain_lut, ApparentStrainLUT, ApparentStrainPoly,
+    fit_apparent_strain_poly, CompensationModel, apply_compensation_model,
+)
+from utils.compensation_metrics import (
+    CompensationMetrics, SensorGrade, GradeThresholds,
+    detect_cycles_from_T, evaluate_compensation, grade_sensor, grade_sensor_na,
+    compare_compensation_forms,
 )
 
 
@@ -575,18 +584,110 @@ class PhaseAWorker(QThread):
             self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 补偿流水线 — 模块级函数 (可被主线程或子线程调用)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _run_compensation_pipeline_static(
+    sensors: dict, fs_map: dict,
+    comp_form: str = "lut", poly_order: int = 4,
+    subsample_step: int | None = None,
+    thresholds: GradeThresholds | None = None,
+) -> dict:
+    """每传感器按指定 form/order 建模型 → evaluate → grade (可在子线程内调用)。
+
+    Args:
+        sensors: PhaseBWorker 输出的传感器 dict
+        fs_map: {s_name: fs} — 满量程映射，由调用方在主线程预计算
+        comp_form: "lut" | "poly"
+        poly_order: form="poly" 时的阶数
+        subsample_step: LOOCV/建模抽样步长, None=不抽样, 10=1/10
+        thresholds: 评级阈值 (SSOT)。None 时使用 GradeThresholds() 出厂默认值。
+
+    Returns:
+        {s_name: {"model": CompensationModel|None,
+                   "metrics": CompensationMetrics|None,
+                   "grade": SensorGrade}}
+    """
+    if thresholds is None:
+        thresholds = GradeThresholds()
+    results: dict = {}
+    for s_name, r in sensors.items():
+        if r.get("single_grating", False):
+            results[s_name] = {
+                "model": None,
+                "metrics": None,
+                "grade": grade_sensor_na(s_name,
+                    "单栅传感器，走 S_eff 温补路径，不参与表观应变补偿"),
+            }
+            continue
+
+        eps = np.asarray(r.get("eps_corr", np.empty(0)), dtype=np.float64)
+        T_abs = np.asarray(r.get("T_abs", np.empty(0)), dtype=np.float64)
+        T_base = float(r.get("T_base", 25.0))
+
+        try:
+            cids = detect_cycles_from_T(T_abs, method="auto")
+            n_cycles = len(set(int(c) for c in cids if c >= 0))
+            fs = float(fs_map.get(s_name, 1000.0))
+
+            if comp_form == "poly":
+                poly = fit_apparent_strain_poly(
+                    T_abs, eps, T_base, poly_order,
+                    sensor=s_name, n_cycles=n_cycles,
+                    source=f"phase_b_decoupling_poly{poly_order}",
+                )
+                cm = CompensationModel(form="poly", model=poly)
+            else:
+                lut = build_apparent_strain_lut(
+                    T_abs, eps, T_base,
+                    bin_width=2.0, min_count=10,
+                    sensor=s_name, n_cycles=n_cycles,
+                    source="phase_b_decoupling",
+                )
+                cm = CompensationModel(form="lut", model=lut)
+
+            metrics = evaluate_compensation(
+                T_abs, eps, cids, fs=fs,
+                form=comp_form, poly_order=poly_order,
+                sensor=s_name, subsample_step=subsample_step,
+            )
+            grade_val = grade_sensor(metrics, thresholds=thresholds)
+
+            results[s_name] = {
+                "model": cm, "metrics": metrics, "grade": grade_val,
+            }
+        except Exception as exc:
+            import traceback as _tb
+            tb = _tb.format_exc()
+            results[s_name] = {
+                "model": None,
+                "metrics": None,
+                "grade": SensorGrade(
+                    sensor=s_name, grade="ERROR", passed=False,
+                    reasons=[f"Compensation pipeline error: {exc}", tb[:400]],
+                ),
+            }
+
+    return results
+
+
 class PhaseBWorker(QThread):
     """Phase B: 用实测S_eff作KT + 用户Ke → 双波长解耦诊断
 
     双栅传感器: decouple(dl1, dl2, Ke1, S1, Ke2, S2)
     单栅传感器: 仅汇总温度系数，不做解耦
+
+    Phase 3b: 补偿流水线已并入 run()，在子线程内计算。
     """
     progress = pyqtSignal(str)
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
 
     def __init__(self, df, time_h, wavelength_cols, annotation_groups,
-                 S_eff_result, strain_coeffs, sample_interval_s=2.0):
+                 S_eff_result, strain_coeffs, sample_interval_s=2.0,
+                 run_compensation=True, comp_form="lut", poly_order=4,
+                 fs_map=None, subsample_step=None, thresholds=None):
         super().__init__()
         self.df = df; self.time_h = time_h
         self.wavelength_cols = wavelength_cols
@@ -594,7 +695,13 @@ class PhaseBWorker(QThread):
         self.S_eff_result = S_eff_result
         self.strain_coeffs = strain_coeffs or {}
         self.sample_interval_s = sample_interval_s
-        self._last_result = None  # 测试用: run() 结束后可直接读取
+        self.run_compensation = run_compensation
+        self.subsample_step = subsample_step
+        self.comp_form = comp_form
+        self.poly_order = poly_order
+        self.fs_map = fs_map or {}
+        self.thresholds = thresholds  # GradeThresholds | None
+        self._last_result = None  # for testing
 
     def run(self):
         try:
@@ -673,16 +780,61 @@ class PhaseBWorker(QThread):
                     f"修正e_std={np.nanstd(eps_corr):.1f}με"
                 )
 
+            # ── Phase 3b: 补偿流水线在子线程内执行 ──
+            compensation = {}
+            if self.run_compensation:
+                self.progress.emit("正在计算补偿指标...")
+                compensation = _run_compensation_pipeline_static(
+                    sensors, self.fs_map,
+                    comp_form=self.comp_form, poly_order=self.poly_order,
+                    subsample_step=self.subsample_step,
+                    thresholds=self.thresholds,
+                )
+                self.progress.emit("补偿指标计算完成")
+
             self.progress.emit("解耦分析完成！")
             result = {
                 "sensors": sensors, "comparisons": comparisons,
                 "df": self.df, "time_h": time_h,
+                "compensation": compensation,
             }
-            self._last_result = result  # 测试用
+            self._last_result = result  # for testing
             self.finished.emit(result)
         except Exception as e:
             import traceback
             self.error.emit(f"{e}\n{traceback.format_exc()}")
+
+
+# ── 按需单传感器 compare_compensation_forms worker (选型对话框用) ──
+
+class ComputeFormsCompareWorker(QThread):
+    """按需计算单传感器的 3 形式 LOOCV 比较 (lut/poly2/poly4)。
+
+    仅在用户打开补偿选型、选中某传感器且缓存未命中时启动。
+    不参与主 PhaseBWorker 流水线。
+    """
+    finished = pyqtSignal(str, object)  # s_name, {lut: sigma, poly2: sigma, poly4: sigma}
+    error = pyqtSignal(str)
+
+    def __init__(self, s_name: str, T_abs, eps_corr, fs: float, subsample_step: int | None = None):
+        super().__init__()
+        self.s_name = s_name
+        self.T_abs = np.asarray(T_abs, dtype=np.float64)
+        self.eps_corr = np.asarray(eps_corr, dtype=np.float64)
+        self.fs = fs
+        self.subsample_step = subsample_step
+
+    def run(self):
+        try:
+            cids = detect_cycles_from_T(self.T_abs, method="auto")
+            result = compare_compensation_forms(
+                self.T_abs, self.eps_corr, cids, fs=self.fs,
+                candidates=("lut", "poly2", "poly4"),
+                subsample_step=self.subsample_step)
+            self.finished.emit(self.s_name, result)
+        except Exception as exc:
+            import traceback
+            self.error.emit(f"compare_forms for {self.s_name}: {exc}\n{traceback.format_exc()}")
 
 
 # 保留旧 Worker 别名向后兼容
@@ -1389,7 +1541,10 @@ class PhaseBDialog(QDialog):
         self._coeffs = {}
         self._worker = None
         self._last_result = None
-        self._single_excluded_label = None  # 单栅排除提示 label (懒初始化)
+        self._pending_callback = None  # async button continuation
+        self._forms_compare_cache: dict[str, dict] = {}  # sensor → {lut/poly2/poly4: sigma}
+        self._forms_compare_worker: ComputeFormsCompareWorker | None = None
+        self._single_excluded_label = None
         self._build_ui()
 
         # ── 状态恢复: 从主 Tab _phase_b_state 恢复上次关闭时的值 ──
@@ -1405,22 +1560,79 @@ class PhaseBDialog(QDialog):
                     self.coef_table.setItem(i, 1, QTableWidgetItem(f"{float(ke['Ke1']):.2f}"))
                     self.coef_table.setItem(i, 2, QTableWidgetItem(f"{float(ke['Ke2']):.2f}"))
             self._coeffs = dict(ke_table)
-            # 恢复解耦结果 (渲染 10 列表格)
+            # ── 恢复补偿数据 (从持久化的紧凑产物重建) ──
+            stored_comp = state.get("compensation", {})
+            if stored_comp:
+                restored_comp: dict = {}
+                for s_name, comp_d in stored_comp.items():
+                    if not isinstance(comp_d, dict):
+                        continue
+                    try:
+                        grade_d = comp_d.get("grade")
+                        cm_d = comp_d.get("compensation_model") or comp_d.get("lut")
+                        cm = None
+                        if cm_d and isinstance(cm_d, dict):
+                            if "form" not in cm_d:
+                                cm_d = {"form": "lut", "model": cm_d}
+                            cm = CompensationModel.from_dict(cm_d)
+                        if grade_d:
+                            restored_comp[s_name] = {
+                                "model": cm,
+                                "metrics": None,
+                                "grade": SensorGrade(**grade_d)
+                                         if isinstance(grade_d, dict) else grade_d,
+                            }
+                    except Exception:
+                        import traceback
+                        traceback.print_exc()  # 不再静默吞异常
+                if restored_comp:
+                    self._compensation_results = restored_comp
+
+            # ── 仅用持久化标量渲染结果表 (禁止 init 重算) ──
             decoupling = state.get("decoupling_results", {})
             if decoupling:
-                sensors = {}
-                for s_name, d in decoupling.items():
-                    sensors[s_name] = {
-                        "eps_corr": [d.get("e_mean", 0)] * 10,
+                # 构建最小 display_sensors (仅用于表格遍历，e_std/e_range/rating 从 decoupling_data 读)
+                display_sensors = {}
+                for s_name, d_val in decoupling.items():
+                    display_sensors[s_name] = {
+                        "eps_corr": [d_val.get("e_mean", 0)],
                         "eps_orig": [], "dT_corr": [], "T_abs": [],
                         "S1": 0, "S2": 0, "T_base": 0,
                         "single_grating": s_name not in ke_table,
                     }
-                saved_ratings = {s: d.get("rating", "—") for s, d in decoupling.items()}
-                # ★ 不设 _last_result: 让 _open_charts 的 lazy decouple 用真实 df 重算
-                self._render_result_table(sensors, self._phase_a_result.get("S_eff", {}),
-                                           saved_ratings)
+                # ★ 优先用新 grade (compensation) 而非旧 rating (decoupling_results)
+                saved_ratings: dict = {}
+                for s_name, d_val in decoupling.items():
+                    comp_entry = stored_comp.get(s_name, {})
+                    comp_grade = comp_entry.get("grade", {})
+                    if isinstance(comp_grade, dict) and comp_grade.get("grade"):
+                        saved_ratings[s_name] = comp_grade["grade"]
+                    else:
+                        saved_ratings[s_name] = d_val.get("rating", "—")
+                self._render_result_table(display_sensors,
+                    self._phase_a_result.get("S_eff", {}),
+                    saved_ratings, decoupling_data=decoupling,
+                    compensation=getattr(self, '_compensation_results', None))
                 self.charts_btn.setEnabled(True)
+                self.form_select_btn.setEnabled(True)
+                self.export_excel_btn.setEnabled(True)
+                self.export_word_btn.setEnabled(True)
+                # ★ 状态恢复: 更新按钮文字 + 清理旧提示
+                self.run_btn.setText("✓ 已分析 (已恢复)")
+                self.run_btn.setEnabled(True)
+                old_hint = getattr(self, '_unanalyzed_hint', None)
+                if old_hint is not None:
+                    old_hint.setVisible(False)
+            else:
+                # 无持久化数据 → 显示提示 (不重算)
+                if hasattr(self, 'result_table'):
+                    self.result_table.setRowCount(0)
+                hint = QLabel("未分析 — 请点击「运行解耦分析」开始")
+                hint.setStyleSheet("color: #999; padding: 8px;")
+                self._unanalyzed_hint = hint
+                idx = self.layout().indexOf(self.result_table)
+                if idx >= 0:
+                    self.layout().insertWidget(idx + 1, hint)
 
     def _get_temp_page(self):
         p = self.parent()
@@ -1428,6 +1640,18 @@ class PhaseBDialog(QDialog):
             return p
         if hasattr(p, 'temperature_page'):
             return p.temperature_page
+        return None
+
+    def _ensure_decoupled_result(self, show_warning: bool = True) -> dict | None:
+        """守卫：仅返回已缓存结果。绝不执行重计算。
+
+        主线程禁止解耦/补偿/LOOCV — 重活唯一产地是 PhaseBWorker。
+        若 _last_result 为 None → 弹 QMessageBox (show_warning=True) 或返回 None。
+        """
+        if self._last_result is not None:
+            return self._last_result.get("sensors", {})
+        if show_warning:
+            QMessageBox.warning(self, "无数据", "请先运行解耦分析。")
         return None
 
     def _build_ui(self):
@@ -1476,12 +1700,13 @@ class PhaseBDialog(QDialog):
         self.error_bar.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.error_bar)
 
-        # ── 解耦结果表 (10列: 传感器/类型/Ke1/Ke2/KT1/KT2/ε_mean/ε_std/ε_range/评级) ──
-        self.result_table = QTableWidget(0, 10)
+        # ── 解耦结果表 (12列: 传感器/类型/Ke/.../原始σ/补偿后σ/评级) ──
+        self.result_table = QTableWidget(0, 12)
         self.result_table.setHorizontalHeaderLabels([
             "传感器", "类型", "Ke1\n(pm/με)", "Ke2\n(pm/με)",
             "KT1\n(pm/°C)", "KT2\n(pm/°C)",
-            "ε_mean\n(με)", "ε_std\n(με)", "ε_range\n(με)", "评级",
+            "ε_mean\n(με)", "原始σ\n(με)", "补偿后σ\n(με)", "补偿后σ\n(%FS)",
+            "ε_range\n(με)", "评级",
         ])
         self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.result_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1495,10 +1720,21 @@ class PhaseBDialog(QDialog):
         self.charts_btn.setEnabled(False)
         layout.addWidget(self.charts_btn)
 
+        # ── 补偿形式选型按钮 (Phase 3c: compare_compensation_forms) ──
+        self.form_select_btn = create_button(
+            "🔬 补偿选型…", self._open_form_selection, "secondary",
+            tooltip="比较查表/2阶/4阶的残余 sigma，选择最优补偿形式")
+        self.form_select_btn.setEnabled(False)
+        layout.addWidget(self.form_select_btn)
+
         # ── 导出 ──
         exp_row = QHBoxLayout()
-        exp_row.addWidget(create_button("导出 Excel", self._export_excel, "success"))
-        exp_row.addWidget(create_button("生成 Word 报告", self._export_word, "secondary"))
+        self.export_excel_btn = create_button("导出 Excel", self._export_excel, "success")
+        self.export_word_btn = create_button("生成 Word 报告", self._export_word, "secondary")
+        self.export_excel_btn.setEnabled(False)
+        self.export_word_btn.setEnabled(False)
+        exp_row.addWidget(self.export_excel_btn)
+        exp_row.addWidget(self.export_word_btn)
         exp_row.addStretch()
         exp_row.addWidget(create_button("确定", self.accept, "primary"))
         layout.addLayout(exp_row)
@@ -1525,10 +1761,45 @@ class PhaseBDialog(QDialog):
         sample_s = 2.0
         time_h = np.arange(len(self._df)) * sample_s / 3600.0
 
+        # ── 满量程映射 (主线程预计算，传入 worker) ──
+        fs_map: dict[str, float] = {}
+        tp = self._get_temp_page()
+        if tp is not None:
+            ctw = getattr(tp, '_get_cal_tab_widget', lambda: None)()
+            if ctw is not None and ctw.project_config is not None:
+                for s_name in self._coeffs:
+                    sc = ctw.project_config.strain.get(s_name)
+                    if sc is not None:
+                        rd_list = getattr(sc, 'readings', []) or []
+                        if rd_list and isinstance(rd_list[-1], dict):
+                            fsc = rd_list[-1].get("eps_theory", 0)
+                            if fsc > 0:
+                                fs_map[s_name] = float(fsc)
+
+        # ── 读取用户选择的补偿配置 ──
+        comp_form = "lut"; poly_order = 4
+        if tp and tp._phase_b_state:
+            comp_form = tp._phase_b_state.get("comp_form", "lut")
+            poly_order = int(tp._phase_b_state.get("poly_order", 4))
+
+        # ── 抽样步长: 从配置读，默认 10 (LOOCV/建模 1/10 数据) ──
+        subsample_step = 10
+        if tp and tp._phase_b_state and "subsample_step" in tp._phase_b_state:
+            subsample_step = int(tp._phase_b_state.get("subsample_step", 10))
+
+        # ── 评级阈值: 从 SSOT 读取 (Phase 3: 迟滞 FAIL 阈值可配) ──
+        thresholds = None
+        if tp and tp._phase_b_state and "grade_thresholds" in tp._phase_b_state:
+            thresholds = GradeThresholds.from_dict(tp._phase_b_state["grade_thresholds"])
+
         from ui.calibration_tab import PhaseBWorker
         self._worker = PhaseBWorker(
             self._df, time_h, wavelength_cols, self._groups,
             self._phase_a_result["S_eff"], self._coeffs, sample_s,
+            run_compensation=True,
+            comp_form=comp_form, poly_order=poly_order,
+            fs_map=fs_map, subsample_step=subsample_step,
+            thresholds=thresholds,
         )
         self._worker.progress.connect(lambda m: self.progress_label.setText(m))
         self._worker.finished.connect(self._on_done)
@@ -1540,21 +1811,56 @@ class PhaseBDialog(QDialog):
         sensors = result.get("sensors", {})
         S_eff = self._phase_a_result.get("S_eff", {})
 
-        # 渲染结果表
-        self._render_result_table(sensors, S_eff)
+        # ★ 补偿结果已在子线程算完 (Phase 3b)
+        self._compensation_results = result.get("compensation", {})
+        if not self._compensation_results:
+            # 回退: worker 没算 → 用静态函数补算
+            fs_map_fb: dict[str, float] = {}
+            ss = 10
+            tp_fb = self._get_temp_page()
+            if tp_fb and tp_fb._phase_b_state:
+                ss = int(tp_fb._phase_b_state.get("subsample_step", 10))
+            thresholds_fb = None
+            if tp_fb and tp_fb._phase_b_state and "grade_thresholds" in tp_fb._phase_b_state:
+                thresholds_fb = GradeThresholds.from_dict(tp_fb._phase_b_state["grade_thresholds"])
+            self._compensation_results = _run_compensation_pipeline_static(
+                sensors, fs_map_fb, comp_form="lut", poly_order=4,
+                subsample_step=ss, thresholds=thresholds_fb)
 
+        # 渲染结果表 + FAIL 横幅
+        self._render_result_table(sensors, S_eff,
+                                   compensation=self._compensation_results)
+        self._show_fail_banner()
+
+        # 启用按钮
         self.charts_btn.setEnabled(True)
+        self.form_select_btn.setEnabled(True)
+        self.export_excel_btn.setEnabled(True)
+        self.export_word_btn.setEnabled(True)
         self.run_btn.setText("✓ 完成")
         self.run_btn.setEnabled(True)
+        self.progress_label.setText("")  # 清空进度文字
 
-    def _render_result_table(self, sensors: dict, S_eff: dict, saved_ratings: dict = None):
+        # ── 继续挂起的回调 (异步按钮: 图表/选型/导出/报告) ──
+        cb = getattr(self, '_pending_callback', None)
+        if cb is not None:
+            self._pending_callback = None
+            cb()
+
+    # _run_compensation_pipeline 已替换为 module-level _run_compensation_pipeline_static
+    # (在 PhaseBWorker.run() 子线程内调用，避免主线程阻塞)
+
+    def _render_result_table(self, sensors: dict, S_eff: dict,
+                              saved_ratings: dict = None, compensation: dict = None,
+                              decoupling_data: dict = None):
         """渲染 10 列解耦结果表 — 仅双栅传感器 (单栅跳过，不进解耦)
 
-        Phase B 解耦基于 2×2 矩阵求逆，单栅传感器无第二个光栅参与
-        解耦，因此不在此表中显示。单栅的 S_eff 温度系数保留在 Phase A，
-        不在 Phase B 处理。
+        Phase 3: 评级用 grade_sensor() (%FS 阈值)。状态恢复时优先读
+        持久化的 e_std/e_range/rating，不从假数组重算。
         """
         saved_ratings = saved_ratings or {}
+        compensation = compensation or getattr(self, '_compensation_results', None) or {}
+        decoupling_data = decoupling_data or {}
         self.result_table.setSortingEnabled(False)
 
         # ── 过滤: 仅双栅传感器 ──
@@ -1577,11 +1883,36 @@ class PhaseBDialog(QDialog):
             ke1 = self._coeffs.get(s_name, {}).get("Ke1", float("nan"))
             ke2 = self._coeffs.get(s_name, {}).get("Ke2", float("nan"))
 
-            e_mean = float(np.nanmean(eps)) if len(eps) > 0 else float("nan")
-            e_std  = float(np.nanstd(eps))  if len(eps) > 0 else float("nan")
-            e_range = float(np.nanmax(eps) - np.nanmin(eps)) if len(eps) > 0 else float("nan")
+            # ★ 优先使用持久化标量 (状态恢复路径)，否则从 eps 数组计算
+            d = decoupling_data.get(s_name, {})
+            if d:
+                e_mean = d.get("e_mean", float("nan"))
+                e_std  = d.get("e_std", float("nan"))
+                e_range = d.get("e_range", float("nan"))
+            else:
+                e_mean = float(np.nanmean(eps)) if len(eps) > 0 else float("nan")
+                e_std  = float(np.nanstd(eps))  if len(eps) > 0 else float("nan")
+                e_range = float(np.nanmax(eps) - np.nanmin(eps)) if len(eps) > 0 else float("nan")
 
-            if not np.isnan(e_std):
+            # ── ★ Phase 3: 用 grade_sensor 评级 (%FS 阈值) ──
+            comp = compensation.get(s_name, {})
+            comp_grade = comp.get("grade") if isinstance(comp, dict) else None
+            if comp_grade is not None and comp_grade.grade != "N/A":
+                rating = comp_grade.grade
+                if rating == "FAIL":
+                    bg = "#FFCDD2"    # deep red — scrap
+                elif rating == "ERROR":
+                    bg = "#FFAB91"    # orange-red — pipeline error
+                elif rating == "优":
+                    bg = "#E8F5E9"    # green
+                elif rating == "良":
+                    bg = "#FFF8E1"    # yellow
+                elif rating == "合格":
+                    bg = "#E3F2FD"    # blue
+                else:
+                    bg = "#F5F5F5"
+            elif not np.isnan(e_std):
+                # 回退: 无补偿数据时用旧阈值 (兼容状态恢复路径)
                 if e_std <= 30:
                     rating, bg = "优", "#E8F5E9"
                 elif e_std <= 60:
@@ -1593,17 +1924,27 @@ class PhaseBDialog(QDialog):
 
             dash = lambda v: "—" if (isinstance(v, float) and np.isnan(v)) else f"{v:.2f}"
 
+            # ── 补偿后σ: 从 compensation metrics 读取 ──
+            comp_metrics = comp.get("metrics") if isinstance(comp, dict) else None
+            comp_sigma_ue = float("nan")
+            comp_sigma_pct = float("nan")
+            if comp_metrics is not None and hasattr(comp_metrics, 'residual_sigma'):
+                comp_sigma_ue = float(comp_metrics.residual_sigma)
+                comp_sigma_pct = float(comp_metrics.residual_sigma_pct_fs)
+
             cells = [
                 s_name,
                 "双栅",
                 dash(ke1), dash(ke2),
                 dash(kt1), dash(kt2),
-                dash(e_mean), dash(e_std), dash(e_range),
+                dash(e_mean), dash(e_std),
+                dash(comp_sigma_ue), dash(comp_sigma_pct),
+                dash(e_range),
                 rating,
             ]
             for j, val in enumerate(cells):
                 item = QTableWidgetItem(str(val))
-                if j == 9:
+                if j == 11:  # 评级列
                     item.setBackground(QColor(bg))
                 self.result_table.setItem(row, j, item)
             row += 1
@@ -1624,7 +1965,11 @@ class PhaseBDialog(QDialog):
             label.setText(f"ⓘ 单栅传感器 ({display_names}) 不进 Phase B 解耦，温度系数 S_eff 保留在 Phase A 结果中")
 
     def _write_state_to_main_page(self):
-        """写回主 Tab 状态 (被 accept + reject 共用)"""
+        """写回主 Tab 状态 (被 accept + reject 共用)
+
+        Phase 3b: 评级用 grade_sensor (%FS), 补偿模型/指标/评级持久化。
+        comp_form / poly_order 随 compensation 一起存。
+        """
         tp = self._get_temp_page()
         if tp:
             ke_table = {}
@@ -1638,24 +1983,71 @@ class PhaseBDialog(QDialog):
                 ke_table[pfx] = {"Ke1": k1, "Ke2": k2}
 
             decoupling = {}
+            compensation = {}
+            comp_results = getattr(self, '_compensation_results', None) or {}
+
             if self._last_result:
                 for s_name, r in self._last_result.get("sensors", {}).items():
+                    comp = comp_results.get(s_name, {})
+                    comp_g = comp.get("grade") if isinstance(comp, dict) else None
+                    comp_m = comp.get("metrics") if isinstance(comp, dict) else None
+                    comp_model = comp.get("model")  # CompensationModel | None
+
                     if r.get("single_grating", False):
-                        continue  # 单栅不参与解耦，不写入 decoupling_results
+                        # 单栅: N/A 评级
+                        if comp_g is not None:
+                            compensation[s_name] = {
+                                "compensation_model": None,
+                                "metrics": None,
+                                "grade": comp_g.to_dict(),
+                            }
+                        continue
+
                     eps = np.asarray(r.get("eps_corr", np.empty(0)), dtype=np.float64)
                     e_mean = float(np.nanmean(eps)) if len(eps) > 0 else float("nan")
                     e_std  = float(np.nanstd(eps)) if len(eps) > 0 else float("nan")
                     e_range = float(np.nanmax(eps) - np.nanmin(eps)) if len(eps) > 0 else float("nan")
-                    rating = "优" if (not np.isnan(e_std) and e_std <= 30) else (
-                        "良" if (not np.isnan(e_std) and e_std <= 60) else "差")
+
+                    # 评级: grade_sensor
+                    if comp_g is not None:
+                        rating = comp_g.grade
+                    else:
+                        rating = "优" if (not np.isnan(e_std) and e_std <= 30) else (
+                            "良" if (not np.isnan(e_std) and e_std <= 60) else "差")
+
                     decoupling[s_name] = {
-                        "e_mean": e_mean, "e_std": e_std, "e_range": e_range, "rating": rating,
+                        "e_mean": e_mean, "e_std": e_std, "e_range": e_range,
+                        "rating": rating,
                     }
+
+                    # 持久化补偿紧凑产物 (CompensationModel + metrics + grade)
+                    compensation[s_name] = {
+                        "compensation_model": comp_model.to_dict()
+                            if comp_model is not None else None,
+                        "metrics": comp_m.to_dict() if comp_m is not None else None,
+                        "grade": comp_g.to_dict() if comp_g is not None else None,
+                    }
+
+            # ── 持久化评级阈值 (SSOT) ──
+            gt = GradeThresholds()
+            if tp and tp._phase_b_state and "grade_thresholds" in tp._phase_b_state:
+                gt = GradeThresholds.from_dict(tp._phase_b_state["grade_thresholds"])
+
+            # ── 继承旧状态的配置项 (不被本次覆盖) ──
+            old_state = tp._phase_b_state or {}
+            comp_form = old_state.get("comp_form", "lut")
+            poly_order = old_state.get("poly_order", 4)
+            subsample_step = old_state.get("subsample_step", 10)
 
             tp._phase_b_result = self._last_result
             tp._phase_b_state = {
                 "ke_table": ke_table,
                 "decoupling_results": decoupling,
+                "compensation": compensation,
+                "grade_thresholds": gt.to_dict(),
+                "comp_form": comp_form,
+                "poly_order": poly_order,
+                "subsample_step": subsample_step,
             }
 
     def accept(self):
@@ -1666,77 +2058,406 @@ class PhaseBDialog(QDialog):
         self._write_state_to_main_page()
         super().reject()
 
-    def _open_charts(self):
-        print("[B1] charts btn clicked")
-        # ── lazy 重算: _last_result 为 None 时现场解耦 ──
-        if not self._last_result and self._df is not None and self._coeffs and self._phase_a_result:
-            print("[B2] _last_result is None, triggering lazy decouple...")
-            import time as _time
-            from py.calibration.temperature_calibration import compute_dL, decouple
-            S_eff_result = self._phase_a_result.get("S_eff", {})
+    def _show_fail_banner(self):
+        """FAIL/拦截横幅: 在结果表下方显示废品传感器列表。"""
+        comp = getattr(self, '_compensation_results', None) or {}
+        fails = [
+            (s_name, c["grade"])
+            for s_name, c in comp.items()
+            if isinstance(c, dict) and c.get("grade") is not None
+            and not c["grade"].passed
+        ]
+        # 移除旧横幅
+        old = getattr(self, '_fail_banner_label', None)
+        if old is not None:
+            try:
+                old.setParent(None)  # type: ignore[union-attr]
+            except Exception:
+                pass
+            self._fail_banner_label = None
 
-            # 构建波长列 + 时间轴
-            wavelength_cols = []
-            for pfx, gratings in self._groups.items():
-                for g in gratings:
-                    cname = g.get("col_name", g.get("name", ""))
-                    if cname and cname in self._df.columns:
-                        wavelength_cols.append(cname)
-            n = len(self._df)
-            time_h = np.arange(n) * 2.0 / 3600.0
-
-            # 解耦 (同步，复用 PhaseBWorker 核心逻辑)
-            df_dL, _ = compute_dL(self._df.copy(), wavelength_cols)
-            sensors = {}
-            for pfx, gratings in self._groups.items():
-                if len(gratings) < 2:
-                    continue
-                wcol1 = gratings[0].get("col_name", gratings[0]["name"])
-                wcol2 = gratings[1].get("col_name", gratings[1]["name"])
-                S1 = S_eff_result.get(wcol1, {}).get("slope", float("nan"))
-                S2 = S_eff_result.get(wcol2, {}).get("slope", float("nan"))
-                T_base = (S_eff_result.get(wcol1, {}).get("T_base", 0) +
-                          S_eff_result.get(wcol2, {}).get("T_base", 0)) / 2.0
-                coefs = self._coeffs.get(pfx, {})
-                Ke1 = coefs.get("Ke1", 1.2); Ke2 = coefs.get("Ke2", 1.2)
-                try:
-                    dl1 = df_dL[f"{wcol1}_d"].values
-                    dl2 = df_dL[f"{wcol2}_d"].values
-                except KeyError:
-                    continue
-                eps_corr, dT_corr = decouple(dl1, dl2, Ke1, S1, Ke2, S2)
-                T_abs = dT_corr + T_base
-                sensors[pfx] = {
-                    "single_grating": False,
-                    "eps_corr": eps_corr, "dT_corr": dT_corr, "T_abs": T_abs,
-                    "S1": S1, "S2": S2, "T_base": T_base,
-                }
-            self._last_result = {"sensors": sensors, "time_h": time_h,
-                                  "df": self._df}
-            print(f"[B2] lazy decouple done: {len(sensors)} sensors")
-
-        if not self._last_result:
-            QMessageBox.warning(self, "无数据", "缺少必要数据，无法绘图。请先运行解耦分析。")
+        if not fails:
             return
 
-        print(f"[B3] about to construct PhaseBChartsDialog")
-        if "time_h" not in self._last_result:
-            n = self._df.shape[0] if self._df is not None and not self._df.empty else 100
-            self._last_result["time_h"] = np.arange(n) * 2.0 / 3600.0
-        from ui.widgets.charts_dialog import PhaseBChartsDialog
-        dlg = PhaseBChartsDialog(
-            self._last_result, df=self._df,
-            annotation_groups=self._groups, parent=self,
+        lines = ["FAIL — 废品拦截 (补偿模型无效):"]
+        for s_name, g in fails:
+            gs: SensorGrade = g  # type: ignore[annotation-type-arg,misc]
+            reason_str = "; ".join(gs.reasons[:2])
+            lines.append(f"  • {s_name}: {gs.grade} — {reason_str}")
+
+        label = QLabel("\n".join(lines))
+        label.setStyleSheet(
+            "color: #b71c1c; padding: 10px 14px; background: #ffebee;"
+            " border: 2px solid #ef5350; border-radius: 4px;"
+            " font-size: 13px; font-weight: bold;"
         )
+        label.setWordWrap(True)
+        self._fail_banner_label = label
+        # 插入到布局底部 (在 charts_btn 之前)
+        idx = self.layout().indexOf(self.charts_btn)
+        if idx >= 0:
+            self.layout().insertWidget(idx, label)
+
+    def _open_charts(self):
+        print("[B1] charts btn clicked")
+        if self._last_result is not None:
+            self._do_open_charts()
+            return
+        # 结果缺失 → 启动 worker 异步重算，完成后继续
+        self._pending_callback = self._do_open_charts
+        self._on_run()
+
+    def _do_open_charts(self):
+        print("[B2] decoupled result ready")
+        last = self._last_result
+        if last is None:
+            QMessageBox.warning(self, "无数据", "缺少必要数据。")
+            return
+        print("[B3] about to construct PhaseBChartsDialog")
+        if "time_h" not in last:
+            n = self._df.shape[0] if self._df is not None and not self._df.empty else 100
+            last["time_h"] = np.arange(n) * 2.0 / 3600.0
+        from ui.widgets.charts_dialog import PhaseBChartsDialog
+        # ★ Phase 2: 传入补偿数据 + 选定形式，供图表绘制补偿后应变
+        compensation = getattr(self, '_compensation_results', None)
+        tp = self._get_temp_page()
+        comp_form = "lut"; poly_order = 4
+        if tp and tp._phase_b_state:
+            comp_form = tp._phase_b_state.get("comp_form", "lut")
+            poly_order = int(tp._phase_b_state.get("poly_order", 4))
+        dlg = PhaseBChartsDialog(last, df=self._df,
+                                  annotation_groups=self._groups, parent=self,
+                                  compensation=compensation,
+                                  comp_form=comp_form, poly_order=poly_order)
         print("[B4] PhaseBChartsDialog constructed")
         dlg.exec()
 
+    def _open_form_selection(self):
+        """Phase 3c: 补偿形式选型 — 读预计算的 forms_compare (零重算)。
+
+        展示每种候选形式的残差，供按客户系统能力选型。
+        选定后写回 _phase_b_state["comp_form"] / _phase_b_state["poly_order"]。
+        """
+        if self._last_result is not None:
+            self._do_open_form_selection()
+            return
+        self._pending_callback = self._do_open_form_selection
+        self._on_run()
+
+    def _do_open_form_selection(self):
+        """补偿形式选型 — 传感器选择器 + 按需惰性算 compare_forms。
+
+        展示每种候选形式的残差，支持切换传感器。
+        compare_forms 仅对当前传感器计算 (不在主 worker 预计算)。
+        """
+        sensors = self._ensure_decoupled_result()
+        if sensors is None:
+            return
+
+        dual = {k: v for k, v in sensors.items() if not v.get("single_grating", False)}
+        if not dual:
+            QMessageBox.information(self, "无数据", "无双栅传感器，无需选型。")
+            return
+
+        # ── 获取 FAIL 列表 ──
+        comp_results = getattr(self, '_compensation_results', None) or {}
+        fail_sensors = set()
+        for s_name in dual:
+            se = comp_results.get(s_name, {})
+            sg = se.get("grade") if isinstance(se, dict) else None
+            if sg is not None and not sg.passed and sg.grade == "FAIL":
+                fail_sensors.add(s_name)
+
+        # 默认选中第一支非 FAIL 传感器
+        dual_names = sorted(dual.keys())
+        default_s = dual_names[0]
+        for n in dual_names:
+            if n not in fail_sensors:
+                default_s = n
+                break
+
+        # ── 构建 UI ──
+        dlg = QDialog(self)
+        dlg.setWindowTitle("补偿形式选型")
+        dlg.resize(560, 480)
+        layout = QVBoxLayout(dlg)
+
+        # ── 传感器选择器 ──
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(QLabel("传感器:"))
+        sensor_combo = QComboBox()
+        for n in dual_names:
+            label = f"{n}"
+            if n in fail_sensors:
+                label += " [FAIL]"
+            sensor_combo.addItem(label, n)
+        idx = sensor_combo.findData(default_s)
+        if idx >= 0:
+            sensor_combo.setCurrentIndex(idx)
+        sel_row.addWidget(sensor_combo)
+        sel_row.addStretch()
+        layout.addLayout(sel_row)
+
+        # ── 内容区 (动态刷新) ──
+        content_stack = QStackedWidget()
+        layout.addWidget(content_stack, stretch=1)
+
+        # 占位页：计算中
+        loading_page = QLabel("正在计算补偿形式比较...")
+        loading_page.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        content_stack.addWidget(loading_page)  # index 0
+
+        # 结果页：表格 + 推荐 + 选择控件
+        result_page = QWidget()
+        result_layout = QVBoxLayout(result_page)
+        result_layout.setContentsMargins(0, 0, 0, 0)
+
+        header_label = QLabel("")
+        header_label.setWordWrap(True)
+        result_layout.addWidget(header_label)
+
+        tbl = QTableWidget(0, 3)
+        tbl.setHorizontalHeaderLabels(["形式", "残余σ (με)", "残余σ (%FS)"])
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        result_layout.addWidget(tbl)
+
+        fail_label = QLabel(
+            "<b style='color:#b71c1c;'>该传感器已 FAIL（迟滞超标），"
+            "补偿形式选择无意义。</b>")
+        fail_label.setWordWrap(True)
+        fail_label.setVisible(False)
+        result_layout.addWidget(fail_label)
+
+        cur_label = QLabel("")
+        cur_label.setWordWrap(True)
+        result_layout.addWidget(cur_label)
+
+        # 选择控件 (FAIL 时禁用)
+        sel_form_row = QHBoxLayout()
+        sel_form_row.addWidget(QLabel("选择形式:"))
+        form_combo = QComboBox()
+        form_combo.addItems(["lut — 查表 (LUT)", "poly — 多项式"])
+        sel_form_row.addWidget(form_combo)
+        sel_form_row.addWidget(QLabel("阶数:"))
+        order_spin = QSpinBox()
+        order_spin.setRange(1, 6)
+        order_spin.setValue(4)
+        sel_form_row.addWidget(order_spin)
+        sel_form_row.addStretch()
+        result_layout.addLayout(sel_form_row)
+
+        content_stack.addWidget(result_page)  # index 1
+
+        # ── 按钮 ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        apply_btn = create_button("应用并关闭", None, "primary")
+        cancel_btn = create_button("取消", dlg.reject, "secondary")
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        # ── 刷新函数: 展示指定传感器的 forms_compare ──
+        def _refresh_for_sensor(target_s: str):
+            is_fail = target_s in fail_sensors
+            cached = self._forms_compare_cache.get(target_s)
+            r_data = dual.get(target_s, {})
+
+            if is_fail:
+                header_label.setText(
+                    f"<b>传感器: {target_s}</b> — 已 FAIL，补偿形式选择无意义")
+                tbl.setRowCount(0)
+                fail_label.setVisible(True)
+                cur_label.setText("")
+                form_combo.setEnabled(False)
+                order_spin.setEnabled(False)
+                apply_btn.setEnabled(False)
+                content_stack.setCurrentIndex(1)
+                return
+
+            # 读满量程
+            fs = 1000.0
+            tp = self._get_temp_page()
+            if tp is not None:
+                ctw = getattr(tp, '_get_cal_tab_widget', lambda: None)()
+                if ctw is not None and ctw.project_config is not None:
+                    sc = ctw.project_config.strain.get(target_s)
+                    if sc is not None:
+                        rd_list = getattr(sc, 'readings', []) or []
+                        if rd_list and isinstance(rd_list[-1], dict):
+                            fsc = rd_list[-1].get("eps_theory", 0)
+                            if fsc > 0:
+                                fs = float(fsc)
+
+            header_label.setText(
+                f"<b>传感器: {target_s}</b> &nbsp; 满量程: {fs:.0f} με<br>"
+                f"比较不同补偿形式的 LOOCV 残余 sigma (越低越好):")
+
+            # 容差带判定
+            forms_order = [c for c in ("lut", "poly2", "poly4") if c in cached]
+            sigmas = [cached[f] for f in forms_order if not np.isnan(cached[f])]
+            sigma_range = max(sigmas) - min(sigmas) if sigmas else 0.0
+            is_tied = (sigma_range < 0.5) or (sigma_range / fs * 100 < 0.2) if fs > 0 else False
+
+            if is_tied:
+                best_form = "poly2"
+                recommendation = "并列（容差内），按互操作性推荐 2 阶多项式"
+            else:
+                best_form = min(forms_order, key=lambda f: cached[f])
+                recommendation = f"{best_form}（残差最小）"
+
+            # 填充表格
+            tbl.setRowCount(len(forms_order))
+            for i, cand in enumerate(forms_order):
+                sigma = cached[cand]
+                label = {"lut": "查表 (LUT)", "poly2": "多项式 2阶",
+                         "poly4": "多项式 4阶"}.get(cand, cand)
+                tbl.setItem(i, 0, QTableWidgetItem(label))
+                tbl.setItem(i, 1, QTableWidgetItem(
+                    f"{sigma:.2f}" if not np.isnan(sigma) else "—"))
+                tbl.setItem(i, 2, QTableWidgetItem(
+                    f"{sigma / fs * 100:.2f}" if not np.isnan(sigma) and fs > 0 else "—"))
+                if is_tied or cand == best_form:
+                    for j in range(3):
+                        item = tbl.item(i, j)
+                        if item:
+                            item.setBackground(QColor("#E8F5E9"))
+
+            fail_label.setVisible(False)
+            form_combo.setEnabled(True)
+            order_spin.setEnabled(True)
+            apply_btn.setEnabled(True)
+
+            # 当前选择
+            tp2 = self._get_temp_page()
+            current_form = "lut"
+            current_order = 4
+            if tp2 and tp2._phase_b_state:
+                current_form = tp2._phase_b_state.get("comp_form", "lut")
+                current_order = int(tp2._phase_b_state.get("poly_order", 4))
+            cur_label.setText(
+                f"当前: <b>{current_form}</b>"
+                + (f" (order {current_order})" if current_form == "poly" else "")
+                + "&nbsp;&nbsp;|&nbsp;&nbsp;"
+                + f"建议: <b>{best_form}</b> — {recommendation}")
+
+            content_stack.setCurrentIndex(1)
+
+        # ── 切换传感器: 缓存命中→刷新; 未命中→启动 worker ──
+        def _on_sensor_changed(idx: int):
+            target = sensor_combo.itemData(idx)
+            if not target:
+                return
+            if target in self._forms_compare_cache:
+                _refresh_for_sensor(target)
+                return
+            # 启动 worker 异步计算
+            r_data = dual.get(target, {})
+            T_arr = np.asarray(r_data.get("T_abs", np.empty(0)), dtype=np.float64)
+            eps_arr = np.asarray(r_data.get("eps_corr", np.empty(0)), dtype=np.float64)
+            fs_v = 1000.0
+            tp = self._get_temp_page()
+            if tp is not None:
+                ctw = getattr(tp, '_get_cal_tab_widget', lambda: None)()
+                if ctw is not None and ctw.project_config is not None:
+                    sc = ctw.project_config.strain.get(target)
+                    if sc is not None:
+                        rd_list = getattr(sc, 'readings', []) or []
+                        if rd_list and isinstance(rd_list[-1], dict):
+                            fsc = rd_list[-1].get("eps_theory", 0)
+                            if fsc > 0:
+                                fs_v = float(fsc)
+
+            content_stack.setCurrentIndex(0)  # 显示 "计算中"
+            loading_page.setText(f"正在计算 {target} 的补偿形式比较...")
+            loading_page.repaint()
+
+            ss = (int(tp._phase_b_state.get("subsample_step", 10))
+                  if tp and tp._phase_b_state else 10)
+            self._forms_compare_worker = ComputeFormsCompareWorker(
+                target, T_arr, eps_arr, fs_v, subsample_step=ss)
+            def _on_comp_done(s_name, comp_dict):
+                self._forms_compare_cache[s_name] = comp_dict
+                if sensor_combo.currentData() == s_name:
+                    _refresh_for_sensor(s_name)
+            self._forms_compare_worker.finished.connect(_on_comp_done)
+            def _on_comp_error(msg):
+                QMessageBox.warning(dlg, "计算失败",
+                    f"{target} 补偿形式比较失败: {msg}")
+                content_stack.setCurrentIndex(1)
+            self._forms_compare_worker.error.connect(_on_comp_error)
+            self._forms_compare_worker.start()
+
+        sensor_combo.currentIndexChanged.connect(_on_sensor_changed)
+
+        # ── 应用按钮: 写回 SSOT + 即时重评 (不重解耦) ──
+        def on_apply():
+            selected = form_combo.currentText()
+            new_form = "poly" if selected.startswith("poly") else "lut"
+            new_order = order_spin.value()
+            tp3 = self._get_temp_page()
+            if tp3:
+                pb = tp3._phase_b_state or {}
+                pb["comp_form"] = new_form
+                pb["poly_order"] = new_order
+                tp3._phase_b_state = pb
+
+            # ★ 即时重算补偿 (复用已缓存的 ε/T 时序，不重解耦)
+            last = self._last_result
+            if last is not None:
+                sensors = last.get("sensors", {})
+                if sensors:
+                    # 读满量程映射
+                    fs_map: dict[str, float] = {}
+                    ctw = getattr(tp3, '_get_cal_tab_widget', lambda: None)() if tp3 else None
+                    if ctw is not None and ctw.project_config is not None:
+                        for s_name in sensors:
+                            sc = ctw.project_config.strain.get(s_name)
+                            if sc is not None:
+                                rd_list = getattr(sc, 'readings', []) or []
+                                if rd_list and isinstance(rd_list[-1], dict):
+                                    fsc = rd_list[-1].get("eps_theory", 0)
+                                    if fsc > 0:
+                                        fs_map[s_name] = float(fsc)
+                    # 重算补偿流水线 (子线程内——但数据量小，主线程快速重评即可)
+                    ss = int(tp3._phase_b_state.get("subsample_step", 10)) if tp3 and tp3._phase_b_state else 10
+                    new_thresholds = None
+                    if tp3 and tp3._phase_b_state and "grade_thresholds" in tp3._phase_b_state:
+                        new_thresholds = GradeThresholds.from_dict(tp3._phase_b_state["grade_thresholds"])
+                    new_comp = _run_compensation_pipeline_static(
+                        sensors, fs_map,
+                        comp_form=new_form, poly_order=new_order,
+                        subsample_step=ss, thresholds=new_thresholds,
+                    )
+                    self._compensation_results = new_comp
+                    # 刷新结果表
+                    self._render_result_table(
+                        sensors, self._phase_a_result.get("S_eff", {}),
+                        compensation=new_comp)
+                    self._show_fail_banner()
+            dlg.accept()
+        apply_btn.clicked.connect(on_apply)
+
+        # ── 触发首次加载 ──
+        _on_sensor_changed(sensor_combo.currentIndex())
+
+        dlg.exec()
+
     def _on_error(self, msg):
+        self._pending_callback = None  # 清除过期回调，防止误触发
+        self.progress_label.setText("")  # 清空进度文字
         self.run_btn.setText("▶ 运行解耦分析"); self.run_btn.setEnabled(True)
         self.error_bar.setText(f"❌ {msg[:500]}"); self.error_bar.setVisible(True)
 
     def _export_excel(self):
-        if not self._last_result: return
+        if self._last_result is not None:
+            self._do_export_excel()
+            return
+        self._pending_callback = self._do_export_excel
+        self._on_run()
+
+    def _do_export_excel(self):
         path, _ = QFileDialog.getSaveFileName(self, "导出", "温度标定结果.xlsx", "Excel (*.xlsx)")
         if not path: return
         from py.calibration.export_utils import export_temperature_excel
@@ -1744,11 +2465,24 @@ class PhaseBDialog(QDialog):
         rb = self._last_result
         sample_s = 2.0
         time_h = np.arange(len(self._df)) * sample_s / 3600.0
-        export_temperature_excel(ra["df"], time_h, rb["sensors"], ra["plateaus"], ra["S_eff"], path)
+        # ★ Phase 3: 传入补偿数据 (LUT/指标/评级) → 导出工厂指标 sheet
+        tp = self._get_temp_page()
+        comp_data = (tp._phase_b_state.get("compensation", {})
+                     if tp and tp._phase_b_state else {})
+        export_temperature_excel(
+            ra["df"], time_h, rb["sensors"], ra["plateaus"], ra["S_eff"], path,
+            compensation=comp_data,
+        )
         QMessageBox.information(self, "完成", f"已保存: {path}")
 
     def _export_word(self):
-        if not self._last_result: return
+        if self._last_result is not None:
+            self._do_export_word()
+            return
+        self._pending_callback = self._do_export_word
+        self._on_run()
+
+    def _do_export_word(self):
         from py.report_builder.word_builder import WordBuilder
         from py.report_builder.models import WordReport, WordSection
         ra = self._phase_a_result

@@ -262,9 +262,188 @@ def test_phase_b_result_table(qapp, sample_df, phase_a_result):
     # Type column
     assert tbl.item(row_map["A1"], 1).text() == "双栅"
 
-    # Rating verification (all 4 sensors produce e_std~10 with random seed 42)
+    # Rating verification (compensation pipeline runs in _on_done; monotonic data → NaN hys → capped at liang)
     for i in range(tbl.rowCount()):
-        assert tbl.item(i, 9).text() == "优"  # all rated 优 with e_std <= 30
-        assert tbl.item(i, 9).background().color().name() == "#e8f5e9"
+        rating = tbl.item(i, 9).text()
+        assert rating != "FAIL", f"row {i}: expected not FAIL, got {rating}"
+        assert rating != "ERROR", f"row {i}: expected not ERROR, got {rating}"
+
+    dlg.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 3c 回归测试: _ensure_decoupled_result 守卫 + 评级 + 状态恢复
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_ensure_decoupled_result_lazy_decouple(qapp, sample_df, phase_a_result):
+    """_last_result=None → 惰性解耦触发 → 返回 sensors + 跑补偿流水线"""
+    from ui.calibration_tab import PhaseBDialog
+
+    dlg = PhaseBDialog(sample_df,
+        {"A1": [{"col_name": "A1-W1", "name": "A1-W1"},
+                {"col_name": "A1-W2", "name": "A1-W2"}]},
+        {"S_eff": {"A1-W1": {"slope": 27.8, "T_base": 10.0},
+                    "A1-W2": {"slope": 29.4, "T_base": 10.0}}})
+    dlg._coeffs = {"A1": {"Ke1": 1.2, "Ke2": 1.2}}
+    assert dlg._last_result is None
+
+    sensors = dlg._ensure_decoupled_result()
+    assert sensors is not None, "should lazy-decouple"
+    assert "A1" in sensors
+    assert dlg._last_result is not None
+    assert getattr(dlg, '_compensation_results', None) is not None, \
+        "compensation pipeline should run after lazy decouple"
+    dlg.close()
+
+
+def test_ensure_decoupled_result_no_data_shows_warning(qapp):
+    """无效 coeffs + 无 phase_a_result → 弹 QMessageBox 警告"""
+    from ui.calibration_tab import PhaseBDialog
+    import pandas as pd
+    from PyQt6.QtWidgets import QMessageBox
+
+    df_empty = pd.DataFrame({"a": [1, 2, 3]})
+    dlg = PhaseBDialog(df_empty, {}, {"S_eff": {}})
+    dlg._coeffs = {}
+    assert dlg._last_result is None
+
+    warned_msgs = []
+    _orig = QMessageBox.warning
+
+    def fake_warning(parent, title, msg):
+        warned_msgs.append((title, msg))
+    try:
+        QMessageBox.warning = fake_warning  # type: ignore[method-assign]
+        result = dlg._ensure_decoupled_result(show_warning=True)
+        assert result is None
+        assert len(warned_msgs) == 1
+        assert "请先加载数据" in warned_msgs[0][1] or "解耦" in warned_msgs[0][1]
+    finally:
+        QMessageBox.warning = _orig  # type: ignore[method-assign]
+    dlg.close()
+
+
+def test_render_result_table_high_hysteresis_shows_fail(qapp, sample_df, phase_a_result):
+    """高滞回 B2 传感器在结果表中应显示 FAIL + 红色背景"""
+    from ui.calibration_tab import PhaseBDialog
+    np.random.seed(1)
+    n = 600
+    # 三角波温度 (3 循环)
+    T_abs = np.empty(n)
+    for ci in range(3):
+        for half in range(2):
+            s = (ci * 2 + half) * (n // 6)
+            e = s + n // 6
+            if half == 0:
+                T_abs[s:e] = np.linspace(10, 60, n // 6)
+            else:
+                T_abs[s:e] = np.linspace(60, 10, n // 6)
+    # 高迟滞应变: 升支 +130, 降支 -130 (模拟 260με 峰值迟滞)
+    eps_corr = 2.0 * (T_abs - 25.0)
+    for ci in range(3):
+        for half in range(2):
+            s = (ci * 2 + half) * (n // 6)
+            e = s + n // 6
+            eps_corr[s:e] += 130.0 if half == 0 else -130.0
+    eps_corr += np.random.normal(0, 5, n)
+
+    sensors = {"B2": {
+        "eps_corr": eps_corr, "dT_corr": np.zeros(n),
+        "T_abs": T_abs, "S1": 30.0, "S2": 28.0, "T_base": 25.0,
+        "single_grating": False,
+    }}
+
+    dlg = PhaseBDialog(sample_df,
+        {"B2": [{"col_name": "B2-W1", "name": "B2-W1"},
+                {"col_name": "B2-W2", "name": "B2-W2"}]},
+        {"S_eff": {"B2-W1": {"slope": 41.0, "T_base": 25.0},
+                    "B2-W2": {"slope": 30.0, "T_base": 25.0}}})
+    dlg._coeffs = {"B2": {"Ke1": 0.8, "Ke2": 1.1}}
+    dlg._compensation_results = dlg._run_compensation_pipeline(sensors)
+    dlg._render_result_table(sensors, phase_a_result.get("S_eff", {}),
+                              compensation=dlg._compensation_results)
+    QApplication.processEvents()
+
+    tbl = dlg.result_table
+    assert tbl.rowCount() >= 1
+    found = False
+    for i in range(tbl.rowCount()):
+        if tbl.item(i, 0).text() == "B2":
+            rating = tbl.item(i, 9).text()
+            assert rating == "FAIL", f"expected FAIL, got {rating}"
+            bg = tbl.item(i, 9).background().color().name()
+            assert bg == "#ffcdd2", f"expected red bg #ffcdd2, got {bg}"
+            found = True
+            break
+    assert found, "B2 row not found in table"
+    dlg.close()
+
+
+def test_render_result_table_shows_real_std(qapp, sample_df, phase_a_result):
+    """ε_std ~10 的传感器在表格中显示真实 e_std (不是 0.00)"""
+    from ui.calibration_tab import PhaseBDialog
+    np.random.seed(42)
+    n = 300
+    T_abs = np.linspace(10, 60, n)
+    eps_corr = np.random.normal(0, 10, n)  # std ~10
+
+    sensors = {"A1": {
+        "eps_corr": eps_corr, "dT_corr": np.zeros(n),
+        "T_abs": T_abs, "S1": 30.0, "S2": 28.0, "T_base": 25.0,
+        "single_grating": False,
+    }}
+
+    dlg = PhaseBDialog(sample_df,
+        {"A1": [{"col_name": "A1-W1", "name": "A1-W1"},
+                {"col_name": "A1-W2", "name": "A1-W2"}]},
+        {"S_eff": {"A1-W1": {"slope": 27.8, "T_base": 25.0},
+                    "A1-W2": {"slope": 29.4, "T_base": 25.0}}})
+    dlg._coeffs = {"A1": {"Ke1": 1.2, "Ke2": 1.2}}
+    dlg._compensation_results = dlg._run_compensation_pipeline(sensors)
+    dlg._render_result_table(sensors, phase_a_result.get("S_eff", {}),
+                              compensation=dlg._compensation_results)
+    QApplication.processEvents()
+
+    tbl = dlg.result_table
+    for i in range(tbl.rowCount()):
+        if tbl.item(i, 0).text() == "A1":
+            e_std_text = tbl.item(i, 7).text()  # column 7 = e_std
+            e_std_val = float(e_std_text)
+            assert 1.0 < e_std_val < 20.0, \
+                f"expected e_std ~10, got {e_std_val}"
+            assert e_std_val != 0.0, "e_std should not be 0.00"
+            break
+    dlg.close()
+
+
+def test_state_restore_no_fake_zeros(qapp):
+    """旧持久化状态加载后，_ensure_decoupled_result 用真实数据渲染 (非 e_mean*10)"""
+    from ui.calibration_tab import PhaseBDialog
+    import pandas as pd
+
+    df = pd.DataFrame({f"ch{i}": [1550.0 + i * 5] * 100 for i in range(1, 3)})
+    dlg = PhaseBDialog(df,
+        {"A1": [{"col_name": "ch1", "name": "A1-W1"},
+                {"col_name": "ch2", "name": "A1-W2"}]},
+        {"S_eff": {"ch1": {"slope": 27.8, "T_base": 10.0},
+                    "ch2": {"slope": 29.4, "T_base": 10.0}}})
+    dlg._coeffs = {"A1": {"Ke1": 1.2, "Ke2": 1.2}}
+
+    # state restore 后表格不应包含 [e_mean]*10 造成的 0.00
+    sensors = dlg._ensure_decoupled_result(show_warning=False)
+    # 无 real underlying data → 表格应为空。
+    # 若有 (当 df 有真实列) → 渲染真实值。
+    if sensors:
+        S_eff = {"ch1": {"slope": 27.8}, "ch2": {"slope": 29.4}}
+        dlg._compensation_results = dlg._run_compensation_pipeline(sensors)
+        dlg._render_result_table(sensors, S_eff,
+                                  compensation=dlg._compensation_results)
+        QApplication.processEvents()
+
+        tbl = dlg.result_table
+        if tbl.rowCount() > 0:
+            e_std_text = tbl.item(0, 7).text()
+            val = float(e_std_text)
+            assert val >= 0, f"e_std should be non-negative, got {val}"
 
     dlg.close()

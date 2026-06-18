@@ -126,6 +126,29 @@
   - `AIClient.generate_structured()` 当前走 Pydantic 校验 + 1 次回喂修复，在线模型（DeepSeek/GPT）可切原生 `response_format=json_schema` 强约束省掉重试往返。不必现在做。
   - `py/agent_worker.py` — `DeepSeekAgentWorker` 当前无 Python 调用者（仅文档引用）；有 `except Exception → error_signal` 守卫。若未来启用需确认 caller 同时绑定 `error_signal`。
 
+## 🔧 表观应变补偿 + 出厂指标 + 评级 (Phase 1-3b 新增)
+
+**10. 补偿流水线 (Phase 1-3b，硬纪律):**
+- Phase B 解耦完成后**立即**运行补偿流水线: `build model (lut|poly) → evaluate_compensation (按形式重算残差) → grade_sensor (%FS 阈值)`。产物 (`compensation_model` + `metrics` + `grade`) 持久化到 `_phase_b_state["compensation"]` / `ProjectConfig.temperature.compensation`。原始 ε/T 时序**不持久化**（从 transient `_last_result["sensors"]` 消费后丢弃）。
+- **补偿形式可配**: `comp_form`="lut"|"poly", `poly_order`=2|3|4。配置走 `_phase_b_state["comp_form"]` / `_phase_b_state["poly_order"]` (SSOT)，可单传感器覆盖。用户通过 `compare_compensation_forms()` 选型，残差按所发形式诚实重算。
+- **越界钳位 + oob fail-loud**: `apply_compensation_model` 两种形式一致：越界钳位到端点值 + `oob_mask` 置位。**多项式严禁外推** (4 阶在标定区外发散极快)。调用方**必须**检查 `np.any(oob_mask)` 并弹 UI 告警。
+- **废品拦截线**: `hysteresis_max_pct_fs > 5%FS` → `grade_sensor()` 返回 `grade="FAIL"`, `passed=False`。FAIL 传感器 UI 显式横幅呈现 (红色) + 补偿模型不生效。两处评级 (`_render_result_table` + `_write_state_to_main_page`) **同时**使用 `grade_sensor()`。
+- **评级去橡皮图章**: 旧 `e_std<=30→优` 已替换为 `grade_sensor()` 的 %FS 阈值 (优≤1%FS, 良≤2%FS, 合格≤4%FS)。
+- **单栅显式 N/A**: `single_grating=True` → `grade_sensor_na()` → `grade="N/A"`, `passed=False`。不建双栅补偿模型。
+- **NaN 滞回降权**: `hysteresis_max=NaN` (未测升降支) → `evaluate_compensation` 强制 `low_confidence=True` → 评级上限 "良"，禁止判优。
+- **残差按形式重算**: `evaluate_compensation(T, eps, cids, fs=1000, form="poly", poly_order=4)` → LOOCV 按指定 form/order 重建模型在留出循环上算 sigma。导出/报告的 σ 列对应所发形式。
+- **意外异常 ≠ 单栅 N/A (硬纪律)**: 补偿流水线异常 (`except Exception`) → `grade="ERROR"`, `passed=False`, reason 含完整 traceback。**严禁** grade="N/A"（与单栅路径混淆）。
+- **★ 阶段B 任何重计算只在 PhaseBWorker 子线程 (绝对铁律)**: 主线程/`__init__`/任何按钮 handler/`_ensure_decoupled_result` 内**禁止**同步执行解耦/补偿/LOOCV/compare。重活唯一产地: `PhaseBWorker.run()`。`_ensure_decoupled_result` 仅返回缓存结果(快速路径)或弹提示/返回 None(缺数据)，**绝不**执行任何 numpy 重算。
+- **性能关键**: `_compute_noise_floor` 用 pandas `rolling().median()` 向量化 (非 Python 循环逐点 `np.median`)。`evaluate_compensation` / `compare_compensation_forms` 支持 `subsample_step` 参数 (均匀抽样)，LOOCV/建模用抽样数据，统计量 (e_std/噪声底/滞回) 始终用全量数据。实测 9.8万行: noise_floor 887ms→35ms (25×), compare_forms 2798ms→194ms (14×), LOOCV 残差偏差 <2%。
+- **按钮异步模式 (硬纪律)**: 四个结果按钮按以下模式: 若 `_last_result` 有 → 调 `_do_*` 继续；若 `_last_result=None` → 设 `_pending_callback` → 调 `_on_run()` 启动 worker。`_on_done` 末尾检查 callback 并继续。`_on_error` **必须**清除 `_pending_callback` 和 `progress_label`。
+- **compare_forms 按需单传感器惰性算 (硬纪律)**: `compare_compensation_forms`(3×LOOCV) **不在**主 `PhaseBWorker.run()` 内预算全量。由 `ComputeFormsCompareWorker`(独立 QThread) 按需对选中传感器计算，结果缓存到 `_forms_compare_cache`。再次打开/切换可直接复用。选型对话框含传感器 QComboBox，FAIL 传感器禁用选择。
+- **结果表渲染仅从持久化标量读取 (硬纪律)**: PhaseBDialog `__init__` 状态恢复**必须**从 `_phase_b_state` 的持久化标量 (`e_std`/`e_range`/`grade`) 直接渲染，**禁止**在 `__init__` 内调用 `_ensure_decoupled_result` 或任何重算。`saved_ratings` 优先用 `compensation[s_name]["grade"]["grade"]` 而非旧 `decoupling_results[s_name]["rating"]`。
+- **补偿流水线已静态化为 `_run_compensation_pipeline_static(sensors, fs_map, comp_form, poly_order)`** (模块级函数，可被子线程调用)。旧实例方法 `_run_compensation_pipeline` 已删除。
+- `except: pass` 静默吞异常 → **禁止**。异常恢复必须 `traceback.print_exc()` 或等价日志。
+- **选型容差带**: 三残差差 < 0.5με 或 < 0.2%FS 时判为"并列"，推荐 2 阶多项式（最简/最互操作），标注"并列，按互操作性选"，不声称"残差最小"。
+- **FAIL 传感器选型拦截**: FAIL 传感器 (passed=False) 选型时显示"补偿形式选择无意义"提示，不允许选择。
+- 模块位置: `utils/apparent_strain_comp.py` (LUT + poly + CompensationModel + apply_compensation_model), `utils/compensation_metrics.py` (指标/评级/循环检测/compare_compensation_forms)。测试: `tests/test_apparent_strain_comp.py` (36), `tests/test_compensation_metrics.py` (84), `tests/test_phase_b_compensation_integration.py` (45), `tests/test_phase_b_guard_regression.py` (15)。
+
 ## 🚀 常用开发命令
 
 ```bash

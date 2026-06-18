@@ -190,21 +190,33 @@ class PhaseAChartsDialog(BaseChartsDialog):
 # ═══════════════════════════════════════════════════════════════════════
 
 class PhaseBChartsDialog(BaseChartsDialog):
-    """诊断四联图 + 传感器下拉选择器 + 散点/直方图切换
+    """诊断四联图 + 传感器下拉选择器 + 散点/直方图切换 + 原始/补偿后切换
 
     面板: (a)Δλ时程 (b)解耦温度 (c)解耦应变 (d)直方图或ε-ΔT散点
+
+    Phase 2: 支持「原始/补偿后」切换 (默认补偿后)。
+    补偿后应变 ε_corr_comp = ε_dec − apply_compensation_model(ε_dec, T, cm)。
+    面板 (c) 标题 std、(d) σ 使用补偿后值。
     """
 
-    def __init__(self, phase_b_result: dict, df=None, annotation_groups=None, parent=None):
+    def __init__(self, phase_b_result: dict, df=None, annotation_groups=None, parent=None,
+                 compensation: dict | None = None, comp_form: str = "lut",
+                 poly_order: int = 4):
         super().__init__("阶段 B — 诊断四联图", (12, 8), parent)
         self._result = phase_b_result
         self._df = df
         self._groups = annotation_groups or {}
         self._sensors = phase_b_result.get("sensors", {})
+        self._compensation = compensation or {}
+        self._comp_form = comp_form
+        self._poly_order = poly_order
 
         # 散点/直方图切换 — 持久化到 QSettings
         settings = QSettings("DataProcessor", "Calibration")
         self._use_histogram = settings.value("phaseB/panelD_mode", "histogram") == "histogram"
+
+        # ★ 原始/补偿后切换 — 默认补偿后
+        self._use_compensated = settings.value("phaseB/use_compensated", True) in (True, "true", "1")
 
         # 传感器选择器
         selector_layout = QHBoxLayout()
@@ -215,6 +227,20 @@ class PhaseBChartsDialog(BaseChartsDialog):
         self._selector.setEnabled(len(dual) > 0)
         self._selector.currentIndexChanged.connect(self._render)
         selector_layout.addWidget(self._selector)
+
+        # ★ 原始/补偿后切换
+        comp_gb = QGroupBox("应变显示")
+        comp_gb_layout = QHBoxLayout(comp_gb)
+        self._raw_radio = QRadioButton("原始 (解耦)")
+        self._comp_radio = QRadioButton("补偿后")
+        if self._use_compensated:
+            self._comp_radio.setChecked(True)
+        else:
+            self._raw_radio.setChecked(True)
+        self._raw_radio.toggled.connect(self._on_strain_mode_changed)
+        comp_gb_layout.addWidget(self._raw_radio)
+        comp_gb_layout.addWidget(self._comp_radio)
+        selector_layout.addWidget(comp_gb)
 
         # 面板(d)模式切换
         gb = QGroupBox("面板(d) 模式")
@@ -229,6 +255,10 @@ class PhaseBChartsDialog(BaseChartsDialog):
         gb_layout.addWidget(self._hist_radio)
         gb_layout.addWidget(self._scat_radio)
         selector_layout.addWidget(gb)
+        # ★ 图表说明按钮
+        from ui.components import create_button
+        selector_layout.addWidget(create_button("📖 图表说明", self._show_help, "secondary",
+                                                tooltip="查看四联图各面板含义与补偿前后区别"))
         selector_layout.addStretch()
         self.layout().insertLayout(1, selector_layout)
 
@@ -248,6 +278,113 @@ class PhaseBChartsDialog(BaseChartsDialog):
         if dual:
             self._render()
 
+    # ── helpers ──
+
+    def _get_loocv_sigma(self, s_name: str) -> float:
+        """返回补偿后的 LOOCV 残余 σ (官方口径)。无补偿数据时返回 NaN。"""
+        comp_entry = self._compensation.get(s_name, {})
+        metrics = comp_entry.get("metrics") if isinstance(comp_entry, dict) else None
+        if metrics is not None:
+            return float(metrics.residual_sigma)
+        return float("nan")
+
+    def _get_compensated_strain(self, s_name: str):
+        """返回补偿后应变数组，若补偿模型不可用则返回原始解耦应变。"""
+        r = self._sensors.get(s_name, {})
+        eps_raw = np.asarray(r.get("eps_corr", []), dtype=np.float64)
+        T_abs = np.asarray(r.get("T_abs", []), dtype=np.float64)
+        if len(eps_raw) == 0:
+            return eps_raw
+
+        comp_entry = self._compensation.get(s_name, {})
+        cm = comp_entry.get("model") if isinstance(comp_entry, dict) else None
+        if cm is None:
+            # 尝试用 comp_form/poly_order 从 compensation entry 的 dict 重建
+            cm_d = None
+            if isinstance(comp_entry, dict):
+                cm_d = comp_entry.get("compensation_model") or comp_entry.get("lut")
+            if cm_d and isinstance(cm_d, dict):
+                try:
+                    if "form" not in cm_d:
+                        cm_d = {"form": self._comp_form, "model": cm_d}
+                    from utils.apparent_strain_comp import CompensationModel as CM
+                    cm = CM.from_dict(cm_d)
+                except Exception:
+                    pass
+        if cm is None:
+            return eps_raw
+
+        try:
+            from utils.apparent_strain_comp import apply_compensation_model
+            eps_corr_comp, _oob = apply_compensation_model(eps_raw, T_abs, cm)
+            return eps_corr_comp
+        except Exception:
+            return eps_raw
+
+    def _show_help(self):
+        """弹出滚动说明对话框，解释四联图各面板含义。"""
+        help_text = """<h3>阶段 B 诊断四联图 — 图表说明</h3>
+
+<h4>(a) Δλ 时程曲线</h4>
+<p>两个光栅的原始波长漂移 Δλ<sub>1</sub>、Δλ<sub>2</sub> 随时间变化，
+是解耦前的原始传感信号，反映两栅对温度的综合响应。</p>
+
+<h4>(b) 解耦温度变化</h4>
+<p>经双栅 2×2 矩阵解耦得到的温度 T 随时间变化，
+即本次标定中传感器实际经历的温度循环曲线。</p>
+
+<h4>(c) 补偿后应变 时序</h4>
+<p>解耦应变随时间变化。本次为纯温度标定(未施加真实机械应变)，理想应变应≈0；
+曲线起伏即温度引起的"表观应变"误差。</p>
+<ul>
+<li><b>原始(解耦)</b>模式：补偿前解耦应变 ε<sub>dec</sub>，
+反映封装热膨胀/KT 失配的表观应变(通常很大)。</li>
+<li><b>补偿后</b>模式：ε<sub>corr</sub> = ε<sub>dec</sub> − 表观应变模型(T)，
+减掉温度表观应变后的残余，越平越好。</li>
+<li>标题两个 σ：<b>in-sample</b>(曲线本身 std，偏乐观) 与
+<b>LOOCV</b>(留一循环交叉验证，诚实，=评级用值)。LOOCV ≥ in-sample 为常态。</li>
+</ul>
+
+<h4>(d) 应变分布 / ε-ΔT 散点</h4>
+<ul>
+<li><b>直方图</b>：应变值分布，越窄越好，标注 μ 与 ±σ。</li>
+<li><b>ε-ΔT 散点</b>：应变 vs 温度变化 ΔT，揭示残余应变与温度的关系。
+  <ul>
+    <li>补偿前：呈明显曲线/回环 → 应变强随温度变化(表观应变未除)。</li>
+    <li>补偿后：应塌缩为接近水平的带状(温度依赖被去除)。</li>
+    <li>残余回环的"宽度"(同一 ΔT 处上下分散)= <b>迟滞</b>：
+      升温段与降温段不重合，是路径依赖，单值补偿模型无法消除的不可约误差。</li>
+  </ul>
+</li>
+</ul>
+
+<h4>补偿前后意义</h4>
+<p><b>补偿前</b>：温度经封装热膨胀/KT 失配产生的表观应变仍在，
+纯温度测试下理想为 0 却大幅摆动。</p>
+<p><b>补偿后</b>：减去 ε<sub>app</sub>(T) 后，残余 = 测量噪声 + 迟滞(路径依赖)
++ 模型未捕捉的非线性；残余 σ 即该传感器在温度变化下的有效应变分辨力。</p>
+"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("图表说明 — 阶段 B 诊断四联图")
+        dlg.resize(650, 550)
+        layout = QVBoxLayout(dlg)
+        from PyQt6.QtWidgets import QTextBrowser
+        browser = QTextBrowser()
+        browser.setHtml(help_text)
+        browser.setOpenExternalLinks(True)
+        layout.addWidget(browser)
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        bottom.addWidget(create_button("确定", dlg.accept, "primary"))
+        layout.addLayout(bottom)
+        dlg.exec()
+
+    def _on_strain_mode_changed(self):
+        settings = QSettings("DataProcessor", "Calibration")
+        self._use_compensated = self._comp_radio.isChecked()
+        settings.setValue("phaseB/use_compensated", self._use_compensated)
+        self._render()
+
     def _on_panel_d_mode_changed(self):
         settings = QSettings("DataProcessor", "Calibration")
         self._use_histogram = self._hist_radio.isChecked()
@@ -263,13 +400,19 @@ class PhaseBChartsDialog(BaseChartsDialog):
         if not r or r.get("single_grating"):
             return
 
-        eps_c = np.asarray(r.get("eps_corr", []), dtype=np.float64)
+        eps_raw = np.asarray(r.get("eps_corr", []), dtype=np.float64)
         T_abs = np.asarray(r.get("T_abs", []), dtype=np.float64)
         dT_corr = np.asarray(r.get("dT_corr", []), dtype=np.float64)
-        n = len(eps_c)
+        n = len(eps_raw)
         if n == 0:
             return
         time_h = self._result.get("time_h", np.arange(n) * 2.0 / 3600.0)
+
+        # ★ 补偿后应变 (仅在 toggle 激活时计算)
+        if self._use_compensated:
+            eps_display = self._get_compensated_strain(s_name)
+        else:
+            eps_display = eps_raw
 
         # 取两栅波长漂移: 以第一行为基准, dL = (λ - λ₀) × 1000 (pm)
         gratings = self._groups.get(s_name, [])
@@ -315,25 +458,39 @@ class PhaseBChartsDialog(BaseChartsDialog):
 
         # (c) 解耦应变 ε(t) + 0 线 + e_std
         ax = axes[1, 0]
-        if np.all(np.isnan(eps_c)):
+        strain_label = "补偿后应变" if self._use_compensated else "解耦应变"
+        line_color = "#e67e22" if self._use_compensated else "#27ae60"
+        if np.all(np.isnan(eps_display)):
             ax.text(0.5, 0.5, "解耦失败: 检查 Ke/KT", transform=ax.transAxes,
                     ha="center", va="center", fontsize=12, color="red")
         else:
-            ax.plot(time_h[:n], eps_c, lw=0.5, color="#27ae60")
+            ax.plot(time_h[:n], eps_display, lw=0.5, color=line_color)
             ax.axhline(0, color="k", lw=0.5)
-            ylim = max(abs(np.nanmin(eps_c)), abs(np.nanmax(eps_c))) * 1.2 if n > 0 else 200
+            ylim = max(abs(np.nanmin(eps_display)), abs(np.nanmax(eps_display))) * 1.2 if n > 0 else 200
             ax.set_ylim(-max(ylim, 50), max(ylim, 50))
-        e_std = np.nanstd(eps_c)
-        ax.set_title(f"(c) {s_name} 解耦应变: e_std={e_std:.1f} με", fontsize=10)
-        ax.set_ylabel("με", color="#27ae60")
+        e_std = np.nanstd(eps_display)
+        if self._use_compensated:
+            sigma_loocv = self._get_loocv_sigma(s_name)
+            if not np.isnan(sigma_loocv):
+                ax.set_title(
+                    f"(c) {s_name} {strain_label} (in-sample): σ={e_std:.1f} με  |  "
+                    f"LOOCV={sigma_loocv:.2f} με",
+                    fontsize=10)
+            else:
+                ax.set_title(f"(c) {s_name} {strain_label}: σ={e_std:.1f} με", fontsize=10)
+        else:
+            ax.set_title(f"(c) {s_name} {strain_label}: σ={e_std:.1f} με", fontsize=10)
+        ax.set_ylabel("με", color=line_color)
         ax.set_xlabel("时间 (h)")
         ax.grid(alpha=0.3)
 
         # (d) 直方图 (默认) 或 ε-ΔT 散点
         ax = axes[1, 1]
-        self._render_panel_d_axis(ax, eps_c, dT_corr if len(dT_corr) == n else T_abs, n, s_name)
+        self._render_panel_d_axis(ax, eps_display, dT_corr if len(dT_corr) == n else T_abs,
+                                  n, s_name)
 
-        fig.suptitle(f"{s_name} — 解耦诊断", fontweight="bold", fontsize=12)
+        mode_tag = "补偿后" if self._use_compensated else "解耦"
+        fig.suptitle(f"{s_name} — {mode_tag}诊断", fontweight="bold", fontsize=12)
         self._chart.draw_with_layout()
 
     def _render_panel_d(self):
@@ -344,11 +501,17 @@ class PhaseBChartsDialog(BaseChartsDialog):
         r = self._sensors.get(s_name)
         if not r or r.get("single_grating"):
             return
-        eps_c = np.asarray(r.get("eps_corr", []), dtype=np.float64)
-        if len(eps_c) == 0:
+        eps_raw = np.asarray(r.get("eps_corr", []), dtype=np.float64)
+        if len(eps_raw) == 0:
             return
         dT_corr = np.asarray(r.get("dT_corr", []), dtype=np.float64)
-        n = len(eps_c)
+        n = len(eps_raw)
+
+        # ★ 补偿后应变
+        if self._use_compensated:
+            eps_display = self._get_compensated_strain(s_name)
+        else:
+            eps_display = eps_raw
 
         fig = self._chart.get_figure()
         axes = fig.axes
@@ -356,11 +519,14 @@ class PhaseBChartsDialog(BaseChartsDialog):
             return
         ax = axes[3]
         ax.clear()
-        self._render_panel_d_axis(ax, eps_c, dT_corr if len(dT_corr) == n else np.zeros(n), n, s_name)
+        self._render_panel_d_axis(ax, eps_display,
+                                  dT_corr if len(dT_corr) == n else np.zeros(n),
+                                  n, s_name)
         self._chart._canvas.draw_idle()
 
     def _render_panel_d_axis(self, ax, eps_c, dT_vals, n, s_name):
         """面板(d) 渲染: 直方图 或 散点"""
+        strain_label = "补偿后应变" if self._use_compensated else "解耦应变"
         if self._use_histogram:
             # 直方图 + μ/σ 标注
             valid = eps_c[~np.isnan(eps_c)]
@@ -373,8 +539,19 @@ class PhaseBChartsDialog(BaseChartsDialog):
             ax.axvline(e_mean - e_std, ls=":", color="gray", lw=1)
             ax.axvline(e_mean + e_std, ls=":", color="gray", lw=1,
                        label=f'±σ={e_std:.1f} με')
-            ax.set_title(f"(d) {s_name} 解耦应变分布: μ={e_mean:.1f}, σ={e_std:.1f} με",
-                         fontsize=10)
+            if self._use_compensated:
+                sigma_loocv = self._get_loocv_sigma(s_name)
+                if not np.isnan(sigma_loocv):
+                    ax.set_title(
+                        f"(d) {s_name} {strain_label}分布 (in-sample): "
+                        f"μ={e_mean:.1f}, σ={e_std:.1f} με  |  LOOCV={sigma_loocv:.2f} με",
+                        fontsize=10)
+                else:
+                    ax.set_title(f"(d) {s_name} {strain_label}分布: μ={e_mean:.1f}, σ={e_std:.1f} με",
+                                 fontsize=10)
+            else:
+                ax.set_title(f"(d) {s_name} {strain_label}分布: μ={e_mean:.1f}, σ={e_std:.1f} με",
+                             fontsize=10)
             ax.set_xlabel("ε (με)")
             ax.set_ylabel("频次")
             ax.legend(fontsize=7, loc="upper right")
@@ -384,7 +561,8 @@ class PhaseBChartsDialog(BaseChartsDialog):
             if valid.sum() > 10:
                 ax.scatter(dT_vals[valid], eps_c[valid], s=2, alpha=0.3, color="#8e44ad")
                 ax.axhline(0, color="k", lw=0.5)
-            ax.set_title(f"(d) {s_name} 应变-温度相关", fontsize=10)
+            mode_tag = " (in-sample)" if self._use_compensated else ""
+            ax.set_title(f"(d) {s_name} {strain_label}-温度相关{mode_tag}", fontsize=10)
             ax.set_xlabel("ΔT (°C)")
             ax.set_ylabel("με", color="#8e44ad")
         ax.grid(alpha=0.3)

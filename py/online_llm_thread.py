@@ -12,6 +12,11 @@ from openai import OpenAI
 def format_api_error(error: Exception) -> str:
     """将 API 异常格式化为用户友好的中文消息"""
     msg = str(error)
+    # 404 常见原因：base_url 错了 / 模型名不存在
+    if '404' in msg or 'not found' in msg.lower():
+        if '/anthropic' in msg:
+            return "API 地址配置错误: 代码使用 OpenAI SDK，请将 base_url 改为 DeepSeek 的 OpenAI 兼容端点(https://api.deepseek.com/v1)，而非 Anthropic 端点"
+        return "请求的资源不存在(404): 请检查 API 地址和模型名称。若 base_url 为 /anthropic 则需改为 /v1 (OpenAI 兼容端点)"
     # 429 限流错误
     if '429' in msg or 'rate_limit' in msg:
         reset_match = re.search(r'resets at (.+?)(?:\s*\(\d+\))?$', msg)
@@ -81,8 +86,10 @@ class OnlineLlamaGenerateThread(QThread):
         """
         t0 = time.time()
         try:
+            # ★ .removesuffix('/v1') — 正确删尾缀，rstrip('/v1') 误删字符集
+            base = self.base_url.removesuffix('/v1')
             response = requests.get(
-                self.base_url.rstrip('/v1') + '/v1/models',
+                f"{base}/v1/models",
                 timeout=5,
             )
             elapsed = int((time.time() - t0) * 1000)

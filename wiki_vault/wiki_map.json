@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "last_updated": "2026-06-03",
+  "last_updated": "2026-06-12",
   "index": {
     "Hermes+Obsidian+LLM Wiki搭建本地知识库": {
       "path": "pages/Hermes+Obsidian+LLM Wiki搭建本地知识库.md",
@@ -33,6 +33,11 @@
     },
     "波长漂移的三大来源": {
       "path": "pages/波长漂移的三大来源.md",
+      "tags": [],
+      "summary": ""
+    },
+    "从“Prompt”到“Loops”的范式转移": {
+      "path": "pages/从“Prompt”到“Loops”的范式转移.md",
       "tags": [],
       "summary": ""
     }
