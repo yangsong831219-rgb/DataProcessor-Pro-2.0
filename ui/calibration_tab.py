@@ -3396,10 +3396,41 @@ class StrainCalibrationPage(QWidget):
                         ss.sensors[0].constants[f"k{g.grating_index}"] = float(g.k_pm_per_ue)
 
     def _export_strain_excel(self):
-        if not self._last_result: return
+        # ── 先找可用的标定数据源 ──
+        source = self._last_result
+        if source is None and self._current_sensor and self._current_sensor in self._strain_configs:
+            # 从已标定列表加载的传感器 — 重新计算 Ke 结果
+            cfg = self._strain_configs[self._current_sensor]
+            ke = getattr(cfg, 'ke_results', {}) or {}
+            if ke:
+                from py.calibration.strain_calibration import (
+                    StrainCalibrationResult,
+                    GratingStrainResult,
+                )
+                gauge = getattr(cfg, 'gauge_length_mm', self._config["gauge_length_mm"])
+                levels = self._levels
+                gratings = []
+                for gi, key in enumerate(["Ke1", "Ke2"], start=1):
+                    k_val = ke.get(key, 0)
+                    if abs(k_val) > 1e-10:
+                        gratings.append(GratingStrainResult(
+                            grating_index=gi, k_pm_per_ue=k_val, R2=0.0,
+                        ))
+                if gratings:
+                    source = StrainCalibrationResult(
+                        gauge_length_mm=gauge, mode=self._config["mode"],
+                        n_cycles=self._config["n_cycles"],
+                        grating_kind=self._config["grating_kind"],
+                        levels=levels,
+                        eps_theory=[d / gauge * 1e6 if gauge > 0 else 0.0 for d in levels],
+                        gratings=gratings,
+                    )
+        if source is None:
+            QMessageBox.warning(self, "提示", "没有可导出的标定数据。请先点击「提交并分析」完成一次应变标定。")
+            return
         path, _ = QFileDialog.getSaveFileName(self, "导出", "应变标定.xlsx", "Excel (*.xlsx)")
         if path:
-            export_strain_excel(self._last_result, path)
+            export_strain_excel(source, path)
             QMessageBox.information(self, "完成", f"已保存: {path}")
 
     def _on_generate_report(self):
