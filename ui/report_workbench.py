@@ -100,11 +100,13 @@ class ReportWorkbenchWidget(QWidget):
 
     outline_requested = pyqtSignal(dict)          # 左侧配置快照
     full_report_requested = pyqtSignal(dict, str)  # 配置 + 右侧大纲文本
+    load_diagnosis_requested = pyqtSignal()         # 用户点击"从已存诊断加载"
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._req_file_path: str = ''
         self._template_file_path: str = ''
+        self._diagnosis_record: dict | None = None  # 从已存诊断 JSON 加载
         self._build_ui()
 
     # ── Public API ──
@@ -124,6 +126,7 @@ class ReportWorkbenchWidget(QWidget):
             'req_file': self._req_file_path,
             'template_file': self._template_file_path,
             'project_files': self._get_project_file_paths(),
+            '_diagnosis_record': self._diagnosis_record,
         }
 
     def set_full_report_ready(self, ready: bool) -> None:
@@ -247,6 +250,19 @@ class ReportWorkbenchWidget(QWidget):
         self.outline_btn.clicked.connect(self._on_outline_requested)
         btn_layout.addWidget(self.outline_btn)
 
+        self.load_diag_btn = QPushButton('📋 从已存诊断加载')
+        self.load_diag_btn.setStyleSheet(
+            "QPushButton { background: #722ed1; color: white; border: none; border-radius: 4px; "
+            "padding: 8px 16px; font-size: 12px; font-weight: bold; }"
+            "QPushButton:hover { background: #9254de; }"
+        )
+        self.load_diag_btn.clicked.connect(self._on_load_diagnosis)
+        btn_layout.addWidget(self.load_diag_btn)
+
+        self.diag_loaded_label = QLabel('诊断数据: (未加载)')
+        self.diag_loaded_label.setStyleSheet('color: #888; font-size: 11px; padding: 2px 0;')
+        btn_layout.addWidget(self.diag_loaded_label)
+
         self.full_report_btn = QPushButton('🚀 基于大纲生成完整报告')
         self.full_report_btn.setStyleSheet(BTN_ACCENT)
         self.full_report_btn.setEnabled(False)
@@ -343,6 +359,21 @@ class ReportWorkbenchWidget(QWidget):
         ]
 
     # ── 信号发射 ──
+
+    def set_diagnosis_record(self, rec: dict | None) -> None:
+        """由控制器调用，设置或清空已加载的诊断记录。"""
+        self._diagnosis_record = rec
+        if rec:
+            ts = rec.get('timestamp', '?')
+            sensors = len(rec.get('diagnosis_json', {}).get('sensor_analysis', []))
+            self.diag_loaded_label.setText(f'诊断数据: {ts} ({sensors} 传感器)')
+            self.diag_loaded_label.setStyleSheet('color: #52c41a; font-weight: bold; font-size: 11px;')
+        else:
+            self.diag_loaded_label.setText('诊断数据: (未加载)')
+            self.diag_loaded_label.setStyleSheet('color: #888; font-size: 11px;')
+
+    def _on_load_diagnosis(self) -> None:
+        self.load_diagnosis_requested.emit()
 
     def _on_outline_requested(self) -> None:
         self.outline_requested.emit(self.get_config())

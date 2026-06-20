@@ -117,6 +117,7 @@ class CompareTabWidget(QWidget):
         self._shared_time_source: tuple[FileConfig, str] | None = None   # (fc, col_name)
         self._selected_data_items: set[tuple[FileConfig, str]] = set()   # {(fc, col_name), ...}
         self._fullscreen_dialog: QDialog | None = None
+        self._last_comparison: dict | None = None  # 供 provider 读取的暂存结果
         self._build_ui()
 
     # ──────────────────────────────────────
@@ -1158,6 +1159,35 @@ class CompareTabWidget(QWidget):
             + ''.join(html_rows)
             + '</table>'
         )
+
+        # ── 暂存结构化结果供 CompareProvider 读取 ──
+        pair_results: list[dict] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                c1, c2 = cols[i], cols[j]
+                s1, s2 = df_clean[c1], df_clean[c2]
+                diff = s1 - s2
+                pair_results.append({
+                    'device_a': str(c1), 'device_b': str(c2),
+                    'max_error': float(diff.abs().max()),
+                    'mae': float(diff.abs().mean()),
+                    'rmse': float(np.sqrt((diff ** 2).mean())),
+                    'corr': float(s1.corr(s2)) if float(s1.std()) > 0 and float(s2.std()) > 0 else 0.0,
+                })
+
+        # 每设备特征 (复用 compute_time_series_features)
+        from core.data_providers import compute_time_series_features
+        device_features: dict[str, dict] = {}
+        for col_name in cols:
+            device_features[str(col_name)] = compute_time_series_features(df_zeroed[col_name].dropna())
+
+        self._last_comparison = {
+            'pairs': pair_results,
+            'device_features': device_features,
+            'baseline_method': '窗口首点归零',
+            'align_method': '绝对时间插值 (numpy.interp)',
+            'n_points': int(len(df_clean)),
+        }
 
         self._comparison_result.setHtml(html)
         self._comparison_result.setVisible(True)

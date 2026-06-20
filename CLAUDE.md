@@ -157,3 +157,22 @@ python test_run.py          # 快速启动测试（仅测试 UI 加载是否崩�
 python -c "import py_compile; py_compile.compile('main.py', doraise=True)" # 快速语法树静态检查
 pyright <changed_files>                                   # 类型检查（提交前必须零红线）
 python run_tests.py                                       # 运行所有测试 (公式引擎 + 标定引擎)
+```
+
+---
+
+## 📋 经验教训 (Lessons Learned)
+
+**11. 枚举/分类字段原样透传 (硬纪律):**
+- 注入 prompt 或生成输出时，枚举字段 (`grade`="优"/"良"/"合格"/"FAIL"/"N/A"、`comp_form`="lut"/"poly"、`single_grating` 等) 必须与数值同等对待，**原样透传**，不得改写。
+- 模型会悄悄软化枚举值（实测 `优 → 良`、`FAIL → 不合格`）。指示语固定 **"评级/数值一律照摘要原文，不得改写"**。
+- 验收时分类字段也逐项对照，不只对数字。
+
+**12. 判 live/dead code 看 "从入口可达性" (硬纪律):**
+- **判断依据 = 能否从 `main.py` / UI 栈 / 用户可触达路径 到达**。禁止以 "被 import 了 / 引用了某 live 模块" 判 live。
+- 反例：`report_word.py` 引用了 `ollama_client`（live 模块），但自身从未被 `main.py` 实例化 → 孤儿死代码（Phase 0.5 误判为 LIVE）。
+
+**13. 验收: "绿勾/自评" 不是证据，ground-truth 对照才是 (硬纪律):**
+- "测试通过 / 规则正确应用 / 数值一致" 是实现方自评，不是验收证据。
+- 关键项（数值交叉核对、模型输出原文、prompt 片段）必须贴 **ground-truth 对照原文**，由审阅方判断。
+- 不接受 summary / 绿勾表 代替 artifact。反例：Phase 3 验收用 "规则正确应用 ✅" 代替模型输出原文，被驳回重交。

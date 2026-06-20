@@ -143,10 +143,79 @@ def _build_context(config: dict) -> str:
                 fname = os.path.basename(pf)
                 parts.append(f'## 项目资料: {fname}\n\n{content}')
 
+    # ── 诊断产物注入 (来自已存 DiagnosisRecord JSON) ──
+    diag_rec = config.get('_diagnosis_record')
+    if diag_rec and isinstance(diag_rec, dict):
+        summary = _build_diagnosis_summary(diag_rec)
+        if summary:
+            parts.append(summary)
+
     if not parts:
         parts.append('（未提供具体需求文件，请根据通用传感器数据分析场景生成报告）')
 
     return '\n\n---\n\n'.join(parts)
+
+
+def _build_diagnosis_summary(rec: dict, max_chars: int = 2500) -> str:
+    """从 DiagnosisRecord 构建紧凑诊断摘要 (供报告引擎注入 project_context)。
+
+    不 dump 整份 record，只取每传感器结论 + KB 要点 + 标定标量。
+    兼容 schema 1.0 (diagnosis_json 顶层) 与 1.1 (ai_diagnosis.diagnosis_json)。
+    """
+    lines = ['# 传感器诊断数据 (来源: AI 诊断结果快照)']
+    # schema 1.1 → ai_diagnosis.diagnosis_json; 1.0 降级到 diagnosis_json
+    ai_d = rec.get('ai_diagnosis') or {}
+    diag = ai_d.get('diagnosis_json') if ai_d else rec.get('diagnosis_json')
+    if not diag:
+        diag = {}
+    if not isinstance(diag, dict):
+        diag = {}
+
+    # ── 每传感器结论 ──
+    sa = diag.get('sensor_analysis', [])
+    if sa:
+        lines.append('\n## 传感器诊断结论')
+        for s in sa:
+            sid = s.get('sensor_id', '?')
+            status = s.get('status', '?')
+            findings = s.get('findings', '')
+            suggestions = s.get('suggestions', '')
+            lines.append(f'- {sid} ({status}): {findings}')
+            if suggestions:
+                lines.append(f'  建议: {suggestions}')
+
+    # ── KB 命中规则要点 ──
+    kb_hits = rec.get('kb_hits', [])
+    if kb_hits:
+        lines.append('\n## 诊断规则命中')
+        for h in kb_hits:
+            objs = h.get('objects') or []
+            obj_str = ', '.join(objs) if isinstance(objs, list) else str(objs) if objs else ''
+            lines.append(f'- {h["id"]} [{h["severity"]}]: {h["meaning"]}')
+            if obj_str:
+                lines.append(f'  适用: {obj_str}')
+            rec_str = h.get('recommendation', '')
+            if rec_str:
+                lines.append(f'  建议: {rec_str}')
+
+    # ── 物理诊断 ──
+    pd = diag.get('physical_diagnosis', {})
+    if pd and pd.get('phenomenon'):
+        lines.append('\n## 物理诊断')
+        lines.append(f'现象: {pd.get("phenomenon", "")}')
+        for c in pd.get('possible_causes', [])[:3]:
+            lines.append(f'  - {c}')
+
+    # ── schema 1.1: 多智能体报告段 ──
+    ma = rec.get('multi_agent') or {}
+    ma_report = ma.get('report', '') if isinstance(ma, dict) else ''
+    if ma_report:
+        lines.append(f'\n## 多智能体诊断\n{ma_report[:800]}')
+
+    text = '\n'.join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars - 20] + '\n(诊断摘要已截断)'
+    return text
 
 
 def _parse_outline_markdown(md: str) -> str:
@@ -332,6 +401,7 @@ def _generate_word_report(
                 messages,
                 tools_config['definitions'],
                 tools_config['executable_map'],
+                enable_thinking=False,  # 报告路径走非思考模式
             )
         else:
             raw = generate_fn(prompt)
@@ -393,6 +463,7 @@ def _generate_ppt_report(
                 messages,
                 tools_config['definitions'],
                 tools_config['executable_map'],
+                enable_thinking=False,  # 报告路径走非思考模式
             )
         else:
             raw = generate_fn(prompt)

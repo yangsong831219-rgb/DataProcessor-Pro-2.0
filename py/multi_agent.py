@@ -1,31 +1,37 @@
-"""DataProcessor Pro 多智能体审查系统 (CrewAI 架构)
+"""DataProcessor Pro 多智能体顾问系统 (Phase 6 — 线性单遍, 输入预算安全).
 
 基于 LangGraph 实现的三角色 Agent 团队：
-- Agent 1: 数据科学家 (Data Scientist)
-- Agent 2: 独立审查员 (Data Auditor)
-- Agent 3: 首席传感专家 (Chief Scientist)
+- Agent 1: 数据科学家 (Data Scientist) — 详报
+- Agent 2: 审核顾问 (Data Advisor) — 审查意见，不裁决
+- Agent 3: 首席传感专家 (Chief Scientist) — 精炼综合，产出结构化诊断报告
 
-团队协作模式：
-用户指令 → 数据科学家(分析) → 审查员(审查) → [循环:有问题打回重算]
-                                         ↓ (通过)
-                                   首席专家(诊断+报告) → 最终报告
+协作模式（线性，无回环）：
+用户指令 → 数据科学家(详报) → 审核顾问(意见) → 首席专家(精炼综合) → 最终报告
+
+Phase 6 变更：
+- 输入预算: chief 不灌 DS 全文，只给摘要 + 审查意见（均在预算内）
+- max_tokens 按上下文窗口安全计算，不再用 8192 撞 -c 8192
+- 截断不崩: chief 触发 AIClientTruncationError → 优雅降级，仍出富报告
+- 精炼综合: chief prompt 明确 "只做综合判断，不复述推导细节"
 """
 
-import os
-from typing import TypedDict, Annotated, List, Literal, Optional, Callable
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langchain_core.tools import tool
-from langchain_core.language_models import BaseChatModel
+from __future__ import annotations
+
+import json
+import re
+import time
+from typing import Any, TypedDict, Annotated
+
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-from langchain_openai import ChatOpenAI
 
-from py.wiki_system import WikiFileSystem
-from py.analyzer import apply_filter
-from py.formula import calculate
+# Phase 6: 截断降级需要此异常类型
+from core.ai_errors import AIClientTruncationError
 
 
-# ============ JSON 输出 Schema（首席专家报告） ============
+# ═══════════════════════════════════════════════════════════════════════
+# JSON Schema (chief 仍产出结构化报告供 UI 卡片渲染)
+# ═══════════════════════════════════════════════════════════════════════
 
 CHIEF_REPORT_JSON_SCHEMA = {
     "type": "object",
@@ -38,7 +44,7 @@ CHIEF_REPORT_JSON_SCHEMA = {
                 "data_quality": {"type": "string", "enum": ["good", "fair", "poor"]},
                 "anomaly_count": {"type": "integer"},
                 "overall_assessment": {"type": "string"},
-            }
+            },
         },
         "data_quality_assessment": {
             "type": "object",
@@ -46,8 +52,8 @@ CHIEF_REPORT_JSON_SCHEMA = {
                 "completeness": {"type": "string"},
                 "consistency": {"type": "string"},
                 "anomaly_patterns": {"type": "array", "items": {"type": "string"}},
-                "recommendations": {"type": "array", "items": {"type": "string"}}
-            }
+                "recommendations": {"type": "array", "items": {"type": "string"}},
+            },
         },
         "sensor_analysis": {
             "type": "array",
@@ -59,16 +65,14 @@ CHIEF_REPORT_JSON_SCHEMA = {
                     "statistics": {
                         "type": "object",
                         "properties": {
-                            "mean": {"type": "number"},
-                            "std": {"type": "number"},
-                            "min": {"type": "number"},
-                            "max": {"type": "number"}
-                        }
+                            "mean": {"type": "number"}, "std": {"type": "number"},
+                            "min": {"type": "number"}, "max": {"type": "number"},
+                        },
                     },
                     "findings": {"type": "string"},
-                    "suggestions": {"type": "string"}
-                }
-            }
+                    "suggestions": {"type": "string"},
+                },
+            },
         },
         "physical_diagnosis": {
             "type": "object",
@@ -76,26 +80,129 @@ CHIEF_REPORT_JSON_SCHEMA = {
                 "phenomenon": {"type": "string"},
                 "possible_causes": {"type": "array", "items": {"type": "string"}},
                 "severity": {"type": "string", "enum": ["low", "medium", "high"]},
-                "recommended_actions": {"type": "array", "items": {"type": "string"}}
-            }
-        }
-    }
+                "recommended_actions": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
 }
 
-_JSON_SCHEMA_STR = __import__('json').dumps(CHIEF_REPORT_JSON_SCHEMA, ensure_ascii=False, indent=2)
+_JSON_SCHEMA_STR = json.dumps(CHIEF_REPORT_JSON_SCHEMA, ensure_ascii=False, indent=2)
 
 
-# ============ 数据上下文构建器 ============
+# ═══════════════════════════════════════════════════════════════════════
+# LLM 调用辅助 (线程安全: 每次调用取 AIClient 单例)
+# ═══════════════════════════════════════════════════════════════════════
 
-def build_context_block(data_context: dict | None = None) -> str:
-    """将数据上下文 dict 序列化为自然语言上下文块，注入 Agent 系统提示词。
+
+def _invoke_llm(system_prompt: str, user_prompt: str,
+                max_tokens: int = 4096) -> str:
+    """通过 AIClient 同步调用 LLM (enable_thinking=False)。"""
+    from core.ai_client import AIClient
+    ai = AIClient.get_instance()
+    return ai.generate(
+        prompt=user_prompt,
+        system_prompt=system_prompt,
+        temperature=0.3,
+        max_tokens=max_tokens,
+        enable_thinking=False,
+    )
+
+
+def _extract_advisory_text(raw: str) -> str:
+    """从 Advisor 输出中提取审查意见（极度宽松：纯文本直通）。
+
+    不像旧版 _parse_audit_json 那样要求 JSON 结构。
+    若输出是 JSON 也原样保留；若是 markdown/纯文本，直接返回。
+    仅过滤掉纯空的退化情况。
+    """
+    if not raw or not raw.strip():
+        return ""  # 空响应 → 空建议，不抛异常
+    return raw.strip()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Token 预算估算与输入裁剪 (Phase 6: 防截断崩溃)
+# ═══════════════════════════════════════════════════════════════════════
+
+# 默认上下文窗口 (保守取 8k — 多数本地模型上限)
+_SAFE_CTX_TOKENS = 8192
+# 输出预留 margin (system prompt + overhead)
+_CTX_MARGIN = 600
+
+
+def _estimate_tokens(text: str) -> int:
+    """基于字符数粗略估算 token 数。
+
+    中文 ≈ 1.5 char/token, 英文/代码 ≈ 3.5 char/token。
+    使用保守估计: 整体 ~2.5 char/token (混合文本)。
+    """
+    if not text:
+        return 0
+    # 分别统计 CJK 和 ASCII 字符
+    cjk = sum(1 for c in text if '一' <= c <= '鿿' or '　' <= c <= '〿')
+    ascii_chars = len(text) - cjk
+    # CJK ~1.5 char/token, ASCII ~3.5 char/token
+    return max(1, int(cjk / 1.5 + ascii_chars / 3.5))
+
+
+def _trim_report_for_budget(report: str, max_input_tokens: int) -> str:
+    """将报告裁剪到指定 token 预算内。
+
+    策略：头尾保留 (header + conclusion)，中间截断。
+    - 前 60% budget 给开头 (通常含结论/摘要)
+    - 后 40% budget 给结尾 (通常含建议/总结)
+    - 中间插入截断标记
+
+    若已在预算内则原样返回。
+    """
+    if not report:
+        return report
+    estimated = _estimate_tokens(report)
+    if estimated <= max_input_tokens:
+        return report
+
+    # 按字符比例粗略裁剪 (同比例 ≈ 同 token 比)
+    ratio = max_input_tokens / estimated
+    target_len = max(200, int(len(report) * ratio * 0.9))  # 留 10% 缓冲
+
+    head_ratio = 0.6
+    head_len = int(target_len * head_ratio)
+    tail_len = target_len - head_len
+
+    head = report[:head_len]
+    tail = report[-tail_len:] if tail_len > 0 else ""
+    cut_note = "\n\n…[中间段已裁剪以控制输入长度]…\n\n"
+
+    return head + cut_note + tail
+
+
+def _safe_max_tokens(system_prompt: str, user_prompt: str,
+                     requested: int,
+                     ctx_tokens: int = _SAFE_CTX_TOKENS,
+                     margin: int = _CTX_MARGIN) -> int:
+    """安全计算 max_tokens: 确保 prompt 估算 + max_tokens + margin ≤ ctx。
 
     Args:
-        data_context: 来自 ui/ai_diagnosis.py _build_data_context() 的输出
+        system_prompt: 系统提示词
+        user_prompt: 用户提示词
+        requested: 请求的 max_tokens
+        ctx_tokens: 上下文窗口大小 (token)
+        margin: 安全边距
 
     Returns:
-        格式化的上下文文本（含数据类型防火墙、清洗统计、模板信息）
+        不超过 available 的安全 max_tokens 值，最小 512。
     """
+    prompt_est = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
+    available = ctx_tokens - prompt_est - margin
+    return max(512, min(requested, available))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 数据上下文构建器
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def build_context_block(data_context: dict | None = None) -> str:
     if not data_context:
         return ""
 
@@ -106,7 +213,8 @@ def build_context_block(data_context: dict | None = None) -> str:
     rows = data_context.get("data_rows", 0)
     cols = data_context.get("data_columns", 0)
 
-    type_label = "光纤光栅传感器数据（基于波长差 W1~W8 进行物理量转换）" if is_fiber else "通用数据（外部已算好，直接读取标注列）"
+    type_label = ("光纤光栅传感器数据（基于波长差 W1~W8 进行物理量转换）"
+                  if is_fiber else "通用数据（外部已算好，直接读取标注列）")
 
     lines = [
         "=== 当前数据上下文（自动注入） ===",
@@ -157,71 +265,50 @@ def build_context_block(data_context: dict | None = None) -> str:
     return '\n'.join(lines)
 
 
-# ============ 角色系统提示词（含上下文注入点） ============
+# ═══════════════════════════════════════════════════════════════════════
+# 系统提示词模板 (Phase 5: Advisor 顾问式, Chief 综合式)
+# ═══════════════════════════════════════════════════════════════════════
 
 DATA_SCIENTIST_PROMPT_TPL = """你是一名资深 Python 数据科学家，专门从事传感器数据分析。
 
 {data_context}
 
 你的职责：
-1. 读取 CSV 数据文件，进行降噪和特征提取
-2. 应用巴特沃斯滤波器进行物理降噪
-3. 执行自定义公式计算
-4. 输出清晰的数据处理报告和技术备忘录
-
-你拥有以下工具：
-- apply_butterworth_filter: 巴特沃斯滤波降噪
-- execute_custom_formula: 自定义公式列计算
-- read_wiki_page: 读取知识库页面
-- write_wiki_page: 写入知识库页面
-
-工作流程：
-1. 接收数据文件路径和分析需求
+1. 接收数据文件和分析需求
 2. 进行数据清洗和滤波处理
 3. 提取波形特征
 4. 生成技术备忘录（包含处理步骤和清洗前后特征比对）
 
-你的输出应该是专业的数据分析报告。
-
 注意：请根据上方"数据类型"选择正确的处理路径：
 - 光纤数据 → 基于波长差计算，关注 FBG 漂移
 - 通用数据 → 直接从标注列读取，不做波长转换
-"""
+
+=== 成品化约束（绝对纪律） ===
+- 严禁向读者发问（如"请确认""待确认后执行""以便生成"等），必须直接给出分析结论。
+- 有不确定 → 写"分析口径/假设说明："陈述前提后照常给结论，不挂起。
+- 严禁臆造数值：缺标定系数/灵敏度/阈值等 → 明示"未提供，无法计算"，不得假设≈1500pm/≈3%等任何虚构数字。
+- 时间戳歧义按数据清洗口径陈述，正文不残留"(2035？)"等问号。
+- 禁止 ASCII 字符画：不得用 | / \\ - _ 等字符拼绘趋势图/曲线/坐标轴/示意图。如需图表用文字描述或数据表表达，注明"由软件绘图模块出图"。
+
+你的输出应该是专业的数据分析报告。"""
 
 
-DATA_AUDITOR_PROMPT_TPL = """你是一名严格的实验数据质量控制官（QC），专门审查数据分析结果的合理性。
+DATA_ADVISOR_PROMPT_TPL = """你是一名经验丰富的实验数据审查顾问，专门为数据分析报告提供建设性反馈。
 
 {data_context}
 
 你的职责：
-1. 审查数据科学家处理后的数据是否合理
-2. 检查滤波是否过度导致真实信号失真
-3. 检查基线回零是否判断准确
-4. 检查异常值处理是否得当
+- 审查数据科学家的分析报告，找出潜在问题、风险、遗漏和需补充验证之处
+- 提出具体的改进建议，供首席专家在撰写最终诊断报告时参考
+- 评估分析方法的合理性、物理可解释性
 
-你只有数据和执行日志的只读权限，不能直接修改数据。
+根据数据类型调整审查重点：
+- 光纤数据：重点关注波长漂移趋势、应变/温度耦合分析、滤波参数选择
+- 通用数据：重点关注标注列一致性、缺失值影响、异常分布合理性
 
-审查标准：
-- 滤波截止频率设置是否合理（不能过低导致波形畸变）
-- 异常值判断是否符合物理规律
-- 数据特征提取是否完整
-- 计算公式是否正确
-
-根据数据类型采用不同的审查重点：
-- 光纤数据：重点审查波长漂移趋势、应变/温度耦合、滤波参数
-- 通用数据：重点审查标注列一致性、缺失值处理、异常分布
-
-=== 输出格式（严格 JSON） ===
-你必须仅输出以下格式的 JSON 对象，不要加任何 markdown 包裹或额外文字：
-
-{audit_schema}
-
-字段说明：
-- verdict: "pass" 表示审查通过，"reject" 表示驳回需修正
-- reasons: 审查理由列表（至少 1 条）
-- required_fixes: 若驳回，给出数据科学家必须修正的具体事项（每条≤50字）；若通过则为空数组
-
-注意：只输出 JSON 对象，一行都不能多。"""
+【重要】你的角色是顾问，不是审判者——你只提供意见和建议供首席参考，不做"通过/否决"决定。
+输出格式不限：可以是要点列表、段落文字、或结构化的观察记录。
+用中文输出。"""
 
 
 CHIEF_SCIENTIST_PROMPT_TPL = """你是光纤光栅传感器研发总负责人，拥有深厚的材料力学背景。
@@ -229,483 +316,325 @@ CHIEF_SCIENTIST_PROMPT_TPL = """你是光纤光栅传感器研发总负责人，
 {data_context}
 
 你的职责：
-1. 结合本地知识库，将数字转化为物理诊断结论
-2. 分析材料力学行为（如 NOA 81 胶水与 PI 光纤的界面滑移）
-3. 撰写最终诊断报告
-4. 更新知识库
-
-你拥有以下工具：
-- read_wiki_page: 读取本地知识库（如封装工艺规范）
-- write_wiki_page: 将新发现写入知识库
-- list_wiki_pages: 列出所有知识库页面
-- search_wiki_pages: 搜索知识库
-
-工作流程：
-1. 读取数据科学家的分析结果和审查员的审查意见
-2. 读取相关知识库内容（如 NOA81 封装工艺）
-3. 根据数据类型选择诊断路径：
+1. 综合数据科学家的技术分析报告和审核顾问的审查意见
+2. 对审核顾问指出的问题逐一回应：接受修正、补充数据、或解释风险可控
+3. 将数字转化为物理诊断结论
+4. 分析材料力学行为（如 NOA 81 胶水与 PI 光纤的界面滑移）
+5. 根据数据类型选择诊断路径：
    - 光纤数据 → 分析波长漂移、应变/温度耦合、界面滑移
    - 通用数据 → 分析数据完整性、趋势变化、异常成因
-4. 生成最终诊断报告（严格 JSON 格式）
-5. 将新发现更新到知识库
 
 === 输出要求 ===
 你必须严格以 JSON 格式输出最终诊断报告，遵循以下 schema（输出纯 JSON，不要 markdown 包裹，不要多余文字）：
 
 {json_schema}
 
-注意：全部用中文输出。"""
+注意：全部用中文输出。你需要对审核顾问的意见做出实质性回应，不要忽略它们。"""
 
 
-# ============ 工具定义 ============
-
-@tool
-def apply_butterworth_filter(file_path: str, cutoff_hz: float, order: int = 4, filter_type: str = "lowpass") -> str:
-    """应用巴特沃斯滤波器进行物理降噪"""
-    try:
-        import pandas as pd
-        df = pd.read_csv(file_path)
-        if 'data' not in df.columns:
-            return "Error: CSV 文件缺少 'data' 列"
-        sampling_rate = 1000.0
-        filtered = apply_filter(df['data'].tolist(), filter_type, cutoff_hz, sampling_rate)
-        df['filtered'] = filtered
-        output_path = file_path.replace('.csv', '_filtered.csv')
-        df.to_csv(output_path, index=False)
-        return f"Filter applied: {filter_type} cutoff={cutoff_hz}Hz order={order}. Output: {output_path}"
-    except Exception as e:
-        return f"Error applying filter: {str(e)}"
+# ═══════════════════════════════════════════════════════════════════════
+# 状态定义 (Phase 5: 移除 rejection_count)
+# ═══════════════════════════════════════════════════════════════════════
 
 
-@tool
-def execute_custom_formula(file_path: str, formula_str: str, params: dict = None) -> str:
-    """执行自定义公式列计算"""
-    try:
-        import pandas as pd
-        df = pd.read_csv(file_path)
-        params = params or {}
-        columns = {col: df[col].tolist() for col in df.columns if df[col].dtype in ['float64', 'int64']}
-        result = calculate(formula_str, columns, params)
-        result_col = f"formula_result"
-        df[result_col] = result
-        output_path = file_path.replace('.csv', '_formula.csv')
-        df.to_csv(output_path, index=False)
-        return f"Formula executed: {formula_str}. Output: {output_path}"
-    except Exception as e:
-        return f"Error executing formula: {str(e)}"
-
-
-@tool
-def read_wiki_page(page_name: str) -> str:
-    """读取本地知识库文档"""
-    wiki = WikiFileSystem()
-    return wiki.read_wiki_page(page_name)
-
-
-@tool
-def write_wiki_page(page_name: str, content: str) -> str:
-    """新建或更新知识库文档"""
-    wiki = WikiFileSystem()
-    return wiki.write_wiki_page(page_name, content, author="Chief-Scientist")
-
-
-@tool
-def list_wiki_pages() -> str:
-    """列出所有知识库页面"""
-    wiki = WikiFileSystem()
-    return wiki.list_pages()
-
-
-@tool
-def search_wiki_pages(keyword: str) -> str:
-    """在知识库中搜索关键词"""
-    wiki = WikiFileSystem()
-    return wiki.search_pages(keyword)
-
-
-# 数据科学家工具（可读写数据和处理）
-DATA_SCIENTIST_TOOLS = [
-    apply_butterworth_filter,
-    execute_custom_formula,
-    read_wiki_page,
-    write_wiki_page,
-]
-
-# 审查员工具（只读）
-AUDITOR_TOOLS = [
-    read_wiki_page,
-    list_wiki_pages,
-    search_wiki_pages,
-]
-
-# 首席专家工具（读写+诊断）
-CHIEF_SCIENTIST_TOOLS = [
-    read_wiki_page,
-    write_wiki_page,
-    list_wiki_pages,
-    search_wiki_pages,
-]
-
-
-# ============ Audit 裁决 Schema ============
-
-class AuditVerdict(TypedDict):
-    """结构化审查裁决 — 替代字符串匹配 "通过/驳回"。
-
-    字段:
-        verdict: "pass" | "reject"
-        reasons: 具体理由列表
-        required_fixes: 要求数据科学家修正的具体事项（驳回时必填）
-    """
-    verdict: Literal["pass", "reject"]
-    reasons: list[str]
-    required_fixes: list[str]
-
-
-AUDIT_JSON_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "verdict": {"type": "string", "enum": ["pass", "reject"]},
-        "reasons": {"type": "array", "items": {"type": "string"}},
-        "required_fixes": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["verdict", "reasons", "required_fixes"],
-}
-_AUDIT_SCHEMA_STR = "{\n  \"verdict\": \"pass\",\n  \"reasons\": [\"理由1\", \"理由2\"],\n  \"required_fixes\": []\n}"
-
-
-# ============ 状态定义 ============
-
-class MultiAgentState(TypedDict):
-    """多智能体系统全局状态"""
-    messages: Annotated[List[BaseMessage], lambda x, y: x + y]
+class MultiAgentState(TypedDict, total=False):
+    messages: Annotated[list[BaseMessage], lambda x, y: x + y]
     current_csv_path: str
-    execution_logs: List[str]
-    audit_result: Optional[dict]  # AuditVerdict 结构化 dict（Phase 3: 不再用字符串）
-    data_scientist_report: Optional[str]  # 数据科学家报告
-    chief_scientist_report: Optional[str]  # 首席专家报告
-    rejection_count: int  # 驳回次数
-    task_status: str  # pending/data_processing/auditing/diagnosis/failed/complete
+    execution_logs: list[str]
+    data_scientist_report: str | None
+    audit_advisory: str | None
+    chief_scientist_report: str | None
+    chief_truncated: bool
 
 
-# ============ LLM 工厂 ============
+# ═══════════════════════════════════════════════════════════════════════
+# 进度回调 (由 Thread 注入)
+# ═══════════════════════════════════════════════════════════════════════
 
-def create_llm(api_key: str, base_url: str, model_name: str) -> BaseChatModel:
-    """使用显式参数创建 LLM 实例（与主应用 AI 诊断共用配置）"""
-    if not api_key:
-        raise ValueError("API Key 未配置，请先在 AI 模型配置中设置")
-    return ChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        base_url=base_url,
-        streaming=True,
-    )
+ProgressCallback = Any  # callable(str) → None
 
 
-# ============ 节点工厂（上下文感知版） ============
+# ═══════════════════════════════════════════════════════════════════════
+# 节点工厂 (AIClient-backed, Phase 5 线性)
+# ═══════════════════════════════════════════════════════════════════════
 
-def _make_nodes(llm: BaseChatModel, data_context: dict | None = None):
-    """创建节点函数，捕获共享的 LLM 实例。
 
-    Args:
-        llm: 大语言模型实例
-        data_context: 来自 ui/ai_diagnosis.py _build_data_context() 的结构化上下文，
-                      用于动态注入数据类型防火墙规则、清洗统计、模板信息。
+def _make_nodes(data_context: dict | None = None,
+                progress: ProgressCallback = None):
+    """创建三个线性节点，全部经 AIClient (enable_thinking=False)。
+
+    Phase 6 输入预算：
+    - advisor: DS 详报裁剪到 ~2000 token 预算
+    - chief: DS 摘要(1500 token) + 审查意见(800 token)，精炼综合
+    - chief max_tokens 不超过 ctx - prompt估算 - margin，上限 4096
     """
     ctx_block = build_context_block(data_context)
 
-    # 预格式化各角色的系统提示词，注入上下文块
     ds_prompt = DATA_SCIENTIST_PROMPT_TPL.format(data_context=ctx_block)
-    auditor_prompt = DATA_AUDITOR_PROMPT_TPL.format(
-        data_context=ctx_block, audit_schema=_AUDIT_SCHEMA_STR,
-    )
+    advisor_prompt = DATA_ADVISOR_PROMPT_TPL.format(data_context=ctx_block)
     chief_prompt = CHIEF_SCIENTIST_PROMPT_TPL.format(
-        data_context=ctx_block,
-        json_schema=_JSON_SCHEMA_STR,
+        data_context=ctx_block, json_schema=_JSON_SCHEMA_STR,
     )
 
+    def _emit(msg: str) -> None:
+        if progress and callable(progress):
+            try:
+                progress(msg)
+            except Exception:
+                pass
+
+    # ── 节点 1: 数据科学家 ──
     def data_scientist_node(state: MultiAgentState) -> MultiAgentState:
-        rej_count = state.get("rejection_count", 0)
-        system_msg = SystemMessage(content=ds_prompt)
-        messages = [system_msg] + state.get("messages", [])
-        response = llm.invoke(messages)
-        log_entry = (
-            f"[DataScientist] input_msgs={len(state.get('messages',[]))} "
-            f"ouput_len={len(str(response.content))} rejection_count={rej_count}"
+        _emit("数据科学家分析中…")
+        t0 = time.time()
+
+        raw = _invoke_llm(
+            system_prompt=ds_prompt,
+            user_prompt=str(state.get("messages", [HumanMessage(content="分析数据")])[-1].content),
+            max_tokens=4096,
         )
-        new_logs = list(state.get("execution_logs", [])) + [log_entry]
+        elapsed = time.time() - t0
+
+        new_logs = list(state.get("execution_logs", [])) + [
+            f"[DataScientist] {len(raw)} chars in {elapsed:.0f}s"
+        ]
+        _emit(f"数据科学家完成 ({elapsed:.0f}s, {len(raw)} chars)")
+
         return {
-            "messages": [response],
-            "task_status": "data_processing",
-            "data_scientist_report": str(response.content),
+            "messages": [AIMessage(content=raw)],
+            "data_scientist_report": raw,
             "current_csv_path": state.get("current_csv_path", ""),
             "execution_logs": new_logs,
-            "audit_result": state.get("audit_result"),
+            "audit_advisory": state.get("audit_advisory"),
             "chief_scientist_report": state.get("chief_scientist_report"),
-            "rejection_count": rej_count,
         }
 
-    def auditor_node(state: MultiAgentState) -> MultiAgentState:
-        import json, re
+    # ── 节点 2: 审核顾问 (顾问式 — 不裁决, 输入裁剪) ──
+    def advisor_node(state: MultiAgentState) -> MultiAgentState:
+        _emit("审核员复核中…")
+        t0 = time.time()
 
-        audit_user_prompt = f"""请审查以下数据科学家的工作成果：
-
-{state.get('data_scientist_report', '无报告')}
-
-请：
-1. 结合上方数据上下文判断处理路径是否正确（光纤 vs 通用）
-2. 检查滤波截止频率是否合理
-3. 检查数据处理是否符合物理规律
-4. 检查是否有异常遗漏
-
-请严格按照系统提示词中的 JSON 格式输出审查结果（verdict + reasons + required_fixes）。"""
-
-        messages = [SystemMessage(content=auditor_prompt), HumanMessage(content=audit_user_prompt)]
-        response = llm.invoke(messages)
-        raw = str(response.content)
-
-        # ── Phase 3: 结构化裁决，杜绝字符串匹配 ──
-        verdict_dict: dict | None = None
-        parse_error: str | None = None
-        try:
-            # 提取 JSON 块
-            m = re.search(r'\{[\s\S]*\}', raw)
-            json_str = m.group(0) if m else raw
-            verdict_dict = json.loads(json_str)
-            # 校验必填字段
-            if verdict_dict.get("verdict") not in ("pass", "reject"):
-                parse_error = f"verdict 字段非法: {verdict_dict.get('verdict')!r}"
-                verdict_dict = None
-            if not isinstance(verdict_dict.get("reasons"), list) or not verdict_dict["reasons"]:
-                parse_error = "reasons 缺失或非数组"
-                verdict_dict = None
-        except (json.JSONDecodeError, AttributeError, KeyError) as e:
-            parse_error = str(e)
-
-        if verdict_dict is None:
-            # 裁决 JSON 非法 → 抛错，绝不默认通过
-            raise ValueError(
-                f"Auditor 未产出合法 AuditVerdict JSON：{parse_error}\n"
-                f"原始输出（前 500 字）: {raw[:500]}"
-            )
-
-        verdict = verdict_dict["verdict"]
-        reasons = verdict_dict.get("reasons", [])
-        required_fixes = verdict_dict.get("required_fixes", [])
-        is_approved = (verdict == "pass")
-        new_rejection_count = state.get("rejection_count", 0) + (0 if is_approved else 1)
-
-        # ── 结构化执行日志 ──
-        log_entry = (
-            f"[Auditor] verdict={verdict} rejection_count={new_rejection_count} "
-            f"reasons={reasons[:3]} "
-            + (f"fixes={required_fixes[:3]}" if not is_approved else "")
+        ds_report = state.get("data_scientist_report") or "无报告"
+        # Phase 6: 裁剪 DS 报告到 ~2000 token 预算 (避免超 ctx)
+        ds_trimmed = _trim_report_for_budget(ds_report, 2000)
+        if len(ds_trimmed) < len(ds_report):
+            _emit("审核员 DS 输入已裁剪以适应窗口")
+        advisory_prompt = (
+            f"请审查以下数据科学家的工作成果，给出你的审查意见：\n\n{ds_trimmed}\n\n"
+            "请指出发现的问题、风险、遗漏之处，以及需补充验证的内容。"
+            "\n\n注意：你是顾问，只提建议供首席参考，不做出 pass/reject 决定。"
         )
-        new_logs = list(state.get("execution_logs", [])) + [log_entry]
 
-        # ── 驳回时把 required_fixes 注入下一轮 data_scientist 的输入 ──
-        new_messages = list(state.get("messages", [])) + [response]
-        if not is_approved and required_fixes and new_rejection_count < 3:
-            fix_text = "【审查员驳回 —— 请按以下修正要求重新处理】\n" + "\n".join(
-                f"- {f}" for f in required_fixes
-            )
-            new_messages.append(HumanMessage(content=fix_text))
+        # Advisor 输出上限 2048 (意见通常精炼)
+        max_tok = _safe_max_tokens(advisor_prompt, advisory_prompt, 2048)
+        raw = _invoke_llm(advisor_prompt, advisory_prompt, max_tokens=max_tok)
+        advisory = _extract_advisory_text(raw)
+        elapsed = time.time() - t0
+
+        new_logs = list(state.get("execution_logs", [])) + [
+            f"[Advisor] {len(raw)} chars in {elapsed:.0f}s (max_tok={max_tok})"
+        ]
+        _emit(f"审核员完成 ({elapsed:.0f}s, {len(raw)} chars)")
+
+        # 注入审查意见到 messages (供 chief 读取)
+        new_messages = list(state.get("messages", [])) + [
+            AIMessage(content=f"【审核顾问意见】\n{advisory}" if advisory else "【审核顾问意见】\n(未产出具体意见)")
+        ]
 
         return {
             "messages": new_messages,
-            "task_status": "auditing",
-            "audit_result": verdict_dict,
-            "rejection_count": new_rejection_count,
+            "audit_advisory": advisory,
             "current_csv_path": state.get("current_csv_path", ""),
             "execution_logs": new_logs,
             "data_scientist_report": state.get("data_scientist_report"),
             "chief_scientist_report": state.get("chief_scientist_report"),
         }
 
+    # ── 节点 3: 首席专家 (精炼综合 + 截断降级) ──
     def chief_scientist_node(state: MultiAgentState) -> MultiAgentState:
-        audit = state.get("audit_result") or {}
-        reasons_str = "\n".join(f"- {r}" for r in audit.get("reasons", [])) if isinstance(audit, dict) else "（无结构化裁决）"
-        diagnosis_prompt = f"""基于以下材料，进行深度物理诊断并生成严格 JSON 格式的最终报告：
+        _emit("首席综合中…")
+        t0 = time.time()
 
-数据科学家报告：
-{state.get('data_scientist_report', '无')}
+        ds_text = state.get("data_scientist_report") or "无报告"
+        advisory = state.get("audit_advisory") or ""
 
-审查员裁决 ({audit.get('verdict', '?')}):
-{reasons_str}
+        # Phase 6: 不灌 DS 全文 — 裁剪到 1500 token 摘要 + 800 token 审查意见
+        ds_trimmed = _trim_report_for_budget(ds_text, 1500)
+        adv_trimmed = _trim_report_for_budget(advisory, 800)
+        if len(ds_trimmed) < len(ds_text):
+            _emit("首席 DS 输入已裁剪以适应窗口")
 
-请：
-1. 结合知识库进行物理诊断
-2. 分析材料力学行为
-3. 根据数据类型选择诊断路径（光纤 → 波长/应变/温度；通用 → 趋势/异常/完整性）
-4. 严格按照上方系统提示词中的 JSON schema 输出报告
-"""
+        diagnosis_prompt = (
+            f"你是首席传感专家，请基于以下材料输出精炼综合诊断（严格 JSON）：\n\n"
+            f"【数据科学家结论/要点（摘要）】\n{ds_trimmed}\n\n"
+            f"【审核顾问审查意见】\n{adv_trimmed if adv_trimmed else '(无)'}\n\n"
+            "要求：\n"
+            "1. 只做综合判断、简明扼要 — 不要复述数据科学家的推导细节（细节已单独保留）\n"
+            "2. 对审核顾问指出的问题做实质性回应\n"
+            "3. 将数值转化为物理诊断结论\n"
+            "4. 严格按照 JSON schema 输出，只输出 JSON，不要 markdown 包裹，不要多余文字"
+        )
 
-        messages = [SystemMessage(content=chief_prompt), HumanMessage(content=diagnosis_prompt)]
-        response = llm.invoke(messages)
+        # Phase 6: 安全计算 max_tokens (不超过 ctx 可用空间)
+        max_tok = _safe_max_tokens(chief_prompt, diagnosis_prompt, 3072)
+        truncation_occurred = False
+        raw = ""
+
+        try:
+            raw = _invoke_llm(chief_prompt, diagnosis_prompt, max_tokens=max_tok)
+        except AIClientTruncationError as e:
+            truncation_occurred = True
+            _emit(f"首席输出截断 (max_tok={max_tok}), 降级保底")
+            # 尝试取出部分内容
+            partial = getattr(e, 'partial_content', '') or ''
+            if partial and partial.strip():
+                raw = partial.strip()
+            else:
+                raw = ""
+
+        elapsed = time.time() - t0
+        new_logs = list(state.get("execution_logs", [])) + [
+            f"[Chief] {len(raw)} chars in {elapsed:.0f}s (max_tok={max_tok}"
+            + (", TRUNCATED" if truncation_occurred else "") + ")"
+        ]
+
+        if truncation_occurred:
+            _emit(f"首席完成 (截断降级, {len(raw)} chars, {elapsed:.0f}s)")
+        else:
+            _emit(f"首席专家完成 ({elapsed:.0f}s, {len(raw)} chars)")
 
         return {
-            "messages": [response],
-            "task_status": "diagnosis",
-            "chief_scientist_report": str(response.content),
+            "messages": [AIMessage(content=raw)],
+            "chief_scientist_report": raw,
+            "chief_truncated": truncation_occurred,
             "current_csv_path": state.get("current_csv_path", ""),
-            "execution_logs": state.get("execution_logs", []),
-            "audit_result": state.get("audit_result"),
+            "execution_logs": new_logs,
             "data_scientist_report": state.get("data_scientist_report"),
-            "rejection_count": state.get("rejection_count", 0),
+            "audit_advisory": state.get("audit_advisory"),
         }
 
-    return data_scientist_node, auditor_node, chief_scientist_node
+    return data_scientist_node, advisor_node, chief_scientist_node
 
 
-def should_continue_workflow(state: MultiAgentState) -> str:
-    """判断工作流走向 — Phase 3: 基于结构化 AuditVerdict 确定性路由。
+# ═══════════════════════════════════════════════════════════════════════
+# 图构建 (Phase 5: 线性, 无回环)
+# ═══════════════════════════════════════════════════════════════════════
 
-    - pass → chief_scientist
-    - reject 且 count < 3 → data_scientist（required_fixes 已注入 messages）
-    - reject 且 count >= 3 → 显式失败终态（task_status="failed"，不再兜圈子）
-    - auditor 产出非法 JSON → 已在 auditor_node 内部抛 ValueError
+
+def create_multi_agent_graph(data_context: dict | None = None,
+                             progress: ProgressCallback = None):
+    """构建线性多智能体图: START → DS → Advisor → Chief → END。
+
+    不再需要 should_continue_workflow / 条件边 / 驳回 / 重跑。
     """
-    task_status = state.get("task_status", "")
-    rejection_count = state.get("rejection_count", 0)
-    audit_result = state.get("audit_result") or {}
-
-    # ── 安全阀：驳回 ≥3 次 → 显式失败终态 ──
-    if rejection_count >= 3:
-        all_reasons: list[str] = []
-        all_fixes: list[str] = []
-        # 汇总历次 reasons + required_fixes（从 audit_result 链中收集）
-        verdict = audit_result if isinstance(audit_result, dict) else {}
-        all_reasons = list(verdict.get("reasons", []))
-        all_fixes = list(verdict.get("required_fixes", []))
-        # 写入终态日志
-        # （execution_logs 由 auditor_node 写入，这里不再重复写 state — 只在返回时设 task_status）
-        return "failed"
-
-    # ── 从 data_scientist 节点出来 → 进入 auditor ──
-    if task_status == "data_processing":
-        return "auditor"
-
-    # ── 从 auditor 节点出来 → 基于结构化裁决路由 ──
-    if task_status == "auditing":
-        verdict = audit_result.get("verdict") if isinstance(audit_result, dict) else None
-        if verdict == "pass":
-            return "chief_scientist"
-        if verdict == "reject":
-            return "data_scientist"
-        # 裁决不明确 → 按 reject 处理（安全侧）
-        return "data_scientist"
-
-    # ── 从 chief_scientist 出来，结束 ──
-    if task_status == "diagnosis":
-        return END
-
-    return END
-
-
-# ============ 创建工作流图 ============
-
-def create_multi_agent_graph(llm: BaseChatModel, data_context: dict | None = None):
-    """创建多智能体工作流
-
-    Args:
-        llm: 大语言模型实例
-        data_context: 可选的结构化数据上下文（模板、清洗统计、数据类型等）
-    """
-    ds_node, aud_node, chief_node = _make_nodes(llm, data_context)
+    ds_node, adv_node, chief_node = _make_nodes(data_context, progress)
 
     workflow = StateGraph(MultiAgentState)
-
     workflow.add_node("data_scientist", ds_node)
-    workflow.add_node("auditor", aud_node)
+    workflow.add_node("advisor", adv_node)
     workflow.add_node("chief_scientist", chief_node)
 
     workflow.set_entry_point("data_scientist")
-
-    workflow.add_conditional_edges(
-        "data_scientist",
-        should_continue_workflow,
-        {"auditor": "auditor", "chief_scientist": "chief_scientist", "failed": END, END: END}
-    )
-
-    workflow.add_conditional_edges(
-        "auditor",
-        should_continue_workflow,
-        {"chief_scientist": "chief_scientist", "data_scientist": "data_scientist", "failed": END, END: END}
-    )
-
+    workflow.add_edge("data_scientist", "advisor")
+    workflow.add_edge("advisor", "chief_scientist")
     workflow.add_edge("chief_scientist", END)
 
     return workflow.compile()
 
 
-# ============ 运行入口 ============
+# ═══════════════════════════════════════════════════════════════════════
+# 运行入口 (Phase 5: 简化返回结构)
+# ═══════════════════════════════════════════════════════════════════════
+
 
 def run_multi_agent(
     user_input: str,
-    api_key: str = "",
-    base_url: str = "",
-    model_name: str = "deepseek-chat",
-    csv_path: str = None,
+    csv_path: str | None = None,
     data_context: dict | None = None,
+    progress: ProgressCallback = None,
 ) -> dict:
-    """
-    运行多智能体审查系统
+    """运行多智能体顾问系统 (Phase 5: 线性单遍)。
 
     Args:
         user_input: 用户的分析需求
-        api_key: API 密钥（与主应用 AI 诊断共用）
-        base_url: API 地址
-        model_name: 模型名称
         csv_path: 可选的 CSV 数据路径
-        data_context: 结构化数据上下文 dict（来自 ui/ai_diagnosis.py _build_data_context()），
-                      自动注入所有 Agent 系统提示词，含数据类型防火墙、模板信息、清洗统计
+        data_context: 来自 _build_data_context() 的结构化上下文
+        progress: 可选的进度回调 callable(str)
 
     Returns:
-        dict: 包含各阶段报告和最终诊断结果
+        dict: {
+            chief_report: str,              # 首席综合报告 raw str (含结构化 JSON)
+            data_scientist_text: str,        # 数据科学家详报 (完整)
+            audit_advisory: str | None,      # 审核顾问审查意见 (自由文本)
+            execution_logs: list[str],       # 各步日志
+            chief_truncated: bool,           # 首席输出是否被截断 (降级保底标记)
+        }
     """
-    llm = create_llm(api_key, base_url, model_name)
-    graph = create_multi_agent_graph(llm, data_context)
+    graph = create_multi_agent_graph(data_context, progress)
 
     initial_state = MultiAgentState(
         messages=[HumanMessage(content=user_input)],
         current_csv_path=csv_path or "",
         execution_logs=[],
-        audit_result=None,
         data_scientist_report=None,
+        audit_advisory=None,
         chief_scientist_report=None,
-        rejection_count=0,
-        task_status="pending"
+        chief_truncated=False,
     )
 
     result = graph.invoke(initial_state, config={"recursion_limit": 50})
 
-    task_status = result.get("task_status", "complete")
-    audit = result.get("audit_result") or {}
     return {
-        "data_scientist_report": result.get("data_scientist_report", ""),
-        "audit_result": audit,
-        "chief_scientist_report": result.get("chief_scientist_report", ""),
-        "final_report": result.get("messages", [{}])[-1].content if result.get("messages") else "",
-        "task_status": task_status,
-        "rejection_count": result.get("rejection_count", 0),
+        "chief_report": result.get("chief_scientist_report", ""),
+        "data_scientist_text": result.get("data_scientist_report", ""),
+        "audit_advisory": result.get("audit_advisory"),
         "execution_logs": result.get("execution_logs", []),
-        # 显式失败标志
-        "is_failed": task_status == "failed",
+        "chief_truncated": result.get("chief_truncated", False),
     }
 
 
-if __name__ == "__main__":
-    print("=== DataProcessor Pro 多智能体审查系统 ===")
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    api_base = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com")
-    if not api_key:
-        print("请设置 DEEPSEEK_API_KEY 环境变量或通过 UI 配置模型")
-    else:
-        result = run_multi_agent(
-            "请分析当前数据文件中的噪声并生成处理报告",
-            api_key=api_key,
-            base_url=api_base,
-        )
-        print("数据科学家报告:", result["data_scientist_report"][:200], "...")
-        print("审查结果:", result["audit_result"])
-        print("首席专家报告:", result["chief_scientist_report"][:200], "...")
+# ═══════════════════════════════════════════════════════════════════════
+# QThread worker (Phase 5: 不变, 仍 emit dict)
+# ═══════════════════════════════════════════════════════════════════════
+
+import sys as _sys
+if "PyQt6" in _sys.modules or True:  # always available for type hints
+    try:
+        from PyQt6.QtCore import QThread, pyqtSignal
+
+        class MultiAgentThread(QThread):
+            """多智能体顾问 QThread — 不阻塞 UI。
+
+            Signals:
+                progress(str): 当前节点
+                finished(dict): 完成时发射 {chief_report, data_scientist_text, audit_advisory, ...}
+                error(str): 错误消息
+            """
+
+            progress = pyqtSignal(str)
+            finished = pyqtSignal(dict)
+            error = pyqtSignal(str)
+
+            def __init__(self, user_input: str, csv_path: str | None = None,
+                         data_context: dict | None = None,
+                         parent=None):
+                super().__init__(parent)
+                self.user_input = user_input
+                self.csv_path = csv_path
+                self.data_context = data_context
+
+            def run(self) -> None:
+                try:
+                    result = run_multi_agent(
+                        user_input=self.user_input,
+                        csv_path=self.csv_path,
+                        data_context=self.data_context,
+                        progress=lambda msg: self.progress.emit(msg),
+                    )
+                    self.finished.emit(result)
+                except Exception as e:
+                    import traceback
+                    self.error.emit(f"{e}\n{traceback.format_exc()}")
+
+    except ImportError:
+        pass  # headless test — no Qt available

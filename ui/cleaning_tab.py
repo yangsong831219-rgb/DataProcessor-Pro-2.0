@@ -16,6 +16,8 @@ class CleaningTabWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._anomaly_info: dict = {}  # 结构化异常信息，供 provider 读取
+        self._cleaning_has_run: bool = False  # 独立于 anomaly_info（0 异常时仍为 True）
         self._build_ui()
 
     def _build_ui(self):

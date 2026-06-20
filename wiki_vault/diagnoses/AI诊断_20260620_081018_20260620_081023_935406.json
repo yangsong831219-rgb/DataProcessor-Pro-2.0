@@ -1,0 +1,108 @@
+{
+  "schema_version": "1.1",
+  "timestamp": "2026-06-20 08:10:05",
+  "backend": "local",
+  "model": "qwen3.5-9b",
+  "selected_sources": [
+    "数据文件",
+    "数据清洗",
+    "数据分析"
+  ],
+  "data_source_snapshot": [
+    "【数据文件】\n模板: ENLIGHT（光纤传感）公式版\n类型: 光纤光栅传感器数据\n规模: 15657 行 x 34 列\n时间列: FBG_A1\n时间范围: 1535-01-01 00:00:00 ~ 1535-12-01 00:00:00\n采样间隔: ~0ms, 非均匀\n列→传感器: Timestamp, A1G1, A1G2, A2G1, A2G2, B1G1, B1G2, B2G1, B2G2, FBG_A1(w1-类型-位置), FBG_A2(w2-类型-位置), FBG_B1(w3-类型-位置), FBG_D1(w4-类型-位置), FBG_F1(w5-类型-位置), FBG_F2(w6-类型-位置), FBG_G1(w7-类型-位置), FBG_G2(w8-类型-位置), Timestamp_anomaly, A1G1_anomaly, A1G2_anomaly, A2G1_anomaly, A2G2_anomaly, B1G1_anomaly, B1G2_anomaly, B2G1_anomaly, B2G2_anomaly, FBG_A1_anomaly, FBG_A2_anomaly, FBG_B1_anomaly, FBG_D1_anomaly, ... (共 34 列)\n数值列统计:\n  A1G1: 有效=15656, 缺失=1, 均值=9.5474, σ=104.6903, 范围=[-73.6500, 488.8960]\n  A1G2: 有效=15656, 缺失=1, 均值=-0.8718, σ=3.5639, 范围=[-5.4400, 4.5280]\n  A2G1: 有效=15656, 缺失=1, 均值=12.6906, σ=105.1417, 范围=[-71.9970, 503.7040]\n  A2G2: 有效=15656, 缺失=1, 均值=-0.5142, σ=3.5501, 范围=[-5.1610, 4.8530]\n  B1G1: 有效=15656, 缺失=1, 均值=-1.6435, σ=99.6500, 范围=[-119.1030, 396.3460]\n  B1G2: 有效=15656, 缺失=1, 均值=8.8173, σ=93.0426, 范围=[-72.2370, 433.0150]\n  B2G1: 有效=15656, 缺失=1, 均值=-2.1965, σ=118.7176, 范围=[-142.8480, 455.5760]\n  B2G2: 有效=15656, 缺失=1, 均值=8.5653, σ=103.8072, 范围=[-74.1220, 495.9860]",
+    "【数据清洗】\n已清洗，未发现异常，相邻差值阈值=1.0\n策略: linear | 规则: 相邻差值检测(阈值=1.0), 缺失值检测",
+    "【数据分析】\n  A1_应变(με): n=15535 | 均值=21.987 | σ=91.371 | 范围=[-21.730, 458.046] (479.777) | 漂移≈-0.9408με/千样本 | 显著波动(CV≥20%)\n  A1_温度(°C): n=15535 | 均值=-0.771 | σ=2.846 | 范围=[-4.400, 3.532] (7.932) | 漂移≈0.4076με/千样本 | 显著波动(CV≥20%)\n  A2_应变(με): n=15535 | 均值=18.949 | σ=92.771 | 范围=[-26.903, 457.494] (484.397) | 漂移≈-1.0759με/千样本 | 显著波动(CV≥20%)\n  A2_温度(°C): n=15535 | 均值=-0.412 | σ=2.721 | 范围=[-3.957, 3.690] (7.647) | 漂移≈0.3953με/千样本 | 显著波动(CV≥20%)"
+  ],
+  "kb_hits": [
+    {
+      "id": "clean_data_modified_note",
+      "severity": "info",
+      "objects": null,
+      "meaning": "数据已经过异常填充处理，后续统计基于清洗后数据。",
+      "mechanism": "填充(如中值)会改变局部分布；解读统计量时需知数据被修改过。",
+      "recommendation": "解读特征/趋势时考虑填充影响；异常密集处尤需注意。"
+    },
+    {
+      "id": "apparent_strain_primer",
+      "severity": "info",
+      "objects": null,
+      "meaning": "表观应变背景：FBG 测到的 Δλ 同时含温度与应变贡献，需解耦。",
+      "mechanism": "封装热失配产生的“假应变”随温度变化，是双栅解耦/补偿要消除的主要对象。",
+      "recommendation": "解读 ε 时务必区分“真实机械应变”与“封装诱导表观应变”。"
+    }
+  ],
+  "ai_diagnosis": {
+    "diagnosis_json": {
+      "diagnosis_summary": {
+        "data_type": "fiber_optic",
+        "template_name": "ENLIGHT（光纤传感）公式版",
+        "data_quality": "good",
+        "anomaly_count": 0,
+        "overall_assessment": "数据清洗完成，无异常点。统计显示显著波动（CV≥20%），符合张拉标定实验特征，但需警惕封装界面滑移导致的重复性下降。",
+        "assessment_en": "Data cleaned with zero anomalies; significant statistical fluctuations observed, consistent with tensile testing but indicating potential packaging interface slip."
+      },
+      "data_quality_assessment": {
+        "completeness": "完整性高，各列有效数据占比>99.9%（仅1个缺失点），时间跨度覆盖全年（1535-01-01至12-01）。",
+        "consistency": "一致性良好，清洗策略已执行线性插值与相邻差值检测，未发现离群点。",
+        "anomaly_patterns": [
+          "无检测到异常数据点",
+          "统计量显示高波动性（CV≥20%），属实验载荷变化而非数据噪声"
+        ],
+        "recommendations": [
+          "确认缺失点位置是否对应设备重启或通讯中断",
+          "后续分析需重点关注‘重复性’指标，因物理滑移可能导致数据离散度增大"
+        ]
+      },
+      "sensor_analysis": [
+        {
+          "sensor_id": "A1/A2 (PI-coated)",
+          "status": "warning",
+          "statistics": {
+            "mean": 20.468,
+            "std": 92.071,
+            "min": -24.3165,
+            "max": 457.77
+          },
+          "findings": "A1/A2为聚酰亚胺涂层双光栅。数据显示显著波动（CV≥20%），符合张拉实验特征。需结合用户经验判断A2是否存在胶水锚固不紧密导致的滑移。",
+          "suggestions": "对比A1与A2在相同载荷下的波长差变化趋势，若A2的滞后环面积明显大于A1，则证实滑移假设。"
+        },
+        {
+          "sensor_id": "B1/B2 (Acrylate-coated)",
+          "status": "warning",
+          "statistics": {
+            "mean": 5.83,
+            "std": 106.479,
+            "min": -115.725,
+            "max": 469.661
+          },
+          "findings": "B1/B2为丙烯酸酯涂层双光栅。观察到显著的‘假应变’漂移现象（均值微小但波动大），符合用户描述的UV胶固化后界面滑移特征（光栅1波长增、光栅2波长减）。",
+          "suggestions": "计算B1与B2的差值序列，若呈现随时间单向漂移趋势而非对称回零，需修正解耦算法以剔除热/封装诱导应变。"
+        }
+      ],
+      "physical_diagnosis": {
+        "phenomenon": "光纤光栅在张拉循环中表现出非线性迟滞与重复性偏差，主要归因于封装材料（353ND胶水 vs UV胶）与裸纤界面的微滑移及热失配效应。",
+        "possible_causes": [
+          "A2#胶水锚固力不足，导致光纤在金属槽内发生微观相对位移（滑移）",
+          "B1#光栅周围UV胶固化收缩或热膨胀系数不匹配，产生持续的界面剪切应力，导致‘假应变’累积漂移",
+          "环境温度波动引起的封装材料热失配（TCE mismatch）未完全解耦"
+        ],
+        "severity": "medium",
+        "recommended_actions": [
+          "执行双光栅差值分析：(λ1 - λ2) vs 位移，滑移会导致该差值在退载时无法归零",
+          "检查B系列数据中光栅1与光栅2的漂移方向是否相反（如用户所述），若是则确认为封装应力问题",
+          "建议引入温度补偿通道或使用双波长法进一步解耦温度影响"
+        ]
+      },
+      "raw_data_preview": {
+        "suggested_filter": "低通滤波截止频率建议设为载荷循环频率的1/5以上，以保留张拉波形细节但滤除高频噪声",
+        "suggested_formula": "对于B系列传感器，建议采用双光栅差分公式：ε_effective = (Δλ_FBG1 - Δλ_FBG2) / K_sensitivity，以消除共模的封装漂移",
+        "notes": "当前数据已清洗，但物理层面的‘假应变’（由胶水滑移引起）无法通过数据清洗去除，必须在物理模型中修正。"
+      }
+    },
+    "diagnosis_raw": "{\n  \"diagnosis_summary\": {\n    \"data_type\": \"fiber_optic\",\n    \"template_name\": \"ENLIGHT（光纤传感）公式版\",\n    \"data_quality\": \"good\",\n    \"anomaly_count\": 0,\n    \"overall_assessment\": \"数据清洗完成，无异常点。统计显示显著波动（CV≥20%），符合张拉标定实验特征，但需警惕封装界面滑移导致的重复性下降。\",\n    \"assessment_en\": \"Data cleaned with zero anomalies; significant statistical fluctuations observed, consistent with tensile testing but indicating potential packaging interface slip.\"\n  },\n  \"data_quality_assessment\": {\n    \"completeness\": \"完整性高，各列有效数据占比>99.9%（仅1个缺失点），时间跨度覆盖全年（1535-01-01至12-01）。\",\n    \"consistency\": \"一致性良好，清洗策略已执行线性插值与相邻差值检测，未发现离群点。\",\n    \"anomaly_patterns\": [\n      \"无检测到异常数据点\",\n      \"统计量显示高波动性（CV≥20%），属实验载荷变化而非数据噪声\"\n    ],\n    \"recommendations\": [\n      \"确认缺失点位置是否对应设备重启或通讯中断\",\n      \"后续分析需重点关注‘重复性’指标，因物理滑移可能导致数据离散度增大\"\n    ]\n  },\n  \"sensor_analysis\": [\n    {\n      \"sensor_id\": \"A1/A2 (PI-coated)\",\n      \"status\": \"warning\",\n      \"statistics\": {\n        \"mean\": 20.468,\n        \"std\": 92.071,\n        \"min\": -24.3165,\n        \"max\": 457.77\n      },\n      \"findings\": \"A1/A2为聚酰亚胺涂层双光栅。数据显示显著波动（CV≥20%），符合张拉实验特征。需结合用户经验判断A2是否存在胶水锚固不紧密导致的滑移。\",\n      \"suggestions\": \"对比A1与A2在相同载荷下的波长差变化趋势，若A2的滞后环面积明显大于A1，则证实滑移假设。\"\n    },\n    {\n      \"sensor_id\": \"B1/B2 (Acrylate-coated)\",\n      \"status\": \"warning\",\n      \"statistics\": {\n        \"mean\": 5.83,\n        \"std\": 106.479,\n        \"min\": -115.725,\n        \"max\": 469.661\n      },\n      \"findings\": \"B1/B2为丙烯酸酯涂层双光栅。观察到显著的‘假应变’漂移现象（均值微小但波动大），符合用户描述的UV胶固化后界面滑移特征（光栅1波长增、光栅2波长减）。\",\n      \"suggestions\": \"计算B1与B2的差值序列，若呈现随时间单向漂移趋势而非对称回零，需修正解耦算法以剔除热/封装诱导应变。\"\n    }\n  ],\n  \"physical_diagnosis\": {\n    \"phenomenon\": \"光纤光栅在张拉循环中表现出非线性迟滞与重复性偏差，主要归因于封装材料（353ND胶水 vs UV胶）与裸纤界面的微滑移及热失配效应。\",\n    \"possible_causes\": [\n      \"A2#胶水锚固力不足，导致光纤在金属槽内发生微观相对位移（滑移）\",\n      \"B1#光栅周围UV胶固化收缩或热膨胀系数不匹配，产生持续的界面剪切应力，导致‘假应变’累积漂移\",\n      \"环境温度波动引起的封装材料热失配（TCE mismatch）未完全解耦\"\n    ],\n    \"severity\": \"medium\",\n    \"recommended_actions\": [\n      \"执行双光栅差值分析：(λ1 - λ2) vs 位移，滑移会导致该差值在退载时无法归零\",\n      \"检查B系列数据中光栅1与光栅2的漂移方向是否相反（如用户所述），若是则确认为封装应力问题\",\n      \"建议引入温度补偿通道或使用双波长法进一步解耦温度影响\"\n    ]\n  },\n  \"raw_data_preview\": {\n    \"suggested_filter\": \"低通滤波截止频率建议设为载荷循环频率的1/5以上，以保留张拉波形细节但滤除高频噪声\",\n    \"suggested_formula\": \"对于B系列传感器，建议采用双光栅差分公式：ε_effective = (Δλ_FBG1 - Δλ_FBG2) / K_sensitivity，以消除共模的封装漂移\",\n    \"notes\": \"当前数据已清洗，但物理层面的‘假应变’（由胶水滑移引起）无法通过数据清洗去除，必须在物理模型中修正。\"\n  }\n}"
+  },
+  "multi_agent": {
+    "report": "",
+    "raw_json": null
+  }
+}

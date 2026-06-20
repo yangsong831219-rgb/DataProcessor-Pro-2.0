@@ -178,13 +178,13 @@ class ProjectManagerWidget(QWidget):
         stats_layout = QFormLayout(stats_group)
         stats_layout.setSpacing(8)
 
-        self.project_stats_label = QLabel("项目数: 0")
+        self.project_stats_label = QLabel("0")
         stats_layout.addRow("项目数:", self.project_stats_label)
 
-        self.project_folders_label = QLabel("子文件夹: 0")
+        self.project_folders_label = QLabel("0")
         stats_layout.addRow("子文件夹:", self.project_folders_label)
 
-        self.project_files_count_label = QLabel("文件数: 0")
+        self.project_files_count_label = QLabel("0")
         stats_layout.addRow("文件数:", self.project_files_count_label)
 
         left_layout.addWidget(stats_group)
@@ -339,12 +339,13 @@ class ProjectManagerWidget(QWidget):
         """设置项目列表."""
         self.project_list_widget.clear()
         self.project_list_widget.addItems(items)
+        self.set_stats(len(items), 0, 0)
 
     def set_stats(self, project_count: int, folder_count: int, file_count: int):
         """更新项目统计信息."""
-        self.project_stats_label.setText(f"项目数: {project_count}")
-        self.project_folders_label.setText(f"子文件夹: {folder_count}")
-        self.project_files_count_label.setText(f"文件数: {file_count}")
+        self.project_stats_label.setText(str(project_count))
+        self.project_folders_label.setText(str(folder_count))
+        self.project_files_count_label.setText(str(file_count))
 
     # ── Current project ──
 
@@ -376,6 +377,7 @@ class ProjectManagerWidget(QWidget):
     def clear_tree(self):
         """清空项目文件树."""
         self.project_tree_widget.clear()
+        self.set_stats(self.project_list_widget.count(), 0, 0)
 
     def load_project_tree(self, root_path: str):
         """从文件系统递归加载项目目录树.
@@ -385,26 +387,35 @@ class ProjectManagerWidget(QWidget):
         """
         self.project_tree_widget.clear()
         if not root_path or not os.path.exists(root_path):
+            self.set_stats(self.project_list_widget.count(), 0, 0)
             return
         try:
             root = QTreeWidgetItem(
                 self.project_tree_widget,
                 [os.path.basename(root_path), "文件夹", "-"],
             )
-            self._load_folder_to_tree(root_path, root)
+            counts: dict[str, int] = {"dirs": 0, "files": 0}
+            self._load_folder_to_tree(root_path, root, counts)
             self.project_tree_widget.expandAll()
+            self.set_stats(
+                self.project_list_widget.count(), counts["dirs"], counts["files"])
         except Exception as e:
             print(f"加载项目树失败: {e}")
 
-    def _load_folder_to_tree(self, folder_path: str, parent_item: QTreeWidgetItem):
-        """递归加载文件夹内容到树."""
+    def _load_folder_to_tree(self, folder_path: str, parent_item: QTreeWidgetItem,
+                             counts: dict[str, int] | None = None):
+        """递归加载文件夹内容到树，同时统计子文件夹和文件数."""
+        if counts is None:
+            counts = {"dirs": 0, "files": 0}  # pyright: ignore[reportAssignmentType] # fallback
         try:
             for item_name in sorted(os.listdir(folder_path)):
                 item_path = os.path.join(folder_path, item_name)
                 if os.path.isdir(item_path):
+                    counts["dirs"] += 1
                     folder_item = QTreeWidgetItem(parent_item, [item_name, "文件夹", "-"])
-                    self._load_folder_to_tree(item_path, folder_item)
+                    self._load_folder_to_tree(item_path, folder_item, counts)
                 else:
+                    counts["files"] += 1
                     size = os.path.getsize(item_path)
                     size_str = self._format_size(size)
                     QTreeWidgetItem(parent_item, [item_name, "文件", size_str])

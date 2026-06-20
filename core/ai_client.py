@@ -5,6 +5,9 @@
 
 阶段一 (P0) 升级：generate() 不再吞异常返回空串，改为抛出 AIClientError
 类型化异常。调用方通过 generate_with_retry() 获得指数退避重试。
+
+阶段 4 (本地后端)：backend ∈ {online, local}；local 走独立 llama.cpp server
+或 Ollama HTTP (均 OpenAI 兼容)。app 进程内不加载模型权重。
 """
 
 from __future__ import annotations
@@ -12,8 +15,9 @@ from __future__ import annotations
 import json
 import os
 import time as _time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Generator, Optional, Tuple
 
+import requests as _requests  # 仅用于 health check（轻量 GET，不依赖 openai SDK）
 from pydantic import BaseModel
 
 from core.ai_errors import (
@@ -21,6 +25,7 @@ from core.ai_errors import (
     AIClientEmptyResponseError,
     AIClientNotConfiguredError,
     AIClientServerError,
+    AIClientTruncationError,
     classify_openai_error,
 )
 
@@ -28,6 +33,37 @@ from core.ai_errors import (
 # ═══════════════════════════════════════════════════════════════════
 # Schema 工具 — 将 Pydantic 模型转换为 LLM 提示词
 # ═══════════════════════════════════════════════════════════════════
+
+
+def _sanitize_json_text(json_str: str) -> str:
+    """修复 LLM 输出 JSON 中的常见问题（FBG 领域专有 + 通用）。
+
+    - 非法转义（LaTeX: \\Delta、\\lambda、\\varepsilon 等）→ 双重反斜杠
+    - 尾逗号（,} 或 ,]）→ 删除
+    - 首尾空白
+    """
+    _VALID_JSON_ESCAPES = frozenset('"\\/bfnrtu')
+    result: list[str] = []
+    i = 0
+    while i < len(json_str):
+        ch = json_str[i]
+        if ch == '\\' and i + 1 < len(json_str):
+            next_ch = json_str[i + 1]
+            if next_ch not in _VALID_JSON_ESCAPES:
+                # 非法转义 → 双重反斜杠（如 \D → \\D）
+                result.append('\\\\')
+            else:
+                result.append('\\')
+        else:
+            result.append(ch)
+        i += 1
+    cleaned = ''.join(result)
+
+    # 去尾逗号
+    import re as _re2
+    cleaned = _re2.sub(r',\s*([}\]])', r'\1', cleaned)
+
+    return cleaned.strip()
 
 
 def build_schema_prompt(models: list[type[BaseModel]]) -> str:
@@ -60,18 +96,71 @@ class AIClient:
     """OpenAI 兼容接口客户端.
 
     默认配置指向 DeepSeek-V4 Pro，可通过环境变量或参数覆盖。
+    支持 backend ∈ {online, local} 切换；local 走本地 HTTP 服务 (llama.cpp / Ollama)。
 
     Usage:
         client = AIClient()
         resp = client.generate("写一段总结", "你是一个写作专家")
     """
 
-    # 默认 DeepSeek 配置
+    # 默认 DeepSeek 在线配置
     DEFAULT_BASE_URL = 'https://api.deepseek.com/v1'
     DEFAULT_MODEL = 'deepseek-v4-pro'
 
+    # 默认本地 llama.cpp server 配置
+    DEFAULT_LOCAL_BASE_URL = 'http://127.0.0.1:8080/v1'
+    DEFAULT_LOCAL_MODEL = 'qwen3.5-9b'
+
     # 类级单例
     _instance: Optional['AIClient'] = None
+
+    # ═══════════════════════════════════════════════════════════════
+    # 后端配置 SSOT（从 ai_models_config.json 读取）
+    # ═══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _load_config_json() -> dict[str, Any]:
+        """加载 ai_models_config.json 全文（无缓存，每次读盘）。"""
+        cfg_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'ai_models_config.json',
+        )
+        if os.path.exists(cfg_path):
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return {}
+
+    @staticmethod
+    def get_backend() -> str:
+        """读取当前后端开关：'online' | 'local'（默认 online）。"""
+        cfg = AIClient._load_config_json()
+        return str(cfg.get('_backend', 'online')).strip().lower() or 'online'
+
+    @staticmethod
+    def get_local_config() -> dict[str, str]:
+        """读取本地后端配置（base_url / model_name / api_key / system_prompt）。
+
+        None 或缺键 → 填默认值；显式空字符串 "" 保留（允许用户主动清空以禁用）。
+        """
+        cfg = AIClient._load_config_json()
+        local = cfg.get('_local') or {}
+
+        def _str_or(key: str, default: str) -> str:
+            val = local.get(key)
+            if val is None:
+                return default
+            return str(val)
+
+        return {
+            'base_url': _str_or('base_url', AIClient.DEFAULT_LOCAL_BASE_URL),
+            'model_name': _str_or('model_name', AIClient.DEFAULT_LOCAL_MODEL),
+            'api_key': _str_or('api_key', 'not-needed'),
+            'system_prompt': _str_or('system_prompt', ''),
+        }
+
+    # ═══════════════════════════════════════════════════════════════
+    # 构造
+    # ═══════════════════════════════════════════════════════════════
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -88,26 +177,140 @@ class AIClient:
         if hasattr(self, '_initialized'):
             return
         self._initialized = True
+        self._stream_response: Any | None = None  # 当前活跃的流式响应，供 cancel 关闭
 
-        self.api_key = api_key or os.environ.get(
-            'DEEPSEEK_API_KEY',
-            '',
-        )
-        self.base_url = base_url or os.environ.get(
-            'DEEPSEEK_BASE_URL',
-            self.DEFAULT_BASE_URL,
-        )
-        self.model_name = model_name or os.environ.get(
-            'DEEPSEEK_MODEL',
-            self.DEFAULT_MODEL,
-        )
+        # ── 按 backend 选择默认值来源 ──
+        _backend = self.get_backend()
+        self._backend: str = _backend
+
+        if _backend == 'local':
+            _lc = self.get_local_config()
+            _default_key = str(_lc['api_key'])
+            _default_url = str(_lc['base_url'])
+            _default_model = str(_lc['model_name'])
+        else:
+            _default_key = os.environ.get('DEEPSEEK_API_KEY', '')
+            _default_url = os.environ.get('DEEPSEEK_BASE_URL', self.DEFAULT_BASE_URL)
+            _default_model = os.environ.get('DEEPSEEK_MODEL', self.DEFAULT_MODEL)
+
+        self.api_key = api_key or _default_key
+        self.base_url = base_url or _default_url
+        self.model_name = model_name or _default_model
         self._client = None
+
+    # ── backend 属性（只读） ──
+
+    @property
+    def backend(self) -> str:
+        """当前后端：'online' | 'local'."""
+        return self._backend
 
     # ── 公共 API ──
 
     def is_available(self) -> bool:
-        """检查 API Key 是否已配置."""
+        """检查当前后端是否可用.
+
+        - online: 需要 api_key 非空
+        - local:  不需要 api_key (llama.cpp server 无认证)，仅检查 base_url 非空
+        """
+        _be = getattr(self, '_backend', 'online')  # 兼容旧测试绕 __init__ 的场景
+        if _be == 'local':
+            return bool(self.base_url)
         return bool(self.api_key)
+
+    def _is_local_qwen(self) -> bool:
+        """本地方 Qwen3.5 模型（需要非思考模式注入）。"""
+        _be = getattr(self, '_backend', 'online')
+        if _be != 'local':
+            return False
+        mn = (self.model_name or '').lower()
+        return 'qwen' in mn or 'qwq' in mn
+
+    # ═══════════════════════════════════════════════════════════════
+    # 健康检查
+    # ═══════════════════════════════════════════════════════════════
+
+    def health_check(self, timeout: float = 5.0) -> bool:
+        """检查后端服务是否可达且健康.
+
+        本地后端：
+          - 先尝试 GET {host}/health (llama.cpp server 标准)
+          - 若 404，回退 GET {host}/api/tags (Ollama 兼容)
+        在线后端：
+          - GET {host}/v1/models (轻量探针)
+
+        Returns:
+            True 若健康
+
+        Raises:
+            AIClientServerError: 服务不可达/503 加载中/连接失败，
+                                信息明确指向“本地服务未启动”或相应原因
+        """
+        host = self.base_url.removesuffix('/v1').removesuffix('/')
+        _be = getattr(self, '_backend', 'online')
+        is_local = _be == 'local'
+
+        if is_local:
+            # ── 本地：先试 llama.cpp /health ──
+            endpoints = [f'{host}/health', f'{host}/api/tags']
+            last_status: int | None = None
+            last_body: str = ''
+            for ep in endpoints:
+                try:
+                    resp = _requests.get(ep, timeout=timeout)
+                    last_status = resp.status_code
+                    if resp.status_code == 200:
+                        # llama.cpp /health 返回 {"status":"ok"} 或类似
+                        # Ollama /api/tags 返回 {"models":[...]}
+                        return True
+                    if resp.status_code == 503:
+                        last_body = resp.text[:200]
+                except _requests.ConnectionError:
+                    continue  # 试下一个 endpoint
+                except _requests.Timeout:
+                    continue
+
+            # ── 所有尝试均失败 → 构造明确错误 ──
+            if last_status == 503:
+                raise AIClientServerError(
+                    f"本地 llama.cpp server 正在加载模型 (HTTP 503)，请稍后重试"
+                    + (f"\n响应: {last_body}" if last_body else ""),
+                    status_code=503,
+                )
+            raise AIClientServerError(
+                "本地服务未启动，请先启动 llama-server (端口 8080) 或 Ollama (端口 11434)\n"
+                "启动示例: llama-server -m qwen3.5-9b-q4_k_m.gguf -ngl 99 -c 8192 --host 127.0.0.1 --port 8080",
+                status_code=503,
+            )
+        else:
+            # ── 在线后端：轻量探测 ──
+            try:
+                resp = _requests.get(f'{host}/v1/models', timeout=timeout)
+                if resp.status_code == 200:
+                    return True
+                # 即使 401/403 也说明服务可达（认证问题另有 generate() 处理）
+                if resp.status_code in (401, 403):
+                    return True
+                raise AIClientServerError(
+                    f"在线 API 服务异常 (HTTP {resp.status_code})",
+                    status_code=resp.status_code,
+                )
+            except _requests.ConnectionError:
+                raise AIClientServerError(
+                    f"无法连接到在线 API 服务: {host}",
+                    status_code=503,
+                )
+            except _requests.Timeout:
+                raise AIClientServerError(
+                    f"连接在线 API 超时 ({timeout}s): {host}",
+                    status_code=503,
+                )
+
+    # ── Qwen 官方推荐采样参数 (非思考模式) ──
+    QWEN_TEMPERATURE: float = 0.7
+    QWEN_TOP_P: float = 0.8
+    QWEN_TOP_K: int = 20
+    QWEN_PRESENCE_PENALTY: float = 1.5
 
     def generate(
         self,
@@ -115,6 +318,8 @@ class AIClient:
         system_prompt: str = '',
         temperature: float = 0.3,
         max_tokens: int = 2048,
+        *,
+        enable_thinking: bool = False,
     ) -> str:
         """同步调用 LLM，返回文本响应。
 
@@ -123,6 +328,8 @@ class AIClient:
             system_prompt: 系统提示词（可选）
             temperature: 温度参数，结构化输出建议 0.3
             max_tokens: 最大生成长度
+            enable_thinking: True=允许思考 (诊断/聊天)，False=纯答案 (报告/结构化)。
+                             对本地 Qwen3.5 经 extra_body→chat_template_kwargs 下发。
 
         Returns:
             LLM 响应文本
@@ -152,19 +359,184 @@ class AIClient:
                 messages.append({'role': 'system', 'content': system_prompt})
             messages.append({'role': 'user', 'content': prompt})
 
-            response = client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            # ── 构建 create kwargs ──
+            create_kwargs: dict = {
+                'model': self.model_name,
+                'messages': messages,
+                'temperature': temperature,
+                'max_tokens': max_tokens,
+            }
+
+            # ── 本地 Qwen3.5：chat_template_kwargs 控制思考开关 ──
+            if self._is_local_qwen():
+                extra_body: dict[str, Any] = {
+                    'chat_template_kwargs': {'enable_thinking': enable_thinking},
+                }
+                create_kwargs['extra_body'] = extra_body
+                # 非思考模式：Qwen 官方推荐采样参数
+                if not enable_thinking:
+                    create_kwargs.setdefault('temperature', self.QWEN_TEMPERATURE)
+                    create_kwargs['top_p'] = self.QWEN_TOP_P
+                    extra_body.update({
+                        'top_k': self.QWEN_TOP_K,
+                        'presence_penalty': self.QWEN_PRESENCE_PENALTY,
+                    })
+
+            response = client.chat.completions.create(**create_kwargs)
 
             content = (response.choices[0].message.content or '').strip()
+            finish = getattr(response.choices[0], 'finish_reason', 'stop')
+
+            # ── 截断检测（防静默交付半截报告） ──
+            if finish == 'length':
+                if content:
+                    raise AIClientTruncationError(
+                        f"AI 输出在 {max_tokens} token 处被截断"
+                        f"（finish_reason=length），内容不完整。"
+                        "请增大 max_tokens 重试。",
+                        partial_content=content,
+                    )
+                # content 为空 + length → 同样不可用
+                reasoning_len = len(
+                    getattr(response.choices[0].message, 'reasoning_content', '') or ''
+                )
+                raise AIClientTruncationError(
+                    f"AI 输出在 {max_tokens} token 处被截断且 content 为空"
+                    + (f"（reasoning_len={reasoning_len}）" if reasoning_len else "")
+                    + ("。请确认 enable_thinking=false 已生效" if not enable_thinking else ""),
+                )
+
             if not content:
+                # content 为空但未截断 → 其他故障
+                reasoning_len = len(
+                    getattr(response.choices[0].message, 'reasoning_content', '') or ''
+                )
                 raise AIClientEmptyResponseError(
-                    "AI 返回了空响应，可能模型不支持当前请求或输入格式有误"
+                    f"AI 返回空 content（finish_reason={finish}"
+                    + (f", reasoning_len={reasoning_len}" if reasoning_len else "")
+                    + f", max_tokens={max_tokens}）"
+                    + ("。请确认 enable_thinking=false 已生效" if not enable_thinking else "")
                 )
             return content
+
+        except AIClientError:
+            raise
+        except Exception as e:
+            raise classify_openai_error(e) from e
+
+    # ── 流式推理 ──
+
+    def cancel_current_stream(self) -> None:
+        """关闭当前活跃的流式 HTTP 连接，让 llama-server 停止生成、释放 slot。
+
+        由 UI 线程调用（AIClientStreamThread.cancel() → 此项）。
+        """
+        if self._stream_response is not None:
+            try:
+                self._stream_response.close()
+            except Exception:
+                pass
+            self._stream_response = None
+
+    def generate_stream(
+        self,
+        prompt: str,
+        system_prompt: str = '',
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        *,
+        enable_thinking: bool = False,
+    ) -> Generator[str, None, None]:
+        """流式调用 LLM，逐 token yield（纯 Python 生成器，无 Qt 依赖）.
+
+        与 generate() 共享同一后端路由（online / local），均走 OpenAI SDK 流式 API。
+        TTFB / 取消 / 信号发射由调用方（QThread wrapper）负责。
+
+        enable_thinking: True=允许思考流式展示 (诊断/聊天)，
+                         False=纯答案 (报告/结构化，经 extra_body 下发)。
+
+        Yields:
+            每次 yield 一个 token 字符串
+
+        Raises:
+            AIClientNotConfiguredError: 未配置
+            AIClientEmptyResponseError: 流结束但无有效内容
+            AIClientError: 其他 HTTP/网络错误（经 classify_openai_error）
+        """
+        if not self.is_available():
+            raise AIClientNotConfiguredError(
+                "AI 不可用：请检查后端配置"
+                + (" (本地 base_url)" if getattr(self, '_backend', 'online') == 'local' else " (在线 API Key)")
+            )
+
+        from openai import OpenAI  # pyright: ignore[reportImplicitRelativeImport]
+
+        try:
+            client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+            )
+
+            messages: list[Dict[str, str]] = []
+            if system_prompt:
+                messages.append({'role': 'system', 'content': system_prompt})
+            messages.append({'role': 'user', 'content': prompt})
+
+            create_kwargs: dict = {
+                'model': self.model_name,
+                'messages': messages,
+                'stream': True,
+                'temperature': temperature,
+                'max_tokens': max_tokens,
+            }
+
+            # ── 本地 Qwen3.5：chat_template_kwargs 控制思考开关 ──
+            if self._is_local_qwen():
+                _eb: dict[str, Any] = {
+                    'chat_template_kwargs': {'enable_thinking': enable_thinking},
+                }
+                create_kwargs['extra_body'] = _eb
+                if not enable_thinking:
+                    create_kwargs.setdefault('temperature', self.QWEN_TEMPERATURE)
+                    create_kwargs['top_p'] = self.QWEN_TOP_P
+                    _eb.update({
+                        'top_k': self.QWEN_TOP_K,
+                        'presence_penalty': self.QWEN_PRESENCE_PENALTY,
+                    })
+
+            self._stream_response = None
+            yielded_any = False
+            last_finish = 'stop'
+            try:
+                response = client.chat.completions.create(**create_kwargs)
+                self._stream_response = response  # 存引用，供 cancel 关闭
+                for chunk in response:
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta:
+                        token = delta.content or ''
+                        if not token and enable_thinking:
+                            # 思考开启时：reasoning_content 作为流式后备
+                            reasoning = getattr(delta, 'reasoning_content', None)
+                            if reasoning:
+                                token = str(reasoning)
+                        if token:
+                            yielded_any = True
+                            yield token
+                    # 最后一个 chunk 带 finish_reason
+                    if chunk.choices and hasattr(chunk.choices[0], 'finish_reason') and chunk.choices[0].finish_reason:
+                        last_finish = chunk.choices[0].finish_reason
+
+                if not yielded_any:
+                    raise AIClientEmptyResponseError(
+                        "AI 流式返回了空响应，可能模型不支持当前请求"
+                        + (" (非思考模式下 content 全空)" if not enable_thinking else "")
+                    )
+                if last_finish == 'length':
+                    raise AIClientTruncationError(
+                        f"AI 流式输出在 {max_tokens} token 处被截断"
+                    )
+            finally:
+                self._stream_response = None  # 清理引用
 
         except AIClientError:
             raise
@@ -180,6 +552,8 @@ class AIClient:
         tool_executable_map: Dict[str, Any],
         temperature: float = 0.3,
         max_tokens: int = 4096,
+        *,
+        enable_thinking: bool = False,
     ) -> str:
         """支持多轮 Function Calling 的 Agent Loop.
 
@@ -193,6 +567,7 @@ class AIClient:
             tool_executable_map: {函数名: 可执行函数} 映射
             temperature: 温度参数
             max_tokens: 每次请求最大 token 数
+            enable_thinking: True=允许思考
 
         Returns:
             最终模型回复文本，失败或超轮次返回空字符串
@@ -201,6 +576,29 @@ class AIClient:
             raise AIClientNotConfiguredError("AI API Key 未配置，请在设置中配置 AI 模型")
 
         from openai import OpenAI  # pyright: ignore[reportImplicitRelativeImport]
+
+        # ── 构建 create kwargs ──
+        def _build_kwargs(msgs: list[Dict[str, Any]]) -> dict:
+            kw: dict = {
+                'model': self.model_name,
+                'messages': msgs,
+                'tools': tools,
+                'temperature': temperature,
+                'max_tokens': max_tokens,
+            }
+            if self._is_local_qwen():
+                _eb: dict[str, Any] = {
+                    'chat_template_kwargs': {'enable_thinking': enable_thinking},
+                }
+                kw['extra_body'] = _eb
+                if not enable_thinking:
+                    kw.setdefault('temperature', self.QWEN_TEMPERATURE)
+                    kw['top_p'] = self.QWEN_TOP_P
+                    _eb.update({
+                        'top_k': self.QWEN_TOP_K,
+                        'presence_penalty': self.QWEN_PRESENCE_PENALTY,
+                    })
+            return kw
 
         try:
             client = OpenAI(
@@ -212,11 +610,7 @@ class AIClient:
 
             for turn in range(MAX_TOOL_TURNS):
                 response = client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    tools=tools,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
+                    **_build_kwargs(messages),
                 )
 
                 choice = response.choices[0]
@@ -274,6 +668,13 @@ class AIClient:
 
                 # ── 情况 B：模型正常输出 ──
                 content = (msg.content or '').strip()
+                finish = getattr(choice, 'finish_reason', 'stop')
+                if finish == 'length':
+                    raise AIClientTruncationError(
+                        f"AI 工具调用输出在 {max_tokens} token 处被截断"
+                        + (f"（content={len(content)} chars）" if content else ""),
+                        partial_content=content if content else "",
+                    )
                 if not content:
                     raise AIClientEmptyResponseError("AI 工具调用返回了空响应")
                 return content
@@ -314,6 +715,7 @@ class AIClient:
         *,
         max_retries: int = 2,
         base_backoff_s: float = 2.0,
+        enable_thinking: bool = False,
     ) -> str:
         """同步调用 LLM，带指数退避重试。
 
@@ -326,6 +728,7 @@ class AIClient:
             max_tokens: 最大生成长度
             max_retries: 最大重试次数（默认 2 次，共 3 次尝试）
             base_backoff_s: 基础退避秒数（指数递增）
+            enable_thinking: True=允许思考
 
         Returns:
             LLM 响应文本
@@ -342,6 +745,7 @@ class AIClient:
                     system_prompt=system_prompt,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    enable_thinking=enable_thinking,
                 )
             except AIClientError as e:
                 last_exc = e
@@ -400,6 +804,7 @@ class AIClient:
                 system_prompt=system_prompt,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                enable_thinking=False,  # 报告 JSON 必须纯答案，不能混入思维链
             )
 
             # 提取 JSON 块
@@ -413,6 +818,8 @@ class AIClient:
                     json_str = m2.group(1)
 
             try:
+                # ── JSON 转义清洗（修复 LLM 输出的 LaTeX 反斜杠等非法转义）──
+                json_str = _sanitize_json_text(json_str)
                 validated = schema.model_validate_json(json_str)
                 return validated.model_dump()
             except Exception as e:
@@ -449,10 +856,17 @@ class AIClient:
             f"generate_structured 意外退出：Schema '{schema_name}' 校验失败"
         )
 
-    def get_generate_fn(self) -> Callable[..., str]:
+    def get_generate_fn(self, enable_thinking: bool = False) -> Callable[..., str]:
         """返回兼容 report_engine 的 generate_fn 回调。
 
         返回的闭包签名: (prompt: str) -> str，失败时抛 AIClientError。
+        默认 enable_thinking=False：报告/结构化路径关闭思考。
+
         调用方负责捕获异常并呈现给用户。
         """
-        return self.generate
+        # 闭包捕获 self 和 enable_thinking
+        _self = self
+        _et = enable_thinking
+        def _generate(prompt: str, **kwargs) -> str:
+            return _self.generate(prompt=prompt, enable_thinking=_et, **kwargs)
+        return _generate

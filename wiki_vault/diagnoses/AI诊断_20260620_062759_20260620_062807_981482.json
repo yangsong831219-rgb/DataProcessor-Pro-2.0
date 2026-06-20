@@ -1,0 +1,124 @@
+{
+  "schema_version": "1.0",
+  "timestamp": "2026-06-20 06:21:47",
+  "backend": "local",
+  "model": "qwen3.5-9b",
+  "selected_sources": [
+    "数据文件",
+    "数据清洗",
+    "数据分析"
+  ],
+  "data_source_snapshot": [
+    "【数据文件】\n模板: ENLIGHT（光纤传感）公式版\n类型: 光纤光栅传感器数据\n规模: 15657 行 x 34 列\n时间列: FBG_A1\n时间范围: 1535-01-01 00:00:00 ~ 1535-12-01 00:00:00\n采样间隔: ~0ms, 非均匀\n列→传感器: Timestamp, A1G1, A1G2, A2G1, A2G2, B1G1, B1G2, B2G1, B2G2, FBG_A1(w1-类型-位置), FBG_A2(w2-类型-位置), FBG_B1(w3-类型-位置), FBG_D1(w4-类型-位置), FBG_F1(w5-类型-位置), FBG_F2(w6-类型-位置), FBG_G1(w7-类型-位置), FBG_G2(w8-类型-位置), Timestamp_anomaly, A1G1_anomaly, A1G2_anomaly, A2G1_anomaly, A2G2_anomaly, B1G1_anomaly, B1G2_anomaly, B2G1_anomaly, B2G2_anomaly, FBG_A1_anomaly, FBG_A2_anomaly, FBG_B1_anomaly, FBG_D1_anomaly, ... (共 34 列)\n数值列统计:\n  A1G1: 有效=15656, 缺失=1, 均值=9.5474, σ=104.6903, 范围=[-73.6500, 488.8960]\n  A1G2: 有效=15656, 缺失=1, 均值=-0.8718, σ=3.5639, 范围=[-5.4400, 4.5280]\n  A2G1: 有效=15656, 缺失=1, 均值=12.6906, σ=105.1417, 范围=[-71.9970, 503.7040]\n  A2G2: 有效=15656, 缺失=1, 均值=-0.5142, σ=3.5501, 范围=[-5.1610, 4.8530]\n  B1G1: 有效=15656, 缺失=1, 均值=-1.6435, σ=99.6500, 范围=[-119.1030, 396.3460]\n  B1G2: 有效=15656, 缺失=1, 均值=8.8173, σ=93.0426, 范围=[-72.2370, 433.0150]\n  B2G1: 有效=15656, 缺失=1, 均值=-2.1965, σ=118.7176, 范围=[-142.8480, 455.5760]\n  B2G2: 有效=15656, 缺失=1, 均值=8.5653, σ=103.8072, 范围=[-74.1220, 495.9860]",
+    "【数据清洗】\n已清洗，未发现异常，相邻差值阈值=1.0\n策略: linear | 规则: 相邻差值检测(阈值=1.0), 缺失值检测",
+    "【数据分析】\n  A1_应变(με): n=15535 | 均值=21.987 | σ=91.371 | 范围=[-21.730, 458.046] (479.777) | 漂移≈-0.9408με/千样本 | 显著波动(CV≥20%)\n  A1_温度(°C): n=15535 | 均值=-0.771 | σ=2.846 | 范围=[-4.400, 3.532] (7.932) | 漂移≈0.4076με/千样本 | 显著波动(CV≥20%)\n  A2_应变(με): n=15535 | 均值=18.949 | σ=92.771 | 范围=[-26.903, 457.494] (484.397) | 漂移≈-1.0759με/千样本 | 显著波动(CV≥20%)\n  A2_温度(°C): n=15535 | 均值=-0.412 | σ=2.721 | 范围=[-3.957, 3.690] (7.647) | 漂移≈0.3953με/千样本 | 显著波动(CV≥20%)"
+  ],
+  "kb_hits": [
+    {
+      "id": "clean_data_modified_note",
+      "severity": "info",
+      "objects": null,
+      "meaning": "数据已经过异常填充处理，后续统计基于清洗后数据。",
+      "mechanism": "填充(如中值)会改变局部分布；解读统计量时需知数据被修改过。",
+      "recommendation": "解读特征/趋势时考虑填充影响；异常密集处尤需注意。"
+    },
+    {
+      "id": "apparent_strain_primer",
+      "severity": "info",
+      "objects": null,
+      "meaning": "表观应变背景：FBG 测到的 Δλ 同时含温度与应变贡献，需解耦。",
+      "mechanism": "封装热失配产生的“假应变”随温度变化，是双栅解耦/补偿要消除的主要对象。",
+      "recommendation": "解读 ε 时务必区分“真实机械应变”与“封装诱导表观应变”。"
+    }
+  ],
+  "diagnosis_json": {
+    "diagnosis_summary": {
+      "data_type": "fiber_optic",
+      "template_name": "ENLIGHT（光纤传感）公式版",
+      "data_quality": "good",
+      "anomaly_count": 0,
+      "overall_assessment": "数据完整性高，无异常点检出，但存在显著的周期性波动与趋势漂移，需关注温度解耦后的真实应变分量。",
+      "assessment_en": "Data integrity is high with zero anomalies detected; however, significant periodic fluctuations and trend drifts are present, requiring attention to the true strain component after temperature decoupling."
+    },
+    "data_quality_assessment": {
+      "completeness": "极高，有效数据占比约 99.9%，仅 34 列中存在极少量缺失（每列 1 个），已进行填充处理。",
+      "consistency": "良好，各通道统计特征稳定，无明显的逻辑冲突或量纲错误。",
+      "anomaly_patterns": [],
+      "recommendations": [
+        "由于数据经过异常值填充（clean_data_modified_note），在分析局部突变或计算梯度时需谨慎，避免将填充后的平滑过渡误判为物理现象。",
+        "鉴于 apparent_strain_primer 规则提示，FBG 原始读数包含显著的封装热失配效应，必须严格区分“表观应变”与“真实机械应变”。"
+      ]
+    },
+    "sensor_analysis": [
+      {
+        "sensor_id": "FBG_A1",
+        "status": "normal",
+        "statistics": {
+          "mean": 21.987,
+          "std": 91.371,
+          "min": -21.73,
+          "max": 458.046
+        },
+        "findings": "表观应变均值约 22με，标准差较大（CV > 20%），呈现显著波动。温度漂移约为 0.94 με/千样本，表明存在随时间累积的线性趋势。",
+        "suggestions": "需结合温度通道数据进行双栅解耦，消除封装热失配带来的假应变影响，以获取真实的结构受力状态。"
+      },
+      {
+        "sensor_id": "FBG_A2",
+        "status": "normal",
+        "statistics": {
+          "mean": 18.949,
+          "std": 92.771,
+          "min": -26.903,
+          "max": 457.494
+        },
+        "findings": "表观应变均值约 19με，波动幅度与 A1 相近。温度漂移约为 1.08 με/千样本，趋势略大于 A1，可能源于安装位置的环境差异或胶水固化特性不同。",
+        "suggestions": "建议对比 A1 与 A2 的解耦后应变差值，判断是否存在非均匀温度场导致的局部热膨胀效应。"
+      },
+      {
+        "sensor_id": "A1G1",
+        "status": "warning",
+        "statistics": {
+          "mean": 9.5474,
+          "std": 104.6903,
+          "min": -73.65,
+          "max": 488.896
+        },
+        "findings": "作为参考通道，其波动范围极大（-73 至 488），标准差显著高于 FBG 解耦后的应变值，可能包含未完全解耦的温度噪声或高频振动干扰。",
+        "suggestions": "检查该通道的滤波截止频率设置是否过低导致波形畸变，或确认其作为基准的稳定性是否满足当前监测需求。"
+      },
+      {
+        "sensor_id": "A1G2",
+        "status": "normal",
+        "statistics": {
+          "mean": -0.8718,
+          "std": 3.5639,
+          "min": -5.44,
+          "max": 4.528
+        },
+        "findings": "该通道波动极小（σ≈3.6），与 A1G1 形成鲜明对比，显示其受环境干扰较小或物理意义不同（如垂直分量）。",
+        "suggestions": "可作为稳定的参考基准用于归一化处理。"
+      }
+    ],
+    "physical_diagnosis": {
+      "phenomenon": "显著的周期性波动与线性趋势漂移并存",
+      "possible_causes": [
+        "环境温度变化引起的 FBG 波长漂移（热膨胀效应）",
+        "NOA 81 胶水与 PI 光纤界面的滑移或应力松弛（导致长期漂移）",
+        "结构本身承受周期性载荷（如风振、机械运转）",
+        "封装材料热失配产生的假应变（apparent strain）未完全解耦"
+      ],
+      "severity": "medium",
+      "recommended_actions": [
+        "执行严格的双栅温度补偿算法，剔除温度引起的表观应变。",
+        "检查 FBG 粘贴区域是否存在胶水老化或界面滑移迹象。",
+        "若漂移趋势持续且无外部热源解释，需评估结构是否发生缓慢蠕变或预应力损失。"
+      ]
+    },
+    "raw_data_preview": {
+      "suggested_filter": "低通滤波截止频率建议 >0.5Hz（避免滤除有效振动），针对漂移趋势可采用多项式拟合去趋势（Detrending）。",
+      "suggested_formula": "ε_true = (λ_A1 - λ_ref) / K_ε + α * (T - T_ref)，其中需利用双栅数据解算温度分量 T。",
+      "notes": "注意 clean_data_modified_note 中提到的填充影响，在计算相邻差值时可能出现人为的平滑现象，导致异常检测阈值失效。"
+    }
+  },
+  "diagnosis_raw": "{\n  \"diagnosis_summary\": {\n    \"data_type\": \"fiber_optic\",\n    \"template_name\": \"ENLIGHT（光纤传感）公式版\",\n    \"data_quality\": \"good\",\n    \"anomaly_count\": 0,\n    \"overall_assessment\": \"数据完整性高，无异常点检出，但存在显著的周期性波动与趋势漂移，需关注温度解耦后的真实应变分量。\",\n    \"assessment_en\": \"Data integrity is high with zero anomalies detected; however, significant periodic fluctuations and trend drifts are present, requiring attention to the true strain component after temperature decoupling.\"\n  },\n  \"data_quality_assessment\": {\n    \"completeness\": \"极高，有效数据占比约 99.9%，仅 34 列中存在极少量缺失（每列 1 个），已进行填充处理。\",\n    \"consistency\": \"良好，各通道统计特征稳定，无明显的逻辑冲突或量纲错误。\",\n    \"anomaly_patterns\": [],\n    \"recommendations\": [\n      \"由于数据经过异常值填充（clean_data_modified_note），在分析局部突变或计算梯度时需谨慎，避免将填充后的平滑过渡误判为物理现象。\",\n      \"鉴于 apparent_strain_primer 规则提示，FBG 原始读数包含显著的封装热失配效应，必须严格区分“表观应变”与“真实机械应变”。\"\n    ]\n  },\n  \"sensor_analysis\": [\n    {\n      \"sensor_id\": \"FBG_A1\",\n      \"status\": \"normal\",\n      \"statistics\": {\n        \"mean\": 21.987,\n        \"std\": 91.371,\n        \"min\": -21.730,\n        \"max\": 458.046\n      },\n      \"findings\": \"表观应变均值约 22με，标准差较大（CV > 20%），呈现显著波动。温度漂移约为 0.94 με/千样本，表明存在随时间累积的线性趋势。\",\n      \"suggestions\": \"需结合温度通道数据进行双栅解耦，消除封装热失配带来的假应变影响，以获取真实的结构受力状态。\"\n    },\n    {\n      \"sensor_id\": \"FBG_A2\",\n      \"status\": \"normal\",\n      \"statistics\": {\n        \"mean\": 18.949,\n        \"std\": 92.771,\n        \"min\": -26.903,\n        \"max\": 457.494\n      },\n      \"findings\": \"表观应变均值约 19με，波动幅度与 A1 相近。温度漂移约为 1.08 με/千样本，趋势略大于 A1，可能源于安装位置的环境差异或胶水固化特性不同。\",\n      \"suggestions\": \"建议对比 A1 与 A2 的解耦后应变差值，判断是否存在非均匀温度场导致的局部热膨胀效应。\"\n    },\n    {\n      \"sensor_id\": \"A1G1\",\n      \"status\": \"warning\",\n      \"statistics\": {\n        \"mean\": 9.5474,\n        \"std\": 104.6903,\n        \"min\": -73.6500,\n        \"max\": 488.8960\n      },\n      \"findings\": \"作为参考通道，其波动范围极大（-73 至 488），标准差显著高于 FBG 解耦后的应变值，可能包含未完全解耦的温度噪声或高频振动干扰。\",\n      \"suggestions\": \"检查该通道的滤波截止频率设置是否过低导致波形畸变，或确认其作为基准的稳定性是否满足当前监测需求。\"\n    },\n    {\n      \"sensor_id\": \"A1G2\",\n      \"status\": \"normal\",\n      \"statistics\": {\n        \"mean\": -0.8718,\n        \"std\": 3.5639,\n        \"min\": -5.4400,\n        \"max\": 4.5280\n      },\n      \"findings\": \"该通道波动极小（σ≈3.6），与 A1G1 形成鲜明对比，显示其受环境干扰较小或物理意义不同（如垂直分量）。\",\n      \"suggestions\": \"可作为稳定的参考基准用于归一化处理。\"\n    }\n  ],\n  \"physical_diagnosis\": {\n    \"phenomenon\": \"显著的周期性波动与线性趋势漂移并存\",\n    \"possible_causes\": [\n      \"环境温度变化引起的 FBG 波长漂移（热膨胀效应）\",\n      \"NOA 81 胶水与 PI 光纤界面的滑移或应力松弛（导致长期漂移）\",\n      \"结构本身承受周期性载荷（如风振、机械运转）\",\n      \"封装材料热失配产生的假应变（apparent strain）未完全解耦\"\n    ],\n    \"severity\": \"medium\",\n    \"recommended_actions\": [\n      \"执行严格的双栅温度补偿算法，剔除温度引起的表观应变。\",\n      \"检查 FBG 粘贴区域是否存在胶水老化或界面滑移迹象。\",\n      \"若漂移趋势持续且无外部热源解释，需评估结构是否发生缓慢蠕变或预应力损失。\"\n    ]\n  },\n  \"raw_data_preview\": {\n    \"suggested_filter\": \"低通滤波截止频率建议 >0.5Hz（避免滤除有效振动），针对漂移趋势可采用多项式拟合去趋势（Detrending）。\",\n    \"suggested_formula\": \"ε_true = (λ_A1 - λ_ref) / K_ε + α * (T - T_ref)，其中需利用双栅数据解算温度分量 T。\",\n    \"notes\": \"注意 clean_data_modified_note 中提到的填充影响，在计算相邻差值时可能出现人为的平滑现象，导致异常检测阈值失效。\"\n  }\n}"
+}

@@ -120,13 +120,6 @@ class DataProcessorWindow(QMainWindow):
 
         # 传感器系统
 
-        # Ollama AI客户端
-        try:
-            from py.ollama_client import OllamaClient
-            self.ollama_client = OllamaClient()
-        except ImportError:
-            self.ollama_client = None
-
         self.init_ui()
 
         # AI诊断Widget延迟加载模型配置
@@ -732,6 +725,9 @@ class DataProcessorWindow(QMainWindow):
         self.report_workbench_widget.full_report_requested.connect(
             self._handle_full_report_generation
         )
+        self.report_workbench_widget.load_diagnosis_requested.connect(
+            self._handle_load_diagnosis
+        )
         return self.report_workbench_widget
 
     # ═══════════════════════════════════════════════
@@ -744,17 +740,17 @@ class DataProcessorWindow(QMainWindow):
     # ═══════════════════════════════════════════════
 
     def _get_generate_fn(self):
-        """获取 LLM 生成回调.
+        """获取 LLM 生成回调 — 统一入口 AIClient (按 backend 路由 online/local).
 
-        优先级: AIClient (DeepSeek) > OllamaClient > 模拟降级.
+        AIClient 不可用时返回 mock 降级（明确提示"未配置"）。
         """
         from core.ai_client import AIClient
         ai = AIClient.get_instance()
         if ai.is_available():
-            return ai.generate
-        if self.ollama_client and self.ollama_client.is_available():
-            return self.ollama_client.generate
-        # 降级: 返回模拟生成函数
+            return ai.get_generate_fn(enable_thinking=False)
+
+        # 降级：无 AI 配置时返回 mock 函数（用户在 UI 看到模板内容）
+        print("[主窗口] AI 未配置，大纲/报告将使用模拟降级")
         def _fallback(prompt: str) -> str:
             return (
                 '# 传感器数据分析报告\n\n'
@@ -799,6 +795,73 @@ class DataProcessorWindow(QMainWindow):
         self._outline_worker.finished.connect(_on_outline_done)
         self._outline_worker.error.connect(_on_outline_error)
         self._outline_worker.start()
+
+    # ═══════════════════════════════════════════════
+    # 从已存诊断加载 — 浏览 diagnoses/ 目录
+    # ═══════════════════════════════════════════════
+
+    def _handle_load_diagnosis(self) -> None:
+        """弹出对话框，列出 wiki_vault/diagnoses/ 中的诊断 JSON，用户选择后加载。"""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QPushButton, QHBoxLayout, QLabel
+        from py.wiki_system import WikiFileSystem
+
+        wiki = WikiFileSystem()
+        diags = wiki.list_diagnoses()
+        if not diags:
+            QMessageBox.information(self, '提示', '项目资料库中尚无已存诊断结果。\n请先在 AI 诊断页运行诊断并保存。')
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('从已存诊断加载')
+        dlg.setMinimumWidth(600)
+        layout = QVBoxLayout(dlg)
+
+        layout.addWidget(QLabel('选择一份已保存的诊断结果:'))
+
+        lst = QListWidget()
+        for d in diags:
+            item_text = f"{d['name']}  ({d['size']//1024}KB)"
+            lst.addItem(item_text)
+        layout.addWidget(lst)
+
+        btn_row = QHBoxLayout()
+        load_btn = QPushButton('加载')
+        load_btn.setStyleSheet(
+            'QPushButton { background: #722ed1; color: white; padding: 8px 16px; '
+            'border-radius: 4px; font-weight: bold; }'
+        )
+        cancel_btn = QPushButton('取消')
+
+        def on_load():
+            row = lst.currentRow()
+            if row < 0 or row >= len(diags):
+                return
+            rec = wiki.read_diagnosis(diags[row]['name'])
+            if rec:
+                sv = str(rec.get('schema_version', '1.0'))
+                if sv not in ('1.0', '1.1'):
+                    QMessageBox.warning(self, '版本不兼容',
+                        f"该记录 schema 版本为 {sv}，当前只支持 1.0 / 1.1")
+                    return
+                self.report_workbench_widget.set_diagnosis_record(rec)
+                # 兼容 1.0 / 1.1 两种 schema
+                ai_d = rec.get('ai_diagnosis', {}).get('diagnosis_json') or rec.get('diagnosis_json') or {}
+                sensors = len(ai_d.get('sensor_analysis', []) if isinstance(ai_d, dict) else [])
+                kb_count = len(rec.get('kb_hits', []))
+                ma_present = '有' if rec.get('multi_agent', {}).get('report') else '无'
+                QMessageBox.information(self, '成功',
+                    f"已加载诊断记录 v{sv}\n时间: {rec.get('timestamp')}\n"
+                    f"传感器数: {sensors}\n"
+                    f"KB 规则: {kb_count} 条\n"
+                    f"多智能体报告: {ma_present}")
+                dlg.accept()
+
+        load_btn.clicked.connect(on_load)
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(load_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+        dlg.exec()
 
     # ═══════════════════════════════════════════════
     # 完整报告生成 — 后台 AI + 渲染
@@ -895,68 +958,103 @@ class DataProcessorWindow(QMainWindow):
         self.ai_diagnosis_widget = AiDiagnosisWidget(self)
         return self.ai_diagnosis_widget
 
-    def load_project_list(self):
-        """加载项目列表"""
-        settings = QSettings('DataProcessor', 'Pro')
-        projects_dir = settings.value('projects_directory', '')
+    # ═══════════════════════════════════════════════════════════
+    # 项目资料库 — 三级目录 (Phase 3)
+    # ═══════════════════════════════════════════════════════════
 
-        items = []
-        if projects_dir and os.path.exists(projects_dir):
+    LIBRARY_FOLDER_NAME = "项目资料库"
+
+    @staticmethod
+    def _get_project_library_dir(projects_dir: str) -> str:
+        """返回项目资料库一级容器路径: <projects_dir>/项目资料库/。"""
+        return os.path.join(projects_dir, DataProcessorWindow.LIBRARY_FOLDER_NAME)
+
+    @staticmethod
+    def get_software_root_dir() -> str:
+        """软件根目录 (main.py 所在目录)。"""
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def get_project_library_dir(self) -> str:
+        """SSOT: 返回实际存在的项目资料库路径。
+
+        确定性：根植软件根目录/<项目资料库>/。与项目资料管理页同一解析。
+        不存在时创建并返回。
+        """
+        root = DataProcessorWindow.get_software_root_dir()
+        lib_dir = os.path.join(root, DataProcessorWindow.LIBRARY_FOLDER_NAME)
+        os.makedirs(lib_dir, exist_ok=True)
+        return lib_dir
+
+    def _ensure_library_exists(self, projects_dir: str) -> str:
+        """确保项目资料库目录存在，返回其路径。"""
+        lib_dir = self._get_project_library_dir(projects_dir)
+        os.makedirs(lib_dir, exist_ok=True)
+        return lib_dir
+
+    def _migrate_projects_to_library(self, projects_dir: str, known_projects: list[str]) -> int:
+        """将 <projects_dir>/ 根目录下已登记的项目迁移到 项目资料库/ 下。
+
+        幂等: 已在库下的跳过；未登记的文件夹不动（避免误伤）。
+        返回迁移数量。
+        """
+        import shutil
+        lib_dir = self._ensure_library_exists(projects_dir)
+        migrated = 0
+        for proj_name in known_projects:
+            old_path = os.path.join(projects_dir, proj_name)
+            new_path = os.path.join(lib_dir, proj_name)
+            if not os.path.isdir(old_path):
+                continue  # 项目不在旧位置
+            if os.path.exists(new_path):
+                continue  # 已在库下，跳过
             try:
-                for entry in os.listdir(projects_dir):
-                    if os.path.isdir(os.path.join(projects_dir, entry)):
+                shutil.move(old_path, new_path)
+                migrated += 1
+            except Exception as e:
+                print(f"迁移项目 '{proj_name}' 失败: {e}")
+        return migrated
+
+    def load_project_list(self):
+        """加载项目列表 (从软件根/项目资料库/ 扫描)。"""
+        lib_dir = self.get_project_library_dir()
+        items: list[str] = []
+        if os.path.isdir(lib_dir):
+            try:
+                for entry in os.listdir(lib_dir):
+                    if os.path.isdir(os.path.join(lib_dir, entry)):
                         items.append(entry)
             except Exception as e:
                 print(f"加载项目列表失败: {e}")
-
         self.project_tab_widget.set_project_list(items)
 
     def on_project_selected(self, project_name: str):
         """选择项目时加载内容"""
-        settings = QSettings('DataProcessor', 'Pro')
-        projects_dir = settings.value('projects_directory', '')
-
-        if not projects_dir:
-            return
-
-        self.current_project_path = os.path.join(projects_dir, project_name)
+        lib_dir = self.get_project_library_dir()
+        self.current_project_path = os.path.join(lib_dir, project_name)
         self.project_tab_widget.set_current_project_label(project_name, exists=True)
         self.project_tab_widget.load_project_tree(self.current_project_path)
 
     def on_new_project(self):
-        """新建项目"""
-        settings = QSettings('DataProcessor', 'Pro')
-        projects_dir = settings.value('projects_directory', '')
-
-        if not projects_dir or not os.path.exists(projects_dir):
-            # 选择项目根目录
-            dir_path = QFileDialog.getExistingDirectory(
-                self, '选择项目存储目录', '.',
-                QFileDialog.Option.ShowDirsOnly
-            )
-            if not dir_path:
-                return
-            projects_dir = dir_path
-            settings.setValue('projects_directory', projects_dir)
-
+        """新建项目 — 直接在软件根/项目资料库/下创建。"""
         # 输入项目名称
         project_name, ok = QInputDialog.getText(self, '新建项目', '请输入项目名称:')
         if not ok or not project_name.strip():
             return
 
         project_name = project_name.strip()
-        project_path = os.path.join(projects_dir, project_name)
+        lib_dir = self.get_project_library_dir()
+        project_path = os.path.join(lib_dir, project_name)
 
         if os.path.exists(project_path):
             QMessageBox.warning(self, '警告', '项目已存在!')
             return
 
         try:
-            # 创建项目文件夹
+            # 创建项目文件夹 (二级目录)
             os.makedirs(project_path)
 
-            # 创建默认子文件夹
-            default_folders = ['方案', '数据', '图片', '视频', '总结', '图纸', '其它']
+            # 创建默认子文件夹 (三级目录: 图片/图纸/数据/方案/总结/视频/其它)
+            default_folders = ['图片', '图纸', '数据', '方案', '总结', '视频', '其它']
             for folder in default_folders:
                 os.makedirs(os.path.join(project_path, folder))
 
@@ -984,14 +1082,10 @@ class DataProcessorWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        settings = QSettings('DataProcessor', 'Pro')
-        projects_dir = settings.value('projects_directory', '')
-        if not projects_dir:
-            return
-
         try:
             import shutil
-            shutil.rmtree(os.path.join(projects_dir, project_name))
+            lib_dir = self.get_project_library_dir()
+            shutil.rmtree(os.path.join(lib_dir, project_name))
             self.load_project_list()
             self.project_tab_widget.clear_tree()
             self.project_tab_widget.set_current_project_label("")
@@ -1007,12 +1101,8 @@ class DataProcessorWindow(QMainWindow):
             return
 
         project_name = current_item.text()
-        settings = QSettings('DataProcessor', 'Pro')
-        projects_dir = settings.value('projects_directory', '')
-        if not projects_dir:
-            return
-
-        project_path = os.path.join(projects_dir, project_name)
+        lib_dir = self.get_project_library_dir()
+        project_path = os.path.join(lib_dir, project_name)
         if os.path.exists(project_path):
             os.startfile(project_path)
 
@@ -2167,6 +2257,52 @@ class DataProcessorWindow(QMainWindow):
             return None, {}, None
         return extract_annotation_info(self.current_data)
 
+    def is_fiber_data(self) -> bool:
+        """公开 getter：判定当前数据是否为光纤光栅数据。
+
+        消除 ai_diagnosis 与 analysis_tab 的重复判定逻辑。
+        列名匹配 FBG/ENLIGHT/光纤传感/W\d+ 或模板名含"光纤"/"ENLIGHT"。
+        """
+        import re as _re
+        if self.current_data is None:
+            return False
+        for c in self.current_data.columns:
+            name = str(c)
+            if 'FBG' in name or 'ENLIG' in name or '光纤传感' in name:
+                return True
+            if _re.match(r'^W\d+$', name):
+                return True
+        if self.current_template and hasattr(self.current_template, 'name'):
+            tname = str(self.current_template.name)
+            if '光纤' in tname or 'ENLIGHT' in tname:
+                return True
+        return False
+
+    def get_timestamp_column(self) -> str | None:
+        """返回检测到的时间戳列名，或 None。
+
+        优先：detector/template 记录的 timestamp_col；
+        否则启发式：datetime 类型 → 列名含时间/time/timestamp/(h)。
+        """
+        import pandas as pd
+        if self.current_data is None:
+            return None
+        # 1. 优先从 template/detector 读
+        if self.current_template and hasattr(self.current_template, 'timestamp_col'):
+            tc = getattr(self.current_template, 'timestamp_col', None)
+            if tc and str(tc) in self.current_data.columns:
+                return str(tc)
+        # 2. datetime 类型
+        for c in self.current_data.columns:
+            if pd.api.types.is_datetime64_any_dtype(self.current_data[c]):
+                return str(c)
+        # 3. 列名匹配
+        for c in self.current_data.columns:
+            cn = str(c).lower()
+            if any(kw in cn for kw in ('时间', 'time', 'timestamp', '(h)')):
+                return str(c)
+        return None
+
     # ══════════════════════════════════════════════════════════
     # 根据暗号标注获取清洗后的分析数据
     # ══════════════════════════════════════════════════════════
@@ -2235,6 +2371,22 @@ class DataProcessorWindow(QMainWindow):
 
             anomaly_cols = [col for col in df.columns if col.endswith('_anomaly')]
             total_anomalies = sum(df[col].sum() for col in anomaly_cols)
+
+            # ── 落盘结构化 anomaly_info 到 SSOT（供 AI 诊断/报告读取） ──
+            struct_anomaly: dict[str, dict] = {}
+            for ac in anomaly_cols:
+                count = int(df[ac].sum())
+                if count > 0:
+                    orig_col = str(ac).replace('_anomaly', '')
+                    indices = df.index[df[ac] == True].tolist()
+                    struct_anomaly[orig_col] = {
+                        'count': count,
+                        'indices': indices[:20],
+                        'total_indices': len(indices),
+                    }
+            self._anomaly_info = struct_anomaly
+            self.cleaning_tab_widget._anomaly_info = struct_anomaly
+            self.cleaning_tab_widget._cleaning_has_run = True  # 独立标志
 
             self.cleaning_tab_widget.set_result_text(
                 f'检测到 {total_anomalies} 个异常数据点\n'

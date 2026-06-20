@@ -16,50 +16,62 @@ import sys
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 1: format_api_error — 错误格式化
+# Test 1: classify_openai_error — 异常分类工厂（覆盖原 format_api_error 意图）
 # ═══════════════════════════════════════════════════════════════════════
 
-class TestFormatApiError:
+class TestClassifyOpenAIErrorMessages:
 
-    def test_404_with_anthropic_url_gives_helpful_message(self):
-        """404 + 含 /anthropic → 提示改 /v1 (Anthropic 分支不含 raw code)"""
-        from py.online_llm_thread import format_api_error
-        err = Exception("404 Not found: https://api.deepseek.com/anthropic/chat/completions")
-        result = format_api_error(err)
-        assert "OpenAI" in result
-        assert "/v1" in result
+    def test_404_not_found(self):
+        """404 → AIClientServerError（兜底），信息含 404"""
+        from core.ai_errors import classify_openai_error, AIClientServerError
 
-    def test_404_generic_gives_model_hint(self):
-        """404 不含 /anthropic → 仍提示检查地址/模型"""
-        from py.online_llm_thread import format_api_error
-        err = Exception("HTTP 404 - model not found")
-        result = format_api_error(err)
-        assert "404" in result
+        class FakeHTTPError(Exception):
+            status_code = 404
+        e = classify_openai_error(FakeHTTPError("Not found"))
+        assert isinstance(e, AIClientServerError)
+        assert "404" in e.message or "Not found" in e.message
 
     def test_401_unauthorized(self):
-        """401 → API Key 无效提示"""
-        from py.online_llm_thread import format_api_error
-        result = format_api_error(Exception("401 Unauthorized: invalid api key"))
-        assert "API Key" in result or "无效" in result
+        """401 + 'invalid api key' → AIClientAuthError"""
+        from core.ai_errors import classify_openai_error, AIClientAuthError
+        e = classify_openai_error(Exception("401 Unauthorized: invalid api key"))
+        assert isinstance(e, AIClientAuthError)
+        assert "API" in e.message or "认证" in e.message
 
     def test_429_rate_limit(self):
-        """429 → 额度用完提示"""
-        from py.online_llm_thread import format_api_error
-        result = format_api_error(Exception("429 rate_limit exceeded"))
-        assert ("额度" in result or "用完" in result)
+        """429 → AIClientRateLimitError"""
+        from core.ai_errors import classify_openai_error, AIClientRateLimitError
+
+        class FakeHTTPError(Exception):
+            status_code = 429
+        e = classify_openai_error(FakeHTTPError("rate_limit exceeded"))
+        assert isinstance(e, AIClientRateLimitError)
+        assert e.retryable is True
 
     def test_timeout(self):
-        """timeout → 超时提示"""
-        from py.online_llm_thread import format_api_error
-        result = format_api_error(Exception("Connection timeout"))
-        assert "超时" in result
+        """'timed out' 文本 → AIClientTimeoutError"""
+        from core.ai_errors import classify_openai_error, AIClientTimeoutError
+        e = classify_openai_error(Exception("Connection timed out"))
+        assert isinstance(e, AIClientTimeoutError)
+        assert e.retryable is True
 
-    def test_generic_error_passthrough(self):
-        """未知错误 → 保留原始消息"""
-        from py.online_llm_thread import format_api_error
+    def test_500_server_error(self):
+        """500 → AIClientServerError"""
+        from core.ai_errors import classify_openai_error, AIClientServerError
+
+        class FakeHTTPError(Exception):
+            status_code = 500
+        e = classify_openai_error(FakeHTTPError("Internal server error"))
+        assert isinstance(e, AIClientServerError)
+        assert e.retryable is True
+
+    def test_unknown_falls_to_server_error(self):
+        """未知错误 → AIClientServerError (兜底)"""
+        from core.ai_errors import classify_openai_error, AIClientServerError
         msg = "Unknown: internal server error 500"
-        result = format_api_error(Exception(msg))
-        assert "500" in result
+        e = classify_openai_error(Exception(msg))
+        assert isinstance(e, AIClientServerError)
+        assert "500" in e.message
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -111,6 +123,14 @@ class TestRemovesuffixVsRstrip:
 
 class TestConfigFile:
 
+    @staticmethod
+    def _model_entries(data: dict):
+        """过滤系统键（_backend / _local / _comment），仅返回模型条目."""
+        return {
+            k: v for k, v in data.items()
+            if not k.startswith('_') and isinstance(v, dict) and 'base_url' in v
+        }
+
     def test_config_base_url_not_anthropic(self):
         """ai_models_config.json 的 base_url 必须用 OpenAI 兼容端点"""
         config_path = os.path.join(
@@ -121,7 +141,9 @@ class TestConfigFile:
             pytest.skip("ai_models_config.json not found")
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        for name, cfg in data.items():
+        models = self._model_entries(data)
+        assert len(models) > 0, "配置文件应至少包含一个模型条目"
+        for name, cfg in models.items():
             url = cfg.get("base_url", "")
             assert "/anthropic" not in url, \
                 f"Config '{name}' uses Anthropic endpoint ({url}). Use OpenAI-compatible (/v1) instead."
@@ -136,7 +158,9 @@ class TestConfigFile:
             pytest.skip("ai_models_config.json not found")
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        for name, cfg in data.items():
+        models = self._model_entries(data)
+        assert len(models) > 0, "配置文件应至少包含一个模型条目"
+        for name, cfg in models.items():
             url = cfg.get("base_url", "")
             assert url.endswith("/v1"), \
                 f"Config '{name}' base_url should end with /v1: {url}"

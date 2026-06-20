@@ -91,6 +91,29 @@ class AIClientNotConfiguredError(AIClientError):
         return False
 
 
+class AIClientTruncationError(AIClientError):
+    """输出因 token 不足被截断 (finish_reason="length") — 不可盲重试，需加大 max_tokens。
+
+    与 EmptyResponseError 的区别：content 非空但不完整。
+    报告/结构化路径遇此必须 fail loud，绝不静默交付半截结果。
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        status_code: int | None = None,
+        cause: BaseException | None = None,
+        *,
+        partial_content: str = "",
+    ) -> None:
+        super().__init__(message or "AI 输出被截断（token 不足），报告可能不完整", status_code, cause)
+        self.partial_content = partial_content  # 可用于降级展示（但报告路径不应使用）
+
+    @property
+    def retryable(self) -> bool:
+        return False  # 需要人工增大 max_tokens，不应自动重试
+
+
 class ReportSchemaError(AIClientError):
     """AI 返回的 JSON 与约定的 Schema 不匹配 — 不可重试（除非调用方回喂修复）。"""
 

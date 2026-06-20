@@ -709,6 +709,38 @@ class WikiFileSystem:
             self._save_map(data)
         return count
 
+    def list_diagnoses(self) -> list[dict]:
+        """列出 wiki_vault/diagnoses/ 中的诊断记录 JSON 文件。
+
+        Returns:
+            [{"name": str, "path": str, "size": int, "mtime": str}, ...]
+        """
+        diag_dir = self.base_dir / "diagnoses"
+        if not diag_dir.exists():
+            return []
+        results = []
+        for f in sorted(diag_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            st = f.stat()
+            results.append({
+                "name": f.stem,
+                "path": str(f),
+                "size": st.st_size,
+                "mtime": f.st_mtime,
+            })
+        return results
+
+    def read_diagnosis(self, name: str) -> dict | None:
+        """读取 diagnoses/{name}.json 并返回解析后的 dict。"""
+        import json as _json
+        diag_dir = self.base_dir / "diagnoses"
+        path = diag_dir / f"{name}.json"
+        if not path.exists():
+            return None
+        try:
+            return _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
     def list_pages(self) -> str:
         """
         列出所有知识库页面（自动同步未索引文件）

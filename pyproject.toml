@@ -3,9 +3,6 @@ include = ["py", "ui", "utils", "core", "tests"]
 exclude = [
     "venv", ".venv", "**/__pycache__",
     "tests/golden",
-    "py/llama_generate_thread.py",
-    "py/local_llm_manager.py",
-    "py/wiki_system.py",
 ]
 venv = "venv"
 venvPath = "."
