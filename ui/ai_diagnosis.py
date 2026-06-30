@@ -453,8 +453,8 @@ class AiDiagnosisWidget(QWidget):
         group = self._st_group("执行诊断", "#52c41a")
         layout = QVBoxLayout(group)
         layout.setSpacing(10)
-        layout.addWidget(self._make_large_btn('运行AI诊断', '#1890ff', '#40a9ff', self._run_diagnosis))
-        layout.addWidget(self._make_large_btn('运行多智能体诊断', '#52c41a', '#73d13d', self._run_multi_agent))
+        layout.addWidget(self._make_large_btn('数据分析专家诊断模式', '#1890ff', '#40a9ff', self._run_diagnosis))
+        layout.addWidget(self._make_large_btn('专家组诊断模式', '#52c41a', '#73d13d', self._run_multi_agent))
         return group
 
     def _build_right_panel(self) -> QWidget:
@@ -589,7 +589,7 @@ class AiDiagnosisWidget(QWidget):
         self.result_toggle_ai.clicked.connect(self._switch_to_ai_result)
         layout.addWidget(self.result_toggle_ai)
 
-        self.result_toggle_multi = QPushButton("多智能体诊断结果")
+        self.result_toggle_multi = QPushButton("专家组诊断结果")
         self.result_toggle_multi.setEnabled(False)
         self.result_toggle_multi.setStyleSheet(_TOGGLE_OFF_QSS)
         self.result_toggle_multi.clicked.connect(self._switch_to_multi_result)
@@ -611,11 +611,20 @@ class AiDiagnosisWidget(QWidget):
         self.save_ai_btn.clicked.connect(self._save_ai)
         layout.addWidget(self.save_ai_btn)
 
-        self.save_multi_btn = QPushButton("保存多智能体诊断")
+        self.save_multi_btn = QPushButton("保存专家组诊断")
         self.save_multi_btn.setStyleSheet(_TOGGLE_OFF_QSS)
         self.save_multi_btn.setEnabled(self._multi_result is not None)
         self.save_multi_btn.clicked.connect(self._save_multi)
         layout.addWidget(self.save_multi_btn)
+
+        self.save_to_project_btn = QPushButton("保存诊断到项目")
+        self.save_to_project_btn.setStyleSheet(
+            "QPushButton { background-color: #722ed1; color: white; padding: 8px 12px; "
+            "border-radius: 4px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #9254de; }"
+        )
+        self.save_to_project_btn.clicked.connect(self._save_diagnosis_to_project)
+        layout.addWidget(self.save_to_project_btn)
 
         return bar
 
@@ -838,7 +847,7 @@ class AiDiagnosisWidget(QWidget):
         if not main_win:
             return
         try:
-            from main import AIModelConfigDialog
+            from ui.ai_model_config_dialog import AIModelConfigDialog
             dlg = AIModelConfigDialog(main_win)
             dlg.exec()
             self._load_models_config()
@@ -853,7 +862,7 @@ class AiDiagnosisWidget(QWidget):
             self._warn(self, '请先配置AI模型')
 
     def _connect_with_config(self, config: dict) -> None:
-        """从模型配置连接 — 存储配置副本用于 UI 状态，后端路由走 AIClient。"""
+        """从模型配置连接 — 存储配置副本用于 UI 状态，同时写回 AIClient 单例。"""
         api_key = config.get('api_key', '')
         base_url = config.get('base_url', '')
         model_name = config.get('model_name', '')
@@ -873,6 +882,13 @@ class AiDiagnosisWidget(QWidget):
                 'max_tokens': config.get('max_tokens', 2048),
                 'system_prompt': config.get('system_prompt', ''),
             }
+            # ★ 就地写回单例 — 统一诊断/报告配置源 (不 reset _instance)
+            if ai.backend != 'local':
+                ai.configure_online(
+                    api_key, base_url, model_name,
+                    max_tokens=int(config.get('max_tokens', 4096)),
+                    temperature=float(config.get('temperature', 0.3)),
+                )
             self._set_status("● 已连接", '#52c41a', '#f6ffed')
             self._set_latency('-- ms')
             print(f"[AI诊断] 已连接模型: {model_name} (backend={ai.backend})")
@@ -1030,6 +1046,16 @@ class AiDiagnosisWidget(QWidget):
         # 用户消息 = 纯数据上下文（不含 schema 约束，schema 在系统提示词中）
         user_prompt = self._build_context_text(ctx)
 
+        # ★ max_tokens 动态计算: 按 ctx − prompt − margin 拉满可用空间
+        from core.ai_client import AIClient
+        _ai = AIClient.get_instance()
+        _prompt_est = _ai._estimate_tokens(system_prompt) + _ai._estimate_tokens(user_prompt)
+        _ctx = _ai._get_context_size()
+        _mt = _ai._safe_max_tokens(system_prompt, user_prompt, _ctx)  # 拉满: 等于 available_for_output
+        print(f"[DIAG] _run_diagnosis: backend={_ai.backend}, model={_ai.model_name}, "
+              f"ctx={_ctx}, max_tokens={_mt}, prompt_est_tokens={_prompt_est}, "
+              f"available_for_output={_ctx - _prompt_est - 512}")
+
         self._ai_result = None
         self._update_result_buttons()
         self.ai_diagnosis_result.clear()
@@ -1041,7 +1067,7 @@ class AiDiagnosisWidget(QWidget):
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 temperature=self._online_config.get('temperature', 0.7) if hasattr(self, '_online_config') and self._online_config else 0.7,
-                max_tokens=self._online_config.get('max_tokens', 4096) if hasattr(self, '_online_config') and self._online_config else 4096,
+                max_tokens=_mt,
                 enable_thinking=False,  # 诊断默认非思考（完整答案；想推理可切换）
             )
             self._diagnosis_thread.token_received.connect(self._on_diag_token)
@@ -1060,6 +1086,12 @@ class AiDiagnosisWidget(QWidget):
 
     @pyqtSlot(str)
     def _on_diag_done(self, result: str) -> None:
+        # ★ DIAG: 检查 thinking 链是否出现在正式内容中
+        _think_count = (result or '').count('<think>')
+        _think_end_count = (result or '').count('</think>')
+        print(f"[DIAG] _on_diag_done: result_len={len(result or '')}, "
+              f"think_tags=<think>{_think_count} </think>{_think_end_count}, "
+              f"result_head={(result or '')[:200]!r}")
         # 尝试解析 JSON 并渲染结构化报告
         parsed = self._extract_json(result)
         if parsed:
@@ -1094,7 +1126,7 @@ class AiDiagnosisWidget(QWidget):
 
         ai = AIClient.get_instance()
         rec: dict[str, Any] = {
-            "schema_version": "1.1",
+            "schema_version": "1.2",
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "backend": ai.backend,
             "model": ai.model_name,
@@ -1121,6 +1153,32 @@ class AiDiagnosisWidget(QWidget):
             "diagnosis_raw": (ai_res.get("raw") or "")[:5000],
         }
 
+        # ── ChartData 段 (1.2): 统一画图数据束 ──
+        try:
+            from core.chart_bundle import ChartBundle
+            bundle = ChartBundle.from_providers(main_win)
+            print(f"[DIAG] _build_diagnosis_record ChartBundle.from_providers: "
+                  f"series={len(bundle.series)}, time_h={len(bundle.time_h)}, "
+                  f"phys_series_n={len(bundle.phys_series)}, "
+                  f"series_delta_n={len(bundle.series_delta)}, "
+                  f"calib_sensors_n={len(bundle.calib_sensors)}, "
+                  f"tables(grade={bool(bundle.grade_table_md)},"
+                  f"anomaly={bool(bundle.anomaly_table_md)},"
+                  f"ke={bool(bundle.ke_table_md)},"
+                  f"dec={bool(bundle.decoupling_table_md)})")
+            if (bundle.series or bundle.compare_sources or bundle.calib_sensors
+                    or bundle.phys_series or bundle.series_delta
+                    or bundle.grade_table_md or bundle.anomaly_table_md
+                    or bundle.ke_table_md or bundle.decoupling_table_md):
+                rec["chart_data"] = bundle.to_dict()
+                print(f"[DIAG] _build_diagnosis_record: chart_data written to record")
+            else:
+                print(f"[DIAG] _build_diagnosis_record: chart_data EMPTY — skipped")
+        except Exception:
+            import traceback
+            print(f"[DIAG] _build_diagnosis_record ChartBundle section FAILED")
+            traceback.print_exc()
+
         # ── 多智能体诊断段 (Phase 6: 线性顾问式 + 截断标记) ──
         ma_res = self._multi_result or {}
         rec["multi_agent"] = {
@@ -1135,6 +1193,137 @@ class AiDiagnosisWidget(QWidget):
         }
 
         return rec
+
+    def _save_diagnosis_to_project(self) -> None:
+        """保存诊断结果到项目：JSON→数据/、图PNG→图片/。"""
+        if not self._ai_result and not self._multi_result:
+            self._warn(self, "暂无诊断结果可保存")
+            return
+
+        # ★ 完整性守卫：截断/失败诊断 → 提示用户，不静默保存
+        is_truncated = False
+        fail_reasons: list[str] = []
+        if self._multi_result:
+            if self._multi_result.get("chief_truncated"):
+                is_truncated = True
+                fail_reasons.append("专家组诊断输出被截断（内容不完整）")
+            ds = self._multi_result.get("data_scientist_text", "") or ""
+            if not ds.strip():
+                fail_reasons.append("数据科学家未产出有效分析")
+            chief = self._multi_result.get("chief_structured") or {}
+            if not chief or not isinstance(chief, dict) or not chief.get("diagnosis_summary"):
+                fail_reasons.append("首席专家未产出结构化诊断结论")
+        if self._ai_result:
+            parsed = self._ai_result.get("json") or {}
+            if not parsed or not isinstance(parsed, dict):
+                is_truncated = True
+                fail_reasons.append("AI 诊断未产出有效 JSON 结果")
+        if is_truncated or fail_reasons:
+            reasons_text = "\n".join(f"• {r}" for r in fail_reasons) if fail_reasons else ""
+            msg = f"当前诊断可能不完整:\n{reasons_text}\n\n确定仍要保存？"
+            reply = QMessageBox.question(self, "诊断结果不完整", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        # ① 构建诊断记录
+        kind = "ai" if self._ai_result else "multi"
+        rec = self._build_diagnosis_record()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # ② 选项目
+        main_win = self._find_main()
+        if not main_win:
+            self._warn(self, "无法定位主窗口")
+            return
+
+        # 列出已有项目
+        proj_dir = getattr(main_win, 'get_project_library_dir', lambda: '')()
+        if proj_dir:
+            import os as _os
+            entries = sorted([
+                d for d in _os.listdir(proj_dir)
+                if _os.path.isdir(_os.path.join(proj_dir, d))
+            ])
+        else:
+            entries = []
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("保存诊断到项目")
+        dlg.setMinimumWidth(450)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("选择项目文件夹："))
+
+        lst = QListWidget()
+        if entries:
+            lst.addItems(entries)
+        else:
+            lst.addItem("(暂无项目 — 将在下方新建)")
+        lst.setCurrentRow(0)
+        lay.addWidget(lst)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("新项目名(可选):"))
+        name_input = QLineEdit()
+        name_row.addWidget(name_input)
+        lay.addLayout(name_row)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("保存到此项目")
+        ok_btn.setStyleSheet("QPushButton { background:#722ed1; color:white; padding:8px 16px; border-radius:4px; font-weight:bold; }")
+        cancel_btn = QPushButton("取消")
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+        def on_ok():
+            import os as _os, shutil
+            import numpy as np
+            sel = lst.currentItem().text() if lst.currentItem() and entries else ""
+            new_name = name_input.text().strip()
+            if new_name:
+                sel = new_name  # 新建
+            if not sel:
+                self._warn(self, "请选择或输入项目名")
+                return
+
+            target = proj_dir and _os.path.join(proj_dir, sel)
+            if not target:
+                target = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), '项目资料库', sel)
+            data_dir = _os.path.join(target, '数据', '诊断记录')
+            img_dir = _os.path.join(target, '图片')
+            _os.makedirs(data_dir, exist_ok=True)  # 包含 诊断记录 子目录
+            _os.makedirs(img_dir, exist_ok=True)
+
+            # ── record_id 单一来源: ts (now()#2, 无横杠, 无冒号) ──
+            record_id = ts  # ts = "%Y%m%d_%H%M%S", 无需 replace
+
+            # ── 出图到 数据/诊断记录/<记录ID>/charts/ (母本B 甲结构) ──
+            from core.chart_store import build_chart_store, chart_manifest_to_dict
+            cd = rec.get('chart_data', {}) or {}
+            charts_dir = _os.path.join(data_dir, record_id, 'charts')
+            wrn: list[str] = []
+            chart_manifest = build_chart_store(cd, charts_dir, wrn)
+            produced = sum(1 for e in chart_manifest if e.produced)
+
+            # ── 写 rec 持久化字段 → 必须在 json.dump 之前 ──
+            rec["record_id"] = record_id
+            rec["chart_manifest"] = chart_manifest_to_dict(chart_manifest)
+
+            # ── 写 JSON ──
+            json_path = _os.path.join(data_dir, f"诊断记录_{ts}.json")
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(rec, f, ensure_ascii=False, indent=2)
+
+            msg = f"已保存到 {sel}:\n  JSON: {_os.path.basename(json_path)}\n  PNG: {produced} 张"
+            if wrn:
+                msg += f"\n  警告: {'; '.join(wrn[:3])}"
+            QMessageBox.information(self, "保存成功", msg)
+            dlg.accept()
+
+        ok_btn.clicked.connect(on_ok)
+        cancel_btn.clicked.connect(dlg.reject)
+        dlg.exec()
 
     def _get_selected_source_names(self) -> list[str]:
         """返回当前勾选的数据源名称列表。"""
@@ -1181,7 +1370,7 @@ class AiDiagnosisWidget(QWidget):
         # sensor_data
         sensor_data: dict[str, dict] = {}
         ct = getattr(main_win, 'calibration_tab_widget', None)
-        tp = getattr(ct, 'temperature_page', None) if ct else None
+        tp = getattr(ct, 'temp_page', None) if ct else None
         if tp:
             pb = getattr(tp, '_phase_b_state', {}) or {}
             decoupling = pb.get('decoupling_results', {}) or {}
@@ -1293,12 +1482,22 @@ class AiDiagnosisWidget(QWidget):
         context_text = self._build_context_text(ctx)
         user_input = f"请分析以下传感器数据:\n\n{context_text}\n\nCSV文件路径: {csv_path or '未指定'}"
 
+        # ★ DIAG: 专家组诊断截断追踪 — 固定本地后端，打印 max_tokens / prompt 占用
+        from core.ai_client import AIClient as _AIC
+        _ai = _AIC.get_instance()
+        _prompt_est = _ai._estimate_tokens('') + _ai._estimate_tokens(user_input)
+        _ctx = _ai._get_context_size()
+        print(f"[DIAG] _run_multi_agent: backend={_ai.backend}, model={_ai.model_name}, "
+              f"ctx={_ctx}, prompt_est_tokens={_prompt_est}, "
+              f"available_for_output={_ctx - _prompt_est - 512}, "
+              f"max_tokens_from_online_config={self._online_config.get('max_tokens', 4096) if hasattr(self, '_online_config') and self._online_config else 'N/A'}")
+
         self.ai_diagnosis_result.clear()
-        self.ai_terminal_title.setText("多智能体诊断 (运行中...)")
+        self.ai_terminal_title.setText("专家组诊断 (运行中...)")
         QApplication.processEvents()
 
         try:
-            from py.multi_agent import MultiAgentThread
+            from dp_engine.multi_agent import MultiAgentThread
             self._multi_thread = MultiAgentThread(
                 user_input=user_input,
                 csv_path=csv_path,
@@ -1309,12 +1508,12 @@ class AiDiagnosisWidget(QWidget):
             self._multi_thread.error.connect(self._on_multi_error)
             self._multi_thread.start()
         except Exception as e:
-            self.ai_diagnosis_result.setPlainText(f'多智能体诊断启动失败: {e}')
+            self.ai_diagnosis_result.setPlainText(f'专家组诊断启动失败: {e}')
 
     @pyqtSlot(str)
     def _on_multi_progress(self, msg: str) -> None:
         """后台进度 → 更新标题栏，不阻塞输出区。"""
-        self.ai_terminal_title.setText(f"多智能体诊断 ({msg})")
+        self.ai_terminal_title.setText(f"专家组诊断 ({msg})")
 
     @pyqtSlot(dict)
     def _on_multi_done(self, result: dict) -> None:
@@ -1340,8 +1539,8 @@ class AiDiagnosisWidget(QWidget):
 
     @pyqtSlot(str)
     def _on_multi_error(self, err: str) -> None:
-        self.ai_diagnosis_result.setPlainText(f'多智能体诊断失败: {err}')
-        self.ai_terminal_title.setText("多智能体诊断 (失败)")
+        self.ai_diagnosis_result.setPlainText(f'专家组诊断失败: {err}')
+        self.ai_terminal_title.setText("专家组诊断 (失败)")
 
     # ═══════════════════════════════════════════════
     # 数据类型防火墙判定（与 analysis_tab 逻辑一致）
@@ -1429,7 +1628,10 @@ class AiDiagnosisWidget(QWidget):
         ctx["data_type_label"] = "光纤光栅传感器数据" if is_fiber else "通用数据（TXT/CSV）"
 
         # ── 数值列统计摘要 ──
-        numeric_cols = data.select_dtypes(include=['number']).columns.tolist()
+        numeric_cols = [
+            c for c in data.select_dtypes(include=['number']).columns
+            if not str(c).endswith('_anomaly')  # ★ 过滤清洗产生的异常标记列，只统计真实数据列
+        ]
         if numeric_cols:
             stats_rows = []
             for c in numeric_cols:
@@ -1555,7 +1757,7 @@ class AiDiagnosisWidget(QWidget):
 
         # ── 覆盖 σ 阈值 (从 grade_thresholds) ──
         ct = getattr(main_win, 'calibration_tab_widget', None)
-        tp = getattr(ct, 'temperature_page', None) if ct else None
+        tp = getattr(ct, 'temp_page', None) if ct else None
         if tp:
             pb_state = getattr(tp, '_phase_b_state', {}) or {}
             gt = pb_state.get('grade_thresholds', None)
@@ -2337,7 +2539,7 @@ class AiDiagnosisWidget(QWidget):
             self._warn(self, '暂无 AI 诊断结果')
             return
         if kind == "multi" and not self._multi_result:
-            self._warn(self, '暂无多智能体诊断结果')
+            self._warn(self, '暂无专家组诊断结果')
             return
 
         rec = self._build_diagnosis_record()
@@ -2699,7 +2901,7 @@ class AiDiagnosisWidget(QWidget):
 
         # ── 封面/文档头 ──
         ts = rec.get('timestamp', '')
-        report_title = f'{"AI 诊断报告" if kind == "ai" else "多智能体诊断报告"}'
+        report_title = f'{"AI 诊断报告" if kind == "ai" else "专家组诊断报告"}'
         doc.add_heading(report_title, level=0)
 
         # 元信息表格 (无边框)
@@ -2882,6 +3084,23 @@ class AiDiagnosisWidget(QWidget):
                 doc.add_heading('三、审核顾问意见', level=1)
                 self._render_markdown_blocks_to_docx(doc, advisory)
                 doc.add_paragraph()
+
+        # ── 数据汇总附表 (从 chart_data 提取四张结构化表) ──
+        try:
+            from core.chart_bundle import extract_four_tables
+            cd = rec.get('chart_data', {}) or {}
+            four_tables = extract_four_tables(cd)
+            if four_tables:
+                doc.add_heading('数据汇总附表', level=1)
+                for tbl in four_tables:
+                    self._add_styled_table_docx(
+                        doc, tbl.headers, tbl.rows,
+                        caption=tbl.heading,
+                        table_id=self._next_docx_table_id(),
+                    )
+        except Exception:
+            import traceback as _tb2
+            print(f"[诊断docx] 数据汇总附表注入失败: {_tb2.format_exc()}")
 
         # ── 页码 ──
         for section in doc.sections:
@@ -3110,7 +3329,7 @@ class AiDiagnosisWidget(QWidget):
                     '<div style="background:linear-gradient(135deg,#0d2137 0%,#1a4971 100%);'
                     'color:white;padding:18px 24px;border-radius:8px;margin-bottom:8px;">'
                     '<h1 style="margin:0 0 4px 0;font-size:20px;">'
-                    '多智能体诊断报告</h1>'
+                    '专家组诊断报告</h1>'
                     '<div style="font-size:12px;opacity:0.85;">'
                     f'由 数据科学家 · 审核顾问 · 首席传感专家 联合出具'
                     '</div>'
@@ -3179,4 +3398,4 @@ class AiDiagnosisWidget(QWidget):
             self.ai_diagnosis_result.setPlainText(
                 mr.get("data_scientist_text", "") or "(无多智能体结果)"
             )
-        self.ai_terminal_title.setText("多智能体诊断结果")
+        self.ai_terminal_title.setText("专家组诊断结果")

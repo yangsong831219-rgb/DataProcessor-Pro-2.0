@@ -35,15 +35,15 @@ _TEMP_DATA_FILE = _os.path.join(
     "golden", "温度循环数据.txt",
 )
 _TEMP_DATA_FALLBACK = "D:/桌面文件/222/4次温度循环温度系数修订/温度循环数据.txt"
-from py.calibration.step_extractor import detect_plateaus
-from py.calibration.temperature_calibration import (
+from dp_engine.calibration.step_extractor import detect_plateaus
+from dp_engine.calibration.temperature_calibration import (
     load_continuous,
     assign_setpoints,
     regress_sensitivity,
     decouple,
     compare_given_vs_measured,
 )
-from py.calibration.strain_calibration import (
+from dp_engine.calibration.strain_calibration import (
     compute_theoretical_strain,
     StrainCalibrationConfig,
     StrainCalibrationResult,

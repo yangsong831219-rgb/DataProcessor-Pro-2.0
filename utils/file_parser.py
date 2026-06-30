@@ -184,12 +184,15 @@ def try_read_csv(
     )
 
 
-def parse_file(file_path: str, template: Any) -> pd.DataFrame:
+def parse_file(file_path: str, template: Any) -> tuple[pd.DataFrame, dict[str, str]]:
     """根据模板解析数据文件
 
     Args:
         file_path: 数据文件路径
         template: DataTemplate 实例，需有 file_format, delimiter, skip_rows 等属性
+
+    Returns:
+        (df, annotation): DataFrame + 列暗号字典（非 enlight 格式 annotation 为空字典）
     """
     if not hasattr(template, 'file_format'):
         ext = file_path.lower().split('.')[-1]
@@ -213,7 +216,7 @@ def parse_file(file_path: str, template: Any) -> pd.DataFrame:
         validate_parsed_data(
             df, {"format": template.file_format}, source_path=file_path, strict=False,
         )
-        return df
+        return df, {}
 
     elif template.file_format in ('xlsx', 'xls'):
         df = pd.read_excel(file_path, header=None)
@@ -222,12 +225,12 @@ def parse_file(file_path: str, template: Any) -> pd.DataFrame:
         validate_parsed_data(
             df, {"format": template.file_format}, source_path=file_path, strict=False,
         )
-        return df
+        return df, {}
 
     elif template.file_format == 'enlight':
         # 委托给新的统一 ENLIGHT/Hyperion 解析器
-        df, _annotation, _meta = parse_enlight_file(file_path)
-        return df
+        df, annotation, _meta = parse_enlight_file(file_path)
+        return df, annotation
 
     else:
         raise ValueError(f"不支持的文件格式: {template.file_format}")
@@ -575,12 +578,14 @@ def parse_enlight_sensors(
             "这是 Peaks 计数列文件，请改用『ENLIGHT(光纤传感)』模板"
         )
 
-    # ── 检测暗号行 (表头后紧跟的行) ──
+    # ── 检测暗号行 (表头后跳过连续空行, 在第一个非空行判定) ──
     annotation: dict[str, str] = {}
     data_start = header_idx + 1
+    # 跳过表头后连续空行 (避免空行短路，吞掉暗号种子)
+    while data_start < len(lines) and not lines[data_start].strip():
+        data_start += 1
     if (
         data_start < len(lines)
-        and lines[data_start].strip()
         and _looks_like_annotation_row(lines[data_start].split("\t"))
     ):
         ann = lines[data_start].split("\t")
@@ -588,6 +593,9 @@ def parse_enlight_sensors(
             cell = cell.strip()
             if cell:
                 annotation[str(col)] = _strip_code_quotes(cell)
+        data_start += 1
+    # 消费暗号行后也跳过后续空行 (暗号行与数据行之间可能还有空行)
+    while data_start < len(lines) and not lines[data_start].strip():
         data_start += 1
 
     # ── 逐行解析数据 ──
@@ -686,12 +694,17 @@ def _parse_hyperion_peaks(
         raise ValueError("Hyperion Peaks: 未找到 Timestamp\t# CH 1 表头行")
 
     # ── 格式判别: 计数列(A) vs 矩形(B) ──
-    # 1) 检测表头后是否紧跟内嵌暗号行，确定数据起点
+    # 1) 检测表头后是否紧跟内嵌暗号行，确定 data_start (跳过连续空行)
     data_start = header_idx + 1
+    while data_start < len(lines) and not lines[data_start].strip():
+        data_start += 1
     if data_start < len(lines) and _looks_like_annotation_row(
         lines[data_start].split("\t")
     ):
         data_start += 1
+        # 消费暗号行后也跳过后续空行
+        while data_start < len(lines) and not lines[data_start].strip():
+            data_start += 1
 
     # 2) 取第一条真实数据行，判别 A/B
     first = next(

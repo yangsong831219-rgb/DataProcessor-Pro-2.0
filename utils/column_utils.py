@@ -145,3 +145,71 @@ def detect_fbg_columns(df: pd.DataFrame) -> list[str]:
             fbg_cols = w_digit_cols
 
     return fbg_cols
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 数据列判定 — 哪些列是"可画的数值数据列"
+# ═══════════════════════════════════════════════════════════════════════
+
+def is_plottable_data_column(col_name: str, series: pd.Series | None = None) -> bool:
+    """判定一列是否是"可画的数值数据列"（排除标记/暗号/异常/非数值列）。
+
+    排除规则（任一命中即排除）：
+      - 列名以 _anomaly 结尾
+      - 列名 == 'Timestamp' 或含 '时间戳' / '时间'
+      - 提供了 series 且 dtype 为非数值 (bool/object/category/string)
+      - 提供了 series 且全为 False/NaN (纯标记列)
+
+    Args:
+        col_name: 列名 (str)
+        series:   可选，该列的 pandas Series（用于 dtype 和内容检测）
+
+    Returns:
+        True = 该列是可画的数值数据列
+    """
+    name = str(col_name)
+
+    # 硬排除：_anomaly 标记列
+    if name.endswith('_anomaly'):
+        return False
+
+    # 硬排除：时间戳/时间列
+    if name == 'Timestamp' or '时间戳' in name or name == '时间':
+        return False
+
+    if series is not None:
+        # dtype 排除：布尔/非数值类型
+        if pd.api.types.is_bool_dtype(series):
+            return False
+        if not pd.api.types.is_numeric_dtype(series):
+            return False
+
+        # 内容排除：纯零值/全NaN/全False 标记列
+        try:
+            unique_vals = series.dropna().unique()
+            if len(unique_vals) <= 1:
+                # 唯一值只有 0/False/NaN → 标记列
+                only_val = unique_vals[0] if len(unique_vals) == 1 else None
+                if only_val is None or only_val == 0 or only_val == 0.0 or only_val is False:
+                    return False
+        except Exception:
+            pass  # dtype 不兼容 unique() → 信任上面 is_numeric_dtype
+
+    return True
+
+
+def filter_plottable_columns(df: pd.DataFrame) -> list[str]:
+    """从 DataFrame 中筛选出所有可画的数据列。
+
+    Args:
+        df: 数据 DataFrame
+
+    Returns:
+        可画的数值数据列名列表
+    """
+    if df is None or df.empty:
+        return []
+    return [
+        str(c) for c in df.columns
+        if is_plottable_data_column(str(c), df[c])
+    ]

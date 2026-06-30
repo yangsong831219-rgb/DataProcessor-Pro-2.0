@@ -638,3 +638,287 @@ class TestHardAssertions:
                 parse_enlight_file(path)
         finally:
             os.unlink(path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 空行+暗号行 — 回归: 表头后空行不再吞暗号种子
+# ═══════════════════════════════════════════════════════════════════════
+
+def _make_26col_file(
+    *,
+    empty_lines_before_annot: int = 0,
+    empty_lines_after_annot: int = 0,
+    with_annot: bool = True,
+) -> str:
+    """构建类实际 26 列 Sensors 文件 (含 12 组 A/B/C × 1-4 波长列)。
+
+    表头: Timestamp + A1_1..A1_4 + B1_1..B1_4 + C1_1..C1_4 +
+           A2_1..A2_4 + B2_1..B2_4 + C2_1..C2_4
+    暗号行: w1-A1-1..w12-C2-2 (仅 24 列有暗号, Timestamp 留空)
+    """
+    import numpy as np
+
+    lines: list[str] = []
+    # 列前缀组: 6 组 × 4 列 = 24 列
+    groups = ["A1", "B1", "C1", "A2", "B2", "C2"]
+    col_names = []
+    annot_cells = []
+    s_idx = 1
+    for g in groups:
+        for k in range(1, 5):
+            col_names.append(f"{g}_{k}")
+            annot_cells.append(f"'w{s_idx}-{g}-{k}'")
+            s_idx += 1
+
+    header = "Timestamp\t" + "\t".join(col_names)
+    lines.append(header)
+
+    # 空行 (表头与暗号行之间)
+    for _ in range(empty_lines_before_annot):
+        lines.append("")
+
+    # 暗号行
+    if with_annot:
+        lines.append("\t" + "\t".join(annot_cells))
+
+    # 空行 (暗号行与数据之间)
+    for _ in range(empty_lines_after_annot):
+        lines.append("")
+
+    # 数据行 (5 行)
+    rng = np.random.default_rng(42)
+    for t in range(5):
+        ts = f"2026/6/23 12:00:0{t}.000"
+        vals = [f"{1525.0 + g_idx * 5.0 + t * 0.1 + rng.normal(0, 0.001):.6f}"
+                for g_idx in range(24)]
+        lines.append(f"{ts}\t" + "\t".join(vals))
+
+    text = "\n".join(lines)
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="test_26col_")
+    os.close(fd)
+    with open(path, "wb") as f:
+        f.write(b"\xef\xbb\xbf")  # BOM
+        f.write(text.encode("utf-8"))
+    return path
+
+
+class TestEmptyLinesAnnotation:
+    """表头后空行不短路暗号检测"""
+
+    def test_no_empty_lines_annotation_still_works(self):
+        """紧邻暗号行(0空行) — 不回归"""
+        path = _make_26col_file(
+            empty_lines_before_annot=0, empty_lines_after_annot=0,
+        )
+        try:
+            df, annotation, meta = parse_enlight_file(path)
+            assert len(annotation) == 24, \
+                f"expected 24 annotations, got {len(annotation)}"
+            assert annotation.get("A1_1") == "w1-A1-1", \
+                f"got {annotation.get('A1_1')!r}"
+            assert annotation.get("C2_4") == "w24-C2-4", \
+                f"got {annotation.get('C2_4')!r}"
+            assert len(df) == 5, f"expected 5 data rows, got {len(df)}"
+            # 列名无引号
+            for key in annotation:
+                assert "'" not in key, f"column name has quote: {key!r}"
+                assert '"' not in key, f"column name has quote: {key!r}"
+            # 数据行不含空行/暗号行
+            assert not df.isna().all(axis=1).any(), \
+                "data should not contain empty rows"
+        finally:
+            os.unlink(path)
+
+    def test_one_empty_line_before_annotation(self):
+        """表头后 1 空行 → 暗号仍被检测"""
+        path = _make_26col_file(
+            empty_lines_before_annot=1, empty_lines_after_annot=0,
+        )
+        try:
+            df, annotation, meta = parse_enlight_file(path)
+            assert len(annotation) == 24, \
+                f"expected 24 annotations, got {len(annotation)}"
+            assert annotation.get("A1_1") == "w1-A1-1"
+            assert annotation.get("C2_4") == "w24-C2-4"
+            assert len(df) == 5
+            # 暗号值无引号
+            for v in annotation.values():
+                assert "'" not in v, f"annotation value has quote: {v!r}"
+                assert '"' not in v, f"annotation value has quote: {v!r}"
+        finally:
+            os.unlink(path)
+
+    def test_empty_lines_after_annotation(self):
+        """暗号行后再 1 空行 → 数据起点正确(不含空行)"""
+        path = _make_26col_file(
+            empty_lines_before_annot=0, empty_lines_after_annot=1,
+        )
+        try:
+            df, annotation, meta = parse_enlight_file(path)
+            assert len(df) == 5, f"expected 5 data rows, got {len(df)}"
+            assert not df.iloc[0].isna().all(), \
+                "first data row should not be empty"
+            assert annotation.get("A1_1") == "w1-A1-1"
+        finally:
+            os.unlink(path)
+
+    def test_both_empty_lines_before_and_after_annotation(self):
+        """表头后 1 空行 + 暗号行 → 再 1 空行 → 数据 — 全覆盖"""
+        path = _make_26col_file(
+            empty_lines_before_annot=1, empty_lines_after_annot=1,
+        )
+        try:
+            df, annotation, meta = parse_enlight_file(path)
+            assert len(annotation) == 24
+            assert len(df) == 5
+            # 验证中间位置暗号
+            assert annotation.get("B1_1") == "w5-B1-1", \
+                f"got {annotation.get('B1_1')!r}"
+            assert annotation.get("C2_4") == "w24-C2-4", \
+                f"got {annotation.get('C2_4')!r}"
+        finally:
+            os.unlink(path)
+
+    def test_no_annotation_no_empty_lines_no_crash(self):
+        """无暗号行原始文件(0空行) → 种子空、不崩、数据正常"""
+        path = _make_26col_file(
+            empty_lines_before_annot=0, empty_lines_after_annot=0,
+            with_annot=False,
+        )
+        try:
+            df, annotation, meta = parse_enlight_file(path)
+            assert annotation == {}, \
+                f"expected empty annotation dict, got {annotation}"
+            assert len(df) == 5, f"expected 5 data rows, got {len(df)}"
+            # 数值列类型正确
+            for col in df.columns[1:]:
+                assert pd.api.types.is_numeric_dtype(df[col]), \
+                    f"column {col} should be numeric"
+        finally:
+            os.unlink(path)
+
+    def test_no_annotation_with_empty_lines_no_crash(self):
+        """无暗号行但有空行 → 种子空、不崩、数据正常"""
+        path = _make_26col_file(
+            empty_lines_before_annot=2, empty_lines_after_annot=0,
+            with_annot=False,
+        )
+        try:
+            df, annotation, meta = parse_enlight_file(path)
+            assert annotation == {}, "should be no annotation"
+            assert len(df) == 5
+        finally:
+            os.unlink(path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# parse_file 统一返回 (df, annotation) — 回归测试
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestParseFileReturnsAnnotation:
+    """parse_file 全格式统一返回 (df, annotation) 二元组"""
+
+    def test_enlight_file_returns_annotation(self):
+        """enlight 格式 → annotation 非空"""
+        from utils.file_parser import parse_file
+
+        path = _make_26col_file(with_annot=True)
+        try:
+            # 构造简化的 DataTemplate
+            class FakeEnlightTemplate:
+                file_format = 'enlight'
+                delimiter = '\t'
+                skip_rows = 0
+            df, annotation = parse_file(path, FakeEnlightTemplate())
+            assert isinstance(df, pd.DataFrame)
+            assert isinstance(annotation, dict)
+            assert len(annotation) == 24, \
+                f"expected 24 annotations, got {len(annotation)}"
+            assert annotation.get("A1_1") == "w1-A1-1"
+            assert annotation.get("C2_4") == "w24-C2-4"
+            # 暗号值干净无引号
+            for v in annotation.values():
+                assert "'" not in v
+                assert '"' not in v
+        finally:
+            os.unlink(path)
+
+    def test_enlight_file_no_annotation_returns_empty_dict(self):
+        """enlight 格式无暗号 → annotation = {}"""
+        from utils.file_parser import parse_file
+
+        path = _make_26col_file(with_annot=False)
+        try:
+            class FakeEnlightTemplate:
+                file_format = 'enlight'
+                delimiter = '\t'
+                skip_rows = 0
+            df, annotation = parse_file(path, FakeEnlightTemplate())
+            assert annotation == {}, \
+                f"expected empty annotation, got {annotation}"
+            assert len(df) == 5
+        finally:
+            os.unlink(path)
+
+    def test_csv_file_returns_empty_annotation(self):
+        """csv 格式 → annotation = {}"""
+        from utils.file_parser import parse_file
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".csv", prefix="test_csv_")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("col1,col2,col3\n1.0,2.0,3.0\n4.0,5.0,6.1\n")
+        try:
+            class FakeCsvTemplate:
+                file_format = 'csv'
+                delimiter = ','
+                skip_rows = 0
+            df, annotation = parse_file(path, FakeCsvTemplate())
+            assert annotation == {}, \
+                f"csv should have empty annotation, got {annotation}"
+            assert len(df) == 2
+        finally:
+            os.unlink(path)
+
+    def test_txt_file_returns_empty_annotation(self):
+        """txt 格式 → annotation = {}"""
+        from utils.file_parser import parse_file
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="test_txt_")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("A\tB\n1.0\t2.0\n")
+        try:
+            class FakeTxtTemplate:
+                file_format = 'txt'
+                delimiter = '\t'
+                skip_rows = 0
+            df, annotation = parse_file(path, FakeTxtTemplate())
+            assert annotation == {}, \
+                f"txt should have empty annotation, got {annotation}"
+            assert len(df) == 1
+        finally:
+            os.unlink(path)
+
+    def test_annotation_keys_match_df_columns(self):
+        """annotation 键与 df 列名一致（单一真源验证）"""
+        from utils.file_parser import parse_file
+
+        path = _make_26col_file(with_annot=True)
+        try:
+            class FakeEnlightTemplate:
+                file_format = 'enlight'
+                delimiter = '\t'
+                skip_rows = 0
+            df, annotation = parse_file(path, FakeEnlightTemplate())
+            for key in annotation:
+                assert key in df.columns, \
+                    f"annotation key {key!r} not in columns {list(df.columns)[:5]}..."
+            # 所有 annotation 值应与 parse_enlight_file 直接返回的一致
+            df2, annot2, _meta = parse_enlight_file(path)
+            assert annotation == annot2, \
+                "parse_file annotation should match parse_enlight_file annotation"
+        finally:
+            os.unlink(path)

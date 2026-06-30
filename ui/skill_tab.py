@@ -160,7 +160,7 @@ class AgentSkillWidget(QWidget):
         )
 
         try:
-            from py.github_skill_loader import GithubSkillLoader
+            from dp_engine.github_skill_loader import GithubSkillLoader
             loader = GithubSkillLoader(token if token else None)
             self.agent_log.append(
                 '<span style="color: green;">[OK]</span> 技能加载功能已调用'

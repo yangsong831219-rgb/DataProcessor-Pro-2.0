@@ -188,7 +188,7 @@ class DataFileProvider(DataProvider):
         if template and hasattr(template, 'column_notes'):
             cn = getattr(template, 'column_notes', {}) or {}
             col_notes = {str(k): str(v) for k, v in cn.items()}
-        # _get_calibration_annotation 兜底：读标定页 _annotation
+        # _get_calibration_annotation 兜底：读标定页 _annotation_dict
         if not col_notes:
             cal_ann = _get_calibration_annotation(main_win)
             if cal_ann:
@@ -214,6 +214,9 @@ class DataFileProvider(DataProvider):
         all_unknown = True
         for c in data.columns:
             cn = str(c)
+            # ★ 过滤清洗产生的 _anomaly 后缀列（非数据列）
+            if cn.endswith('_anomaly'):
+                continue
             note = col_notes.get(cn, '')
             if note:
                 all_unknown = False
@@ -229,7 +232,10 @@ class DataFileProvider(DataProvider):
             lines.append(f"列→传感器: {', '.join(col_segs)}")
 
         # ── 数值列统计摘要 ──
-        numeric_cols = data.select_dtypes(include=['number']).columns.tolist()
+        numeric_cols = [
+            c for c in data.select_dtypes(include=['number']).columns
+            if not str(c).endswith('_anomaly')  # ★ 过滤清洗产生的异常标记列
+        ]
         if numeric_cols:
             lines.append("数值列统计:")
             shown = 0
@@ -277,7 +283,7 @@ class CalibrationProvider(DataProvider):
         ct = getattr(main_win, 'calibration_tab_widget', None)
         if ct is None:
             return None
-        return getattr(ct, 'temperature_page', None)
+        return getattr(ct, 'temp_page', None)  # 真属性名: CalibrationTabWidget.temp_page
 
     def get_summary(self, main_win: Any, budget_chars: int = 2000) -> str:
         tp = self._get_temp_page(main_win)
@@ -301,23 +307,41 @@ class CalibrationProvider(DataProvider):
             lines.append("  (未运行)")
             return '\n'.join(lines)
 
-        # 收集传感器 ID — 以 ke_table 和 decoupling 为准，
-        # s_eff 里的纯波长通道 (w1-w12) 不是传感器，过滤掉
+        # 收集传感器 ID — 以 ke_table / decoupling / S_eff 三源并集
         sensor_ids: set[str] = set()
         sensor_ids.update(ke_table.keys())
         sensor_ids.update(d for d in decoupling.keys() if d in ke_table or d not in seff_data)
-        # 如果 decoupling 中有不在 ke_table 的（单栅），也加
         for dk in decoupling:
             if dk not in sensor_ids:
                 sensor_ids.add(dk)
 
-        # 从 s_eff 中只取已确认为传感器的 KT 值
-        # s_eff key 可能是波长通道名 (w1) 或传感器名 (A1)
-        # 按传感器名前缀匹配
+        # ★ 从 S_eff 的波长通道名提取传感器前缀 (如 A1-W1 → A1)
+        #   使 has_a=True / has_b=False 时也能输出温度灵敏度数据
+        seff_sensor_prefixes: dict[str, list[str]] = {}
+        if isinstance(seff_data, dict) and seff_data:
+            for wcol in seff_data:
+                if '-' in str(wcol):
+                    pfx = str(wcol).split('-')[0]
+                    if pfx not in seff_sensor_prefixes:
+                        seff_sensor_prefixes[pfx] = []
+                    seff_sensor_prefixes[pfx].append(str(wcol))
+            # 将 S_eff 派生的传感器前缀加入 sensor_ids（仅当 ke_table/decoupling 都未声明时兜底）
+            for pfx, channels in seff_sensor_prefixes.items():
+                if pfx not in sensor_ids and pfx not in ke_table:
+                    sensor_ids.add(pfx)
+
+        # 从 s_eff 中提取 KT 值（优先按传感器名，回落波长通道名）
         seff_for_sensor: dict[str, float] = {}
         for s_id in sensor_ids:
             if s_id in seff_data:
                 seff_for_sensor[s_id] = float(seff_data[s_id])
+            elif s_id in seff_sensor_prefixes:
+                # 传感器前缀 → 取该前缀下第一个波长通道的 slope
+                channels = seff_sensor_prefixes[s_id]
+                if channels and channels[0] in seff_data:
+                    s = seff_data[channels[0]]
+                    if isinstance(s, dict) and 'slope' in s:
+                        seff_for_sensor[s_id] = float(s['slope'])
 
         if not sensor_ids:
             lines.append("  (无传感器数据)")
@@ -350,23 +374,34 @@ class CalibrationProvider(DataProvider):
                 comp_d = compensation.get(s_name, {})
                 if isinstance(comp_d, dict):
                     grade = comp_d.get('grade')
-                    g = str(getattr(grade, 'grade', grade)) if grade else '?'
+                    if isinstance(grade, dict):
+                        g = str(grade.get('grade', '?'))
+                    else:
+                        g = str(grade) if grade else '?'
                     parts.append(f"评级=N/A (单栅不解耦)")
                 else:
                     parts.append("评级=N/A (单栅不解耦)")
             else:
-                # 双栅：Ke — 优先从应变 section 取精值，ke_table 为回退
-                strain_ke = _get_strain_ke(main_win, s_name) if main_win else None
-                if strain_ke:
-                    ke1_s = f"{float(strain_ke['Ke1']):.4f}"
-                    ke2_s = f"{float(strain_ke['Ke2']):.4f}"
+                # 双栅：Ke — ke_table 为单一真相源（用户点「应用全部系数」后写入），strain_configs 兜底
+                ke = ke_table.get(s_name, {}) if ke_table else {}
+                ke1_raw = ke.get('Ke1') if isinstance(ke, dict) else None
+                ke2_raw = ke.get('Ke2') if isinstance(ke, dict) else None
+                if isinstance(ke1_raw, (int, float)) and float(ke1_raw) != 0.0:
+                    # ke_table 有非零值 → 以此为权威
+                    ke1_s = f"{float(ke1_raw):.4f}"
+                    ke2_s = f"{float(ke2_raw):.4f}" if isinstance(ke2_raw, (int, float)) else '?'
+                elif isinstance(ke2_raw, (int, float)) and float(ke2_raw) != 0.0:
+                    ke1_s = f"{float(ke1_raw):.4f}" if isinstance(ke1_raw, (int, float)) else '?'
+                    ke2_s = f"{float(ke2_raw):.4f}"
                 else:
-                    ke = ke_table.get(s_name, {}) if ke_table else {}
-                    if isinstance(ke, dict):
-                        ke1_s = str(ke.get('Ke1', '?'))
-                        ke2_s = str(ke.get('Ke2', '?'))
+                    # ke_table 无真值 → 回退 strain_configs
+                    strain_ke = _get_strain_ke(main_win, s_name) if main_win else None
+                    if strain_ke:
+                        ke1_s = f"{float(strain_ke['Ke1']):.4f}"
+                        ke2_s = f"{float(strain_ke['Ke2']):.4f}"
                     else:
-                        ke1_s, ke2_s = '?', '?'
+                        ke1_s = str(ke.get('Ke1', '?')) if isinstance(ke, dict) else '?'
+                        ke2_s = str(ke.get('Ke2', '?')) if isinstance(ke, dict) else '?'
                 parts.append(f"Ke1/Ke2={ke1_s}/{ke2_s}")
 
                 # 解耦
@@ -383,34 +418,36 @@ class CalibrationProvider(DataProvider):
                 if isinstance(comp_d, dict):
                     metrics = comp_d.get('metrics')
                     if metrics is not None and not isinstance(metrics, (int, float)):
-                        fs = float(getattr(metrics, 'fs', 1000) or 1000)
+                        _m = metrics if isinstance(metrics, dict) else {}
+                        fs = float(_m.get('fs', 1000) or 1000)
                         parts.append(f"FS={fs:.0f}με")
                         # 补偿后 σ (%FS, LOOCV 口径)
-                        sigma_pct = getattr(metrics, 'residual_sigma_pct_fs', None)
+                        sigma_pct = _m.get('residual_sigma_pct_fs')
                         if sigma_pct is not None:
                             parts.append(f"补偿后σ={float(sigma_pct):.3f}%FS(LOOCV)")
                         # 迟滞
-                        hys_pct = getattr(metrics, 'hysteresis_max_pct_fs', None)
+                        hys_pct = _m.get('hysteresis_max_pct_fs')
                         if hys_pct is not None and not (hys_pct != hys_pct):  # non-NaN
                             parts.append(f"迟滞={float(hys_pct):.3f}%FS")
                         # 重复性
-                        rep_pct = getattr(metrics, 'repeatability_pct_fs', None)
+                        rep_pct = _m.get('repeatability_pct_fs')
                         if rep_pct is not None:
                             parts.append(f"重复性={float(rep_pct):.3f}%FS")
                         # 旗标
-                        lc = getattr(metrics, 'low_confidence', False)
+                        lc = _m.get('low_confidence', False)
                         if lc:
                             parts.append("(低置信度)")
-                        cf = getattr(metrics, 'comp_form', '')
+                        cf = str(_m.get('comp_form', ''))
                         if cf:
-                            po = getattr(metrics, 'poly_order', 0)
+                            po = _m.get('poly_order', 0)
                             parts.append(f"{cf}" + (f"_{po}" if cf == 'poly' else ''))
 
                     grade = comp_d.get('grade')
                     if grade is not None and not isinstance(grade, (int, float, str)):
-                        g = str(getattr(grade, 'grade', '?'))
-                        passed = bool(getattr(grade, 'passed', False))
-                        reasons = getattr(grade, 'reasons', []) or []
+                        _g = grade if isinstance(grade, dict) else {}
+                        g = str(_g.get('grade', '?'))
+                        passed = bool(_g.get('passed', False))
+                        reasons = _g.get('reasons', []) or []
                         if g in ('FAIL', 'ERROR'):
                             reason_str = '; '.join(str(r) for r in reasons[:2])
                             parts.append(f"评级={g}({reason_str})")
@@ -563,33 +600,84 @@ class AnalysisProvider(DataProvider):
     disabled_hint = "无结果 — 运行数据分析后可用"
 
     def is_available(self, main_win: Any) -> bool:
-        sr = getattr(main_win, 'sensor_results', None)
-        return bool(sr)
+        atw = getattr(main_win, 'analysis_tab_widget', None)
+        if atw is None:
+            return False
+        data = getattr(atw, '_current_data', None)
+        return data is not None and not data.empty
 
     def get_summary(self, main_win: Any, budget_chars: int = 2000) -> str:
-        sr = getattr(main_win, 'sensor_results', {})
-        if not sr:
-            return "【数据分析】无传感器计算结果"
+        atw = getattr(main_win, 'analysis_tab_widget', None)
+        if atw is None:
+            return "【数据分析】无数据分析结果（分析页未就绪）"
+        df = getattr(atw, '_current_data', None)
+        if df is None or df.empty:
+            return "【数据分析】无数据分析结果"
 
-        lines = ["【数据分析】"]
-        for sensor_id, values in sorted(sr.items()):
-            clean_vals = [v for v in values if v is not None]
-            if not clean_vals:
-                lines.append(f"  {sensor_id}: (无有效值)")
-                continue
-            feat = compute_time_series_features(clean_vals)
-            lines.append(
-                f"  {sensor_id}: n={feat['n']} | "
-                f"均值={feat['mean']:.3f} | σ={feat['std']:.3f} | "
-                f"范围=[{feat['min']:.3f}, {feat['max']:.3f}] ({feat['range']:.3f}) | "
-                f"漂移≈{feat['drift_slope_per_1k']:.4f}με/千样本 | "
-                f"{feat['stability']}"
-            )
-            if len('\n'.join(lines)) > budget_chars:
-                current = '\n'.join(lines)
-                return current[:budget_chars - 20] + "\n(已截断)"
+        # ── 暗号名映射: main_win.current_annotation = {原始列名: 暗号名} ──
+        annotation_map: dict[str, str] = {}
+        annot_dict = getattr(main_win, 'current_annotation', None) or {}
+        if isinstance(annot_dict, dict):
+            annotation_map = {str(k): str(v) for k, v in annot_dict.items()}
 
-        return '\n'.join(lines)
+        from utils.column_utils import is_plottable_data_column
+
+        # 筛选可画的数据列（排除 _anomaly / 时间戳 / 非数值）
+        data_cols: list[str] = []
+        for c in df.columns:
+            col_str = str(c)
+            series = df[col_str]
+            if is_plottable_data_column(col_str, series):
+                data_cols.append(col_str)
+
+        if not data_cols:
+            return "【数据分析】无可用的数值数据列"
+
+        # ── 逐列生成统计摘要 ──
+        lines: list[str] = ["【数据分析】"]
+        header_len = len(lines[0])  # for budget tracking
+        total_cols = len(data_cols)
+        included = 0
+        truncated = False
+
+        for col in data_cols:
+            # 解析显示名: 优先暗号名，退而原始列名
+            ann = annotation_map.get(col, '') or annotation_map.get(str(col), '')
+            display = ann.strip() if ann and ann.strip() != str(col) else col
+
+            # compute_time_series_features 内部通过 np.asarray + np.isfinite 自动滤 NaN/None/inf
+            feat = compute_time_series_features(df[col])
+            if feat['n'] < 2:
+                next_line = f"  {display}: (无有效值)"
+            else:
+                next_line = (
+                    f"  {display}: n={feat['n']} | "
+                    f"均值={feat['mean']:.3f} | σ={feat['std']:.3f} | "
+                    f"范围=[{feat['min']:.3f}, {feat['max']:.3f}] ({feat['range']:.3f}) | "
+                    f"漂移≈{feat['drift_slope_per_1k']:.4f}/千样本 | "
+                    f"{feat['stability']}"
+                )
+            # Check budget BEFORE appending
+            candidate = '\n'.join(lines + [next_line])
+            if len(candidate) > budget_chars:
+                truncated = True
+                break
+            lines.append(next_line)
+            included += 1
+
+        result = '\n'.join(lines)
+        if truncated:
+            note = f"\n(仅显示前 {included} 列，共 {total_cols} 列，余略)"
+            # Fit the note within budget
+            if len(result) + len(note) <= budget_chars + 80:  # tolerate slight overshoot
+                result += note
+            else:
+                # trim result slightly to fit note
+                avail = budget_chars - len(note) - 3
+                if avail > header_len:
+                    result = result[:avail] + "…" + note
+
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -833,9 +921,9 @@ def _get_calibration_annotation(main_win: Any) -> dict[str, str] | None:
     ct = getattr(main_win, 'calibration_tab_widget', None)
     if ct is None:
         return None
-    tp = getattr(ct, 'temperature_page', None)
-    if tp and hasattr(tp, '_annotation'):
-        ann = tp._annotation  # type: ignore[union-attr]
+    tp = getattr(ct, 'temp_page', None)
+    if tp:
+        ann = getattr(tp, '_annotation_dict', None) or getattr(tp, '_annotation', None)
         if ann:
             return {str(k): str(v) for k, v in ann.items()}
     return None
@@ -847,18 +935,26 @@ def _get_strain_ke(main_win: Any, sensor: str) -> dict[str, float] | None:
     if ct is None:
         return None
     sp = getattr(ct, 'strain_page', None)
-    if sp and hasattr(sp, '_phase_b_state'):
-        sb = sp._phase_b_state or {}  # type: ignore[union-attr]
-        strain_data = sb.get(sensor, {})
-        if isinstance(strain_data, dict):
-            ke = strain_data.get('ke_results', {})
-            if ke:
-                return {"Ke1": float(ke.get("Ke1", 0)), "Ke2": float(ke.get("Ke2", 0))}
-    # Fallback: check ProfileConfig on strain page
+    # ★ Fallback: check StrainSubConfig in _strain_configs (真数据路径)
     if sp and hasattr(sp, '_strain_configs'):
         sc = sp._strain_configs or {}  # type: ignore[union-attr]
         for _, cfg in sc.items():
             ke = getattr(cfg, 'ke_results', None)
             if ke and getattr(cfg, 'sensor_name', '') == sensor:
-                return {"Ke1": float(getattr(ke, 'Ke1', 0)), "Ke2": float(getattr(ke, 'Ke2', 0))}
+                # ★ ke_results 是 dict 如 {"Ke1": 1.18, "Ke2": 0.95}
+                #   getattr(cfg, 'ke_results', None) 取到的是 dict，
+                #   下面用 dict 的 .get() 取值（不用 getattr，dict 没有 .Ke1 属性）
+                if isinstance(ke, dict):
+                    k1 = float(ke.get('Ke1', 0))
+                    k2 = float(ke.get('Ke2', 0))
+                elif hasattr(ke, 'get'):
+                    k1 = float(ke.get('Ke1', 0))  # pyright: ignore[reportAttributeAccessIssue]  # 防御: Mapping 接口
+                    k2 = float(ke.get('Ke2', 0))  # pyright: ignore[reportAttributeAccessIssue]
+                else:
+                    return None  # ke 类型不可识别，不下结论
+                # ★ 如果 ke_results 的 Ke1/Ke2 都是 0 (未标定/锚固栅)，不返回，
+                #   让调用方回落 ke_table（避免 0 挡住真实值）
+                if k1 == 0.0 and k2 == 0.0:
+                    return None
+                return {"Ke1": k1, "Ke2": k2}
     return None

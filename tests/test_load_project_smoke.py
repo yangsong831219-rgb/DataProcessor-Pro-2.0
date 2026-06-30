@@ -37,7 +37,7 @@ def qapp():
 def _save_temp_project(temp_dir: str, name: str, temperature: dict | None,
                         strain: dict | None = None) -> str:
     """把一个 ProjectConfig 写入临时目录。"""
-    from py.calibration.project_config import ProjectConfig, StrainSubConfig
+    from dp_engine.calibration.project_config import ProjectConfig, StrainSubConfig
     pc = ProjectConfig(
         name=name, created_at="2026-01-01T00:00:00",
         last_modified="2026-01-01T00:00:00",
@@ -75,8 +75,8 @@ class TestLoadProjectConfigSmoke:
         try:
             _save_temp_project(tmp_dir, "smoke_temp_only", _make_simple_temperature())
 
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
             old_dir = pcfg.PROFILES_DIR
             pcfg.PROFILES_DIR = tmp_dir
 
@@ -107,8 +107,8 @@ class TestLoadProjectConfigSmoke:
                                strain={"B1": {"sensor_name": "B1", "sensor_mode": "single",
                                                "ke_results": {"Ke1": 1.5, "Ke2": 0.0}}})
 
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
             old_dir = pcfg.PROFILES_DIR
             pcfg.PROFILES_DIR = tmp_dir
 
@@ -139,8 +139,8 @@ class TestLoadProjectConfigSmoke:
                                                "ke_results": {"Ke1": 1.23, "Ke2": 0.98}}},
                                )
 
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
             old_dir = pcfg.PROFILES_DIR
             pcfg.PROFILES_DIR = tmp_dir
 
@@ -172,8 +172,8 @@ class TestLoadProjectRestore:
         try:
             _save_temp_project(tmp_dir, "rt_smoke", _make_simple_temperature())
 
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
             old_dir = pcfg.PROFILES_DIR
             pcfg.PROFILES_DIR = tmp_dir
 
@@ -208,8 +208,8 @@ class TestManageProfilesTable:
         try:
             _save_temp_project(tmp_dir, "mgr_smoke", _make_simple_temperature())
 
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
             old_dir = pcfg.PROFILES_DIR
             pcfg.PROFILES_DIR = tmp_dir
 
@@ -242,8 +242,8 @@ class TestStrainLoadProjectList:
                                                "ke_results": {"Ke1": 2.0, "Ke2": 0.0}}},
                                )
 
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
             old_dir = pcfg.PROFILES_DIR
             pcfg.PROFILES_DIR = tmp_dir
 

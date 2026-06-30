@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 import json
+import os
 import sys
 import pytest
 
@@ -686,6 +687,111 @@ class TestTruncationDetection:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Test 6b: configure_online — 就地更新单例 (不 reset _instance)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestConfigureOnline:
+    """AIClient.configure_online() 统一配置源测试."""
+
+    def test_configure_makes_available(self):
+        """configure_online 后 is_available()→True。"""
+        from core.ai_client import AIClient
+        AIClient._instance = None
+        # 从无配置开始 (env 可能也有值, 先设空)
+        old_val = os.environ.pop('DEEPSEEK_API_KEY', None)
+        try:
+            client = AIClient()
+            if client.backend == 'local':
+                # 切到 online
+                client._backend = 'online'
+            assert not client.is_available()
+            client.configure_online("sk-test-123", "https://api.test.com/v1", "test-model")
+            assert client.is_available()
+            assert client.api_key == "sk-test-123"
+            assert client.base_url == "https://api.test.com/v1"
+            assert client.model_name == "test-model"
+            assert client.backend == 'online'
+        finally:
+            if old_val is not None:
+                os.environ['DEEPSEEK_API_KEY'] = old_val
+
+    def test_configure_switches_backend_to_online(self):
+        """configure_online 必须把 _backend 设为 'online'(承重: is_available 分支)。"""
+        from core.ai_client import AIClient
+        AIClient._instance = None
+        client = AIClient()
+        client._backend = 'local'  # 模拟本地模式
+        client.base_url = 'http://127.0.0.1:8080/v1'
+        # 此时 is_available 走 local 分支 → bool(base_url) → True
+        assert client.is_available()
+        # configure_online 必须切 backend
+        client.configure_online("sk-test", "https://api.deepseek.com/v1")
+        assert client.backend == 'online'
+        assert client.is_available()  # 走 online 分支 → bool(api_key) → True
+
+    def test_configure_online_preserves_existing_fields(self):
+        """传入空的 base_url/model_name 不覆盖已有值。"""
+        from core.ai_client import AIClient
+        AIClient._instance = None
+        client = AIClient()
+        client.model_name = "existing-model"
+        client.base_url = "https://existing.url/v1"
+        client.configure_online("sk-test")
+        assert client.model_name == "existing-model"
+        assert client.base_url == "https://existing.url/v1"
+
+    def test_configure_empty_key_is_noop(self):
+        """空 api_key 不写单例 (调用方已应验证非空)。"""
+        from core.ai_client import AIClient
+        AIClient._instance = None
+        client = AIClient()
+        client._backend = 'online'
+        client.api_key = ''
+        client.configure_online("")
+        assert client.backend == 'online'
+        assert client.api_key == ''  # 未被覆盖
+
+    def test_configure_syncs_max_tokens_and_temperature(self):
+        """configure_online 同步 max_tokens + temperature 到单例。"""
+        from core.ai_client import AIClient
+        AIClient._instance = None
+        client = AIClient()
+        client.max_tokens = 2048
+        client.temperature = 0.3
+        client.configure_online(
+            "sk-test", "https://a.b/v1", "m",
+            max_tokens=8192, temperature=0.5,
+        )
+        assert client.max_tokens == 8192
+        assert client.temperature == 0.5
+        # 0 值不覆盖
+        client.configure_online(
+            "sk-test", max_tokens=0, temperature=0.0,
+        )
+        assert client.max_tokens == 8192  # unchanged
+        assert client.temperature == 0.5   # unchanged
+
+    def test_generate_uses_singleton_max_tokens(self):
+        """generate() 未传 max_tokens 时用单例 self.max_tokens。"""
+        from core.ai_client import AIClient
+        AIClient._instance = None
+        client = AIClient()
+        client.max_tokens = 8888
+        # is_available 先配好
+        client._backend = 'online'
+        client.api_key = 'sk-test'
+        client.model_name = 'test-model'
+        # 直接看 generate 的默认解析 (没法真调 API, 只看 _max_tokens 推断逻辑:
+        #   generate(prompt) → max_tokens=0 → _max_tokens = self.max_tokens = 8888)
+        # 通过查看方法签名确认 — 默认参数从 2048 变成了 0
+        import inspect
+        sig = inspect.signature(client.generate)
+        mt_default = sig.parameters['max_tokens'].default
+        assert mt_default == 0, f"generate max_tokens default should be 0, got {mt_default}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Test 7: Mock 降级边界 — "配置了但连不上" 抛错，"未配置" 才 mock
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -790,3 +896,118 @@ class TestMockFallbackBoundary:
         with pytest.raises(AIClientAuthError):
             result = fn("test")
             assert "Mock 大纲" not in str(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Per-backend timeout split (local vs online)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestBackendTimeoutSplit:
+    """_get_httpx_timeout 和 _make_openai_kwargs 按 backend 分流"""
+
+    def _make_client(self, backend: str, monkeypatch, **local_cfg):
+        """构造 AIClient 实例，注入 backend 和假配置。"""
+        import core.ai_client as _mod
+        cfg = {"_backend": backend, "_local": dict(local_cfg)}
+
+        # 直接覆写类属性 — _load_config_json 是 @staticmethod, 赋值覆盖
+        monkeypatch.setattr(_mod.AIClient, '_load_config_json', staticmethod(lambda: cfg))
+
+        client = _fresh_client(monkeypatch)
+        # init 时需要 _load_config_json 已就绪 ↔ 已在 monkeypatch 上完成
+        _init_client(client, monkeypatch)
+        return client
+
+    def test_local_timeout_is_long(self, monkeypatch):
+        """本地后端 read 超时 ≥ 600s (覆盖 ~661s 最坏单轮)。"""
+        client = self._make_client('local', monkeypatch)
+        to = client._get_httpx_timeout()
+        assert to is not None
+        assert to.read >= 600.0, f"本地 read 超时过短: {to.read}s"
+
+    def test_online_timeout_unchanged(self, monkeypatch):
+        """在线后端 read 超时维持 120s。"""
+        client = self._make_client('online', monkeypatch)
+        to = client._get_httpx_timeout()
+        assert to is not None
+        assert to.read == 120.0, f"在线 read 超时应为 120s, 实际 {to.read}s"
+
+    def test_local_read_timeout_from_config(self, monkeypatch):
+        """本地超时从配置文件 _local.read_timeout_s 读取。"""
+        client = self._make_client('local', monkeypatch, read_timeout_s=300)
+        to = client._get_httpx_timeout()
+        assert to.read == 300.0, f"配置的 read_timeout_s=300 未生效, 实际 {to.read}"
+
+    def test_connect_timeout_same_for_both(self, monkeypatch):
+        """连接超时 10s 对 local/online 均不变。"""
+        for be in ('local', 'online'):
+            client = self._make_client(be, monkeypatch)
+            to = client._get_httpx_timeout()
+            assert to.connect == 10.0, f"{be}: connect 超时应为 10s"
+
+    def test_local_make_openai_kwargs_has_http_client(self, monkeypatch):
+        """本地后端 _make_openai_kwargs 返回 http_client (非 timeout 裸值)。"""
+        client = self._make_client('local', monkeypatch)
+        kw = client._make_openai_kwargs()
+        assert 'http_client' in kw, f"本地应返回 http_client, 实际 keys: {list(kw.keys())}"
+        assert 'timeout' not in kw, "本地不应返回裸 timeout"
+
+    def test_online_make_openai_kwargs_has_timeout(self, monkeypatch):
+        """在线后端 _make_openai_kwargs 返回 timeout (非 http_client)。"""
+        client = self._make_client('online', monkeypatch)
+        kw = client._make_openai_kwargs()
+        assert 'timeout' in kw, f"在线应返回 timeout, 实际 keys: {list(kw.keys())}"
+        assert 'http_client' not in kw, "在线不应返回 http_client"
+
+    def test_local_http_client_trust_env_false(self, monkeypatch):
+        """本地后端的 http_client 拒绝环境代理。"""
+        client = self._make_client('local', monkeypatch)
+        kw = client._make_openai_kwargs()
+        hc = kw['http_client']
+        assert hc.trust_env is False, f"本地应 trust_env=False"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Human-readable timeout error in _invoke_llm
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestInvokeLlmTimeoutMessage:
+    """_invoke_llm 超时时输出人类可读消息（不暴露 raw traceback）。"""
+
+    def test_timeout_message_is_chinese_readable(self, monkeypatch):
+        """超时时不再是一串 httpx traceback。"""
+        from core.ai_errors import AIClientTimeoutError
+        from core.ai_client import AIClient as _AIC
+
+        # Mock AIClient.get_instance() 返回一个会 raise Timeout 的假实例
+        class MockClient:
+            backend = 'local'
+            model_name = 'test-model'
+
+            def _get_context_size(self):
+                return 8192
+
+            def _estimate_tokens(self, text):
+                return len(text) // 2
+
+            def _safe_max_tokens(self, sp, up, req):
+                return min(req, 4000) if req > 0 else 4000
+
+            def generate(self, **kw):
+                raise AIClientTimeoutError("httpx.ReadTimeout")
+
+        monkeypatch.setattr(_AIC, 'get_instance', lambda: MockClient())
+
+        from dp_engine.multi_agent import _invoke_llm
+        try:
+            _invoke_llm("system", "user", max_tokens=4000)
+        except AIClientTimeoutError as e:
+            msg = str(e)
+            # 必须含中文提示
+            assert "超时" in msg, f"消息缺'超时': {msg}"
+            assert "max_tokens" in msg, f"消息缺 max_tokens: {msg}"
+            # 不得含 raw exception 链
+            assert "ReadTimeout" not in msg, f"消息不应含 raw 异常名: {msg}"
+            assert "traceback" not in msg.lower(), f"消息不应含 traceback"
+        else:
+            pytest.fail("应抛出 AIClientTimeoutError")

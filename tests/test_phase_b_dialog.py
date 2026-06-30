@@ -447,3 +447,281 @@ def test_state_restore_no_fake_zeros(qapp):
             assert val >= 0, f"e_std should be non-negative, got {val}"
 
     dlg.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 1: sensors 落盘 + reject 未保存提示
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _MockTempPageForPhaseB:
+    """模拟 TemperatureCalibrationPage — 仅含 _phase_b_state 供写回验证。"""
+
+    def __init__(self):
+        self._phase_b_state = {}
+        self._phase_b_result = None
+        self._annotation_dict = {}
+        self._annotation_groups = {}
+        self._annotation_dirty: set = set()
+        self._last_result = None
+        self._phase_a_done = True
+
+
+class _MockCalTabWidget:
+    """模拟 CalibrationTabWidget — 供 _get_cal_tab_widget 使用。"""
+    def __init__(self):
+        self.project_config = None
+
+
+class TestPhaseBWritebackSensors:
+    """_write_state_to_main_page 落盘 sensors → from_providers 可读"""
+
+    @pytest.fixture
+    def phase_b_dialog_with_result(self, sample_df, qapp, monkeypatch):
+        """构造 PhaseBDialog，模拟分析完成有 _last_result。"""
+        from ui.calibration_tab import PhaseBDialog, TemperatureCalibrationPage
+
+        page = TemperatureCalibrationPage()
+        page._loaded_df = sample_df
+
+        S_eff = {}
+        for wl in ["A1-W1", "A1-W2", "A2-W1", "A2-W2"]:
+            S_eff[wl] = {"slope": 28.0, "intercept": -280.0, "T_base": 10.0, "r2": 0.99}
+
+        dlg = PhaseBDialog(sample_df,
+            {"A1": [{"col_name": "A1-W1", "name": "A1-W1"},
+                    {"col_name": "A1-W2", "name": "A1-W2"}],
+             "A2": [{"col_name": "A2-W1", "name": "A2-W1"},
+                    {"col_name": "A2-W2", "name": "A2-W2"}]},
+            {"S_eff": S_eff, "df": sample_df, "plateaus": pd.DataFrame()},
+            parent=page,
+        )
+
+        n = 100
+        rng = np.random.default_rng(42)
+        T_abs = np.linspace(25, 85, n)
+        eps_a1 = 500 * np.sin(np.linspace(0, np.pi, n)) + rng.normal(0, 5, n)
+        eps_a2 = 400 * np.sin(np.linspace(0, np.pi, n)) + rng.normal(0, 3, n)
+
+        dlg._last_result = {
+            "sensors": {
+                "A1": {
+                    "single_grating": False,
+                    "T_abs": T_abs, "eps_orig": eps_a1,
+                    "eps_corr": eps_a1 * 0.9,
+                    "dT_orig": np.zeros(n), "dT_corr": np.zeros(n),
+                    "S1": 28.0, "S2": 28.5, "T_base": 10.0,
+                },
+                "A2": {
+                    "single_grating": False,
+                    "T_abs": T_abs, "eps_orig": eps_a2,
+                    "eps_corr": eps_a2 * 0.7,
+                    "dT_orig": np.zeros(n), "dT_corr": np.zeros(n),
+                    "S1": 28.0, "S2": 28.5, "T_base": 10.0,
+                },
+                "B1": {
+                    "single_grating": True,
+                    "S1": 41.0, "T_base": 10.0, "R2": 0.99,
+                },
+            },
+            "comparisons": [],
+            "df": sample_df, "time_h": np.arange(n) / 3600.0,
+            "compensation": {},
+        }
+
+        class _FakeGrade:
+            grade = "优"
+            passed = True
+            reasons: list = []
+            def to_dict(self):
+                return {"grade": self.grade, "passed": self.passed}
+        dlg._compensation_results = {
+            "A1": {"model": None, "metrics": None, "grade": _FakeGrade()},
+            "A2": {"model": None, "metrics": None, "grade": _FakeGrade()},
+        }
+
+        yield dlg
+        dlg.close()
+
+    def test_sensors_written_to_phase_b_state(self, phase_b_dialog_with_result):
+        """落盘后 _phase_b_state['sensors'] 含 T_abs/eps_orig"""
+        dlg = phase_b_dialog_with_result
+        tp = _MockTempPageForPhaseB()
+        dlg._get_temp_page = lambda: tp  # type: ignore[method-assign]
+        dlg._write_state_to_main_page()
+
+        assert "sensors" in tp._phase_b_state, \
+            f"落盘字典缺 sensors, keys={list(tp._phase_b_state.keys())}"
+        sensors = tp._phase_b_state["sensors"]
+        assert "A1" in sensors
+        assert "A2" in sensors
+        a1 = sensors["A1"]
+        assert "T_abs" in a1, f"A1 keys={list(a1.keys())}"
+        assert "eps_orig" in a1
+        assert len(a1["T_abs"]) > 0
+        assert len(a1["eps_orig"]) > 0
+        # 不影响原有字段
+        assert "compensation" in tp._phase_b_state
+        assert "decoupling_results" in tp._phase_b_state
+
+    def test_empty_sensors_does_not_crash(self, sample_df, qapp):
+        """_last_result.sensors 为空 → 落盘 sensors={} 不崩"""
+        from ui.calibration_tab import PhaseBDialog, TemperatureCalibrationPage
+        page = TemperatureCalibrationPage()
+        page._loaded_df = sample_df
+        dlg = PhaseBDialog(sample_df,
+            {"A1": [{"col_name": "A1-W1", "name": "A1-W1"}]},
+            {"S_eff": {"A1-W1": {"slope": 28.0, "T_base": 10.0, "r2": 0.99}},
+             "df": sample_df, "plateaus": pd.DataFrame()},
+            parent=page,
+        )
+        dlg._last_result = {"sensors": {}, "comparisons": [], "compensation": {}}
+        tp = _MockTempPageForPhaseB()
+        dlg._get_temp_page = lambda: tp  # type: ignore[method-assign]
+        dlg._write_state_to_main_page()
+        assert tp._phase_b_state.get("sensors") == {}
+        dlg.close()
+
+    def test_last_result_none_does_not_crash(self, sample_df, qapp):
+        """_last_result = None → _write_state_to_main_page 不崩, sensors={}"""
+        from ui.calibration_tab import PhaseBDialog, TemperatureCalibrationPage
+        page = TemperatureCalibrationPage()
+        page._loaded_df = sample_df
+        dlg = PhaseBDialog(sample_df,
+            {"A1": [{"col_name": "A1-W1", "name": "A1-W1"}]},
+            {"S_eff": {"A1-W1": {"slope": 28.0, "T_base": 10.0, "r2": 0.99}},
+             "df": sample_df, "plateaus": pd.DataFrame()},
+            parent=page,
+        )
+        dlg._last_result = None  # ← 未分析
+        tp = _MockTempPageForPhaseB()
+        dlg._get_temp_page = lambda: tp  # type: ignore[method-assign]
+        # 不应崩
+        dlg._write_state_to_main_page()
+        assert tp._phase_b_state.get("sensors") == {}
+        # 其他字段仍正常落盘 (ke_table 从 coef_table 读)
+        assert "ke_table" in tp._phase_b_state
+        dlg.close()
+
+    def test_from_providers_reads_sensors_after_writeback(
+        self, phase_b_dialog_with_result):
+        """闭环: 落盘 → from_providers → hyst_sensors 非空"""
+        dlg = phase_b_dialog_with_result
+        tp = _MockTempPageForPhaseB()
+
+        dlg._get_temp_page = lambda: tp  # type: ignore[method-assign]
+        dlg._coeffs = {"A1": {"Ke1": 1.2, "Ke2": 1.2}}
+        dlg._write_state_to_main_page()
+
+        from core.chart_bundle import ChartBundle
+
+        class _MW:
+            current_data = None
+            sensor_results = {}
+            analysis_tab_widget = None
+            calibration_tab_widget = None
+
+        mw = _MW()
+        atw = type("ATW", (), {"_current_data": None})()
+        mw.analysis_tab_widget = atw  # type: ignore[assignment]
+        ctw = type("CTW", (), {"temp_page": tp})()
+        mw.calibration_tab_widget = ctw  # type: ignore[assignment]
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert len(bundle.hyst_sensors) >= 1, \
+            f"A1+A2应≥1有迟滞, 实际 {len(bundle.hyst_sensors)}"
+        names = {hs["name"] for hs in bundle.hyst_sensors}
+        assert "A1" in names
+        for hs in bundle.hyst_sensors:
+            assert isinstance(hs["T_abs"], list)
+            assert isinstance(hs["eps"], list)
+            assert len(hs["T_abs"]) > 0
+
+
+class TestPhaseBRejectConfirmation:
+    """reject 有未保存结果 → 弹确认; 无结果 → 不弹"""
+
+    @pytest.fixture
+    def dialog_no_result(self, sample_df, qapp):
+        from ui.calibration_tab import PhaseBDialog, TemperatureCalibrationPage
+        page = TemperatureCalibrationPage()
+        page._loaded_df = sample_df
+        dlg = PhaseBDialog(sample_df,
+            {"A1": [{"col_name": "A1-W1", "name": "A1-W1"}]},
+            {"S_eff": {"A1-W1": {"slope": 28.0, "T_base": 10.0, "r2": 0.99}},
+             "df": sample_df, "plateaus": pd.DataFrame()},
+            parent=page,
+        )
+        yield dlg
+        dlg.close()
+
+    @pytest.fixture
+    def dialog_with_result(self, sample_df, qapp):
+        from ui.calibration_tab import PhaseBDialog, TemperatureCalibrationPage
+        page = TemperatureCalibrationPage()
+        page._loaded_df = sample_df
+        dlg = PhaseBDialog(sample_df,
+            {"A1": [{"col_name": "A1-W1", "name": "A1-W1"}]},
+            {"S_eff": {"A1-W1": {"slope": 28.0, "T_base": 10.0, "r2": 0.99}},
+             "df": sample_df, "plateaus": pd.DataFrame()},
+            parent=page,
+        )
+        dlg._last_result = {"sensors": {}, "comparisons": [], "compensation": {}}
+        yield dlg
+        dlg.close()
+
+    def test_reject_with_result_shows_confirmation(self, dialog_with_result):
+        """有 _last_result → QMessageBox Yes/No 弹窗"""
+        from unittest import mock as _umock
+        dlg = dialog_with_result
+        with _umock.patch("PyQt6.QtWidgets.QMessageBox.question") as mock_q:
+            mock_q.return_value = _umock.MagicMock()
+            dlg.reject()
+        mock_q.assert_called_once()
+        call_args = mock_q.call_args[0]
+        assert "未保存的分析结果" in str(call_args)
+
+    def test_reject_no_result_direct_close(self, dialog_no_result):
+        """无 _last_result → 不弹窗, 直接 reject"""
+        from unittest import mock as _umock
+        dlg = dialog_no_result
+        with _umock.patch("PyQt6.QtWidgets.QMessageBox.question") as mock_q:
+            dlg.reject()
+        mock_q.assert_not_called()
+
+    def test_reject_select_no_stays_open(self, dialog_with_result):
+        """选 No → 不调 QDialog.reject"""
+        from unittest import mock as _umock
+        from PyQt6.QtWidgets import QMessageBox, QDialog
+        dlg = dialog_with_result
+        parent_reject_called = [False]
+
+        def _fake_parent_reject(_self):
+            parent_reject_called[0] = True
+
+        with _umock.patch.object(QDialog, "reject", _fake_parent_reject), \
+             _umock.patch("PyQt6.QtWidgets.QMessageBox.question",
+                          return_value=QMessageBox.StandardButton.No):
+            dlg.reject()
+
+        assert not parent_reject_called[0], \
+            "选 No 不应调 QDialog.reject()"
+
+    def test_reject_select_yes_closes(self, dialog_with_result):
+        """选 Yes → 调 QDialog.reject()"""
+        from unittest import mock as _umock
+        from PyQt6.QtWidgets import QMessageBox, QDialog
+        dlg = dialog_with_result
+        parent_reject_called = [False]
+
+        def _fake_parent_reject(_self):
+            parent_reject_called[0] = True
+
+        with _umock.patch.object(QDialog, "reject", _fake_parent_reject), \
+             _umock.patch("PyQt6.QtWidgets.QMessageBox.question",
+                          return_value=QMessageBox.StandardButton.Yes):
+            dlg.reject()
+
+        assert parent_reject_called[0], \
+            "选 Yes 应调 QDialog.reject()"

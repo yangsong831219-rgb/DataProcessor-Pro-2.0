@@ -20,8 +20,9 @@ from typing import Any, Dict, List, Optional
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup, QDialog, QFileDialog, QGroupBox, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QPushButton, QRadioButton,
-    QSplitter, QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
+    QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
+    QRadioButton, QSplitter, QTextBrowser, QTextEdit, QVBoxLayout,
+    QWidget,
 )
 
 
@@ -101,6 +102,7 @@ class ReportWorkbenchWidget(QWidget):
     outline_requested = pyqtSignal(dict)          # 左侧配置快照
     full_report_requested = pyqtSignal(dict, str)  # 配置 + 右侧大纲文本
     load_diagnosis_requested = pyqtSignal()         # 用户点击"从已存诊断加载"
+    cancel_requested = pyqtSignal()                 # 用户点击"取消生成"
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -114,7 +116,9 @@ class ReportWorkbenchWidget(QWidget):
     def set_outline_text(self, text: str) -> None:
         """由控制器调用，将 AI 生成的大纲填入编辑器."""
         self.outline_editor.setPlainText(text)
-        self.full_report_btn.setEnabled(True)
+        # 仅在诊断已加载时解锁"生成完整报告"按钮
+        if self._diagnosis_record is not None:
+            self.full_report_btn.setEnabled(True)
 
     def get_outline_text(self) -> str:
         return self.outline_editor.toPlainText().strip()
@@ -199,10 +203,17 @@ class ReportWorkbenchWidget(QWidget):
         self._req_file_label.setWordWrap(True)
         file_layout.addWidget(self._req_file_label)
 
+        req_row = QHBoxLayout()
         req_btn = QPushButton('选择需求文件...')
         req_btn.setStyleSheet(BTN_SECONDARY)
         req_btn.clicked.connect(self._on_select_req_file)
-        file_layout.addWidget(req_btn)
+        req_row.addWidget(req_btn)
+        clear_req_btn = QPushButton('✕ 清除')
+        clear_req_btn.setStyleSheet(BTN_SECONDARY)
+        clear_req_btn.clicked.connect(self._on_clear_req_file)
+        req_row.addWidget(clear_req_btn)
+        req_row.addStretch()
+        file_layout.addLayout(req_row)
 
         # 模板文件
         self._tmpl_file_label = QLabel('模板文件: 未选择')
@@ -210,10 +221,17 @@ class ReportWorkbenchWidget(QWidget):
         self._tmpl_file_label.setWordWrap(True)
         file_layout.addWidget(self._tmpl_file_label)
 
+        tmpl_row = QHBoxLayout()
         tmpl_btn = QPushButton('选择模板文件...')
         tmpl_btn.setStyleSheet(BTN_SECONDARY)
         tmpl_btn.clicked.connect(self._on_select_template_file)
-        file_layout.addWidget(tmpl_btn)
+        tmpl_row.addWidget(tmpl_btn)
+        clear_tmpl_btn = QPushButton('✕ 清除')
+        clear_tmpl_btn.setStyleSheet(BTN_SECONDARY)
+        clear_tmpl_btn.clicked.connect(self._on_clear_template_file)
+        tmpl_row.addWidget(clear_tmpl_btn)
+        tmpl_row.addStretch()
+        file_layout.addLayout(tmpl_row)
 
         # 项目资料列表
         file_layout.addWidget(QLabel('项目关联资料 (多选):'))
@@ -231,10 +249,20 @@ class ReportWorkbenchWidget(QWidget):
         """)
         file_layout.addWidget(self._proj_file_list)
 
+        # ★ 拦截 Delete 键 — 删除关联资料选中项
+        self._proj_file_list.keyPressEvent = self._proj_list_key_press
+
+        proj_btn_row = QHBoxLayout()
         add_proj_btn = QPushButton('添加文件到资料列表')
         add_proj_btn.setStyleSheet(BTN_SECONDARY)
         add_proj_btn.clicked.connect(self._on_add_project_file)
-        file_layout.addWidget(add_proj_btn)
+        proj_btn_row.addWidget(add_proj_btn)
+        remove_proj_btn = QPushButton('移除选中资料')
+        remove_proj_btn.setStyleSheet(BTN_SECONDARY)
+        remove_proj_btn.clicked.connect(self._on_remove_project_files)
+        proj_btn_row.addWidget(remove_proj_btn)
+        proj_btn_row.addStretch()
+        file_layout.addLayout(proj_btn_row)
 
         file_group.setLayout(file_layout)
         layout.addWidget(file_group)
@@ -268,6 +296,15 @@ class ReportWorkbenchWidget(QWidget):
         self.full_report_btn.setEnabled(False)
         self.full_report_btn.clicked.connect(self._on_full_report_requested)
         btn_layout.addWidget(self.full_report_btn)
+
+        self.cancel_btn = QPushButton('⏹ 取消生成')
+        self.cancel_btn.setStyleSheet(
+            'QPushButton { background: #ff4d4f; color: white; padding: 8px 16px; '
+            'border-radius: 4px; font-weight: bold; }'
+        )
+        self.cancel_btn.hide()
+        self.cancel_btn.clicked.connect(self._on_cancel_requested)
+        btn_layout.addWidget(self.cancel_btn)
 
         help_btn = QPushButton('📖 编写说明')
         help_btn.setStyleSheet(BTN_SECONDARY)
@@ -338,6 +375,29 @@ class ReportWorkbenchWidget(QWidget):
         )
         path, _ = QFileDialog.getOpenFileName(self, '选择模板文件', '', filt)
         if path:
+            # 即时校验：无效模板早发现
+            import os as _os
+            fname = _os.path.basename(path)
+            ext = _os.path.splitext(fname)[1].lower()
+            if not self.ppt_radio.isChecked() and ext != '.docx':
+                QMessageBox.warning(
+                    self, '模板格式不支持',
+                    f'「{fname}」不是 .docx 格式（扩展名为 {ext or "无"}）。\n'
+                    f'python-docx 只能处理 .docx 文件，不能打开旧 .doc 格式。\n'
+                    f'请选择 .docx 文件，或清空模板使用默认样式。',
+                )
+                return
+            if not self.ppt_radio.isChecked():
+                try:
+                    from docx import Document
+                    Document(path)
+                except Exception as e:
+                    QMessageBox.warning(
+                        self, '模板无法打开',
+                        f'「{fname}」无法作为 Word 模板打开：{e}\n'
+                        f'请选择有效的 .docx 文件，或清空模板使用默认样式。',
+                    )
+                    return
             self._template_file_path = path
             self._tmpl_file_label.setText(f'模板: {path}')
             self._tmpl_file_label.setStyleSheet('color: #333; font-size: 12px;')
@@ -352,6 +412,36 @@ class ReportWorkbenchWidget(QWidget):
             item.setToolTip(path)
             self._proj_file_list.addItem(item)
 
+    def _on_remove_project_files(self) -> None:
+        """删除关联资料列表中选中的项 (倒序删，避免索引错位)。"""
+        selected = self._proj_file_list.selectedItems()
+        if not selected:
+            return
+        rows = sorted((self._proj_file_list.row(item) for item in selected), reverse=True)
+        for row in rows:
+            self._proj_file_list.takeItem(row)
+
+    def _proj_list_key_press(self, event) -> None:
+        """拦截 Delete 键 — 删除关联资料选中项。"""
+        from PyQt6.QtCore import Qt as _Qt
+        from PyQt6.QtGui import QKeyEvent
+        if event.key() == _Qt.Key.Key_Delete:
+            self._on_remove_project_files()
+        else:
+            QListWidget.keyPressEvent(self._proj_file_list, event)
+
+    def _on_clear_req_file(self) -> None:
+        """清除需求文件。"""
+        self._req_file_path = ''
+        self._req_file_label.setText('需求文件: 未选择')
+        self._req_file_label.setStyleSheet('color: #888; font-size: 12px;')
+
+    def _on_clear_template_file(self) -> None:
+        """清除模板文件。"""
+        self._template_file_path = ''
+        self._tmpl_file_label.setText('模板文件: 未选择')
+        self._tmpl_file_label.setStyleSheet('color: #888; font-size: 12px;')
+
     def _get_project_file_paths(self) -> List[str]:
         return [
             self._proj_file_list.item(i).text()
@@ -364,8 +454,9 @@ class ReportWorkbenchWidget(QWidget):
         """由控制器调用，设置或清空已加载的诊断记录。"""
         self._diagnosis_record = rec
         if rec:
+            from core.report_engine import count_sensors
             ts = rec.get('timestamp', '?')
-            sensors = len(rec.get('diagnosis_json', {}).get('sensor_analysis', []))
+            sensors = count_sensors(rec)
             self.diag_loaded_label.setText(f'诊断数据: {ts} ({sensors} 传感器)')
             self.diag_loaded_label.setStyleSheet('color: #52c41a; font-weight: bold; font-size: 11px;')
         else:
@@ -373,16 +464,56 @@ class ReportWorkbenchWidget(QWidget):
             self.diag_loaded_label.setStyleSheet('color: #888; font-size: 11px;')
 
     def _on_load_diagnosis(self) -> None:
+        if not self._get_project_file_paths():
+            QMessageBox.warning(
+                self, '缺少项目关联资料',
+                '请先添加项目关联资料，再加载诊断记录。')
+            return
         self.load_diagnosis_requested.emit()
 
     def _on_outline_requested(self) -> None:
+        if not self._get_project_file_paths():
+            QMessageBox.warning(
+                self, '缺少项目关联资料',
+                '请先添加项目关联资料，再生成报告大纲。')
+            return
+        if self._diagnosis_record is None:
+            QMessageBox.warning(
+                self, '未加载诊断数据',
+                '请先点击「📋 从已存诊断加载」载入诊断记录，再生成报告大纲。\n\n'
+                '说明：未加载诊断时，大纲将偏离 FBG 光纤传感领域，产生无用的 IT 运维模板。')
+            return
         self.outline_requested.emit(self.get_config())
 
     def _on_full_report_requested(self) -> None:
+        if not self._get_project_file_paths():
+            QMessageBox.warning(
+                self, '缺少项目关联资料',
+                '请先添加项目关联资料，再生成完整报告。')
+            return
+        if self._diagnosis_record is None:
+            QMessageBox.warning(
+                self, '未加载诊断数据',
+                '请先点击「📋 从已存诊断加载」载入诊断记录，再生成完整报告。')
+            return
         outline = self.outline_editor.toPlainText().strip()
         if not outline:
             outline = '(空大纲 — 将使用默认模板)'
         self.full_report_requested.emit(self.get_config(), outline)
+
+    def _on_cancel_requested(self) -> None:
+        self.cancel_requested.emit()
+
+    def set_generation_running(self, running: bool) -> None:
+        """显示/隐藏取消按钮，锁住/解锁生成按钮."""
+        if running:
+            self.cancel_btn.show()
+            self.full_report_btn.setEnabled(False)
+            self.outline_btn.setEnabled(False)
+        else:
+            self.cancel_btn.hide()
+            self.full_report_btn.setEnabled(True)
+            self.outline_btn.setEnabled(True)
 
     # ── 帮助 ──
 

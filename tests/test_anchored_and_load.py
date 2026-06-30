@@ -45,7 +45,7 @@ def _make_anchored_readings(levels, working_ke=1.21):
 
 
 def _save_project(name, temp_dir, strain_configs):
-    from py.calibration.project_config import ProjectConfig, StrainSubConfig
+    from dp_engine.calibration.project_config import ProjectConfig, StrainSubConfig
     pc = ProjectConfig.create_new(name)
     for s_name, mode, ke1, ke2 in strain_configs:
         pc.strain[s_name] = StrainSubConfig(
@@ -65,7 +65,7 @@ class TestAnchoredModeFix:
     def test_anchored_g2_anchor(self, qapp):
         """锚固=G2，G1 斜率~1.21 → Ke1≈1.21, Ke2=0"""
         from ui.calibration_tab import StrainCalibrationPage
-        from py.calibration.strain_calibration import (
+        from dp_engine.calibration.strain_calibration import (
             StrainCalibrationConfig, calibrate_strain, compute_theoretical_strain,
         )
         page = StrainCalibrationPage()
@@ -92,7 +92,7 @@ class TestAnchoredModeFix:
     def test_anchored_g1_anchor(self, qapp):
         """锚固=G1 → G2 工作, Ke2≈1.21, Ke1=0"""
         from ui.calibration_tab import StrainCalibrationPage
-        from py.calibration.strain_calibration import (
+        from dp_engine.calibration.strain_calibration import (
             StrainCalibrationConfig, calibrate_strain,
         )
         page = StrainCalibrationPage()
@@ -122,7 +122,7 @@ class TestAnchoredModeFix:
     def test_anchored_chart_plots_working_grating(self, qapp):
         """图表只画工作栅 (non-NaN k)，不画锚固栅"""
         from ui.calibration_tab import StrainCalibrationPage
-        from py.calibration.strain_calibration import (
+        from dp_engine.calibration.strain_calibration import (
             StrainCalibrationConfig, calibrate_strain,
         )
         page = StrainCalibrationPage()
@@ -191,7 +191,7 @@ class TestAnchoredGratingNone:
     def test_compute_ke_anchored_grating_none(self, qapp):
         """anchored_grating=None → _compute_ke_results 不崩 + Ke2=0"""
         from ui.calibration_tab import StrainCalibrationPage
-        from py.calibration.strain_calibration import (
+        from dp_engine.calibration.strain_calibration import (
             StrainCalibrationConfig, calibrate_strain,
         )
         page = StrainCalibrationPage()
@@ -236,8 +236,8 @@ class TestLoadProjectPopulatesList:
             ])
 
             from ui.calibration_tab import CalibrationTabWidget
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
             old_dir = pcfg.PROFILES_DIR
             pcfg.PROFILES_DIR = tmp_dir
 
@@ -269,8 +269,8 @@ class TestLoadProjectPopulatesList:
             ])
 
             from ui.calibration_tab import CalibrationTabWidget
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
             old_dir = pcfg.PROFILES_DIR
             pcfg.PROFILES_DIR = tmp_dir
 
@@ -302,8 +302,8 @@ class TestLoadProjectPopulatesList:
             ])
 
             from ui.calibration_tab import CalibrationTabWidget
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
             old_dir = pcfg.PROFILES_DIR
             pcfg.PROFILES_DIR = tmp_dir
 
@@ -332,13 +332,13 @@ class TestLoadProjectPopulatesList:
         """temperature=None + strain={} 项目加载不崩"""
         tmp_dir = tempfile.mkdtemp(prefix="ld_empty_")
         try:
-            from py.calibration.project_config import ProjectConfig
+            from dp_engine.calibration.project_config import ProjectConfig
             pc = ProjectConfig.create_new("empty")
             pc.save(dir_path=tmp_dir)
 
             from ui.calibration_tab import CalibrationTabWidget
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
             old_dir = pcfg.PROFILES_DIR
             pcfg.PROFILES_DIR = tmp_dir
 

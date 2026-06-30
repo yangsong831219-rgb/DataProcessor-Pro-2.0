@@ -9,6 +9,46 @@ from __future__ import annotations
 import re
 from typing import Any
 
+
+def merge_annotations(
+    base: dict[str, str],
+    fallback: dict[str, str],
+    dirty: set[str] | None = None,
+) -> dict[str, str]:
+    """合并两个 annotation dict — base 为底, fallback 仅对缺失/空列兜底。
+
+    dirty 中的列保持 base 原值不动 (手改锁定语义)。
+
+    用于 restore 和 PhaseADialog.__init__ 两处 annotation 合并，
+    避免 "文件为底覆盖手改" 的反模式在两处孪生分叉。
+
+    Args:
+        base: 权威暗号源 (profile annotation / 主页面当前 annotation)
+        fallback: 兜底源 (文件头暗号 / 旧 state 存档)
+        dirty: 锁定的列名集合 — 这些列不从 fallback 取值
+
+    Returns:
+        合并后的 dict (新对象，不影响入参)
+
+    Examples:
+        >>> merge_annotations({"A": "A1-1"}, {"A": "W1", "B": "W2"})
+        {'A': 'A1-1', 'B': 'W2'}  # base 优先, fallback 补 B
+
+        >>> merge_annotations({}, {"A": "C1-W1"})
+        {'A': 'C1-W1'}  # base 空 → 退化为纯 fallback (旧项目兼容)
+
+        >>> merge_annotations({"A": "A1-1"}, {"A": "W1"}, dirty={"A"})
+        {'A': 'A1-1'}  # dirty 列不覆盖
+    """
+    merged = dict(base)
+    _dirty = dirty or set()
+    for col_name, val in (fallback or {}).items():
+        if col_name in _dirty:
+            continue  # 手改列锁定，不从 fallback 覆盖
+        if col_name not in merged or not merged.get(col_name):
+            merged[col_name] = val
+    return merged
+
 import pandas as pd
 import numpy as np
 
@@ -46,18 +86,21 @@ def build_annotation_row(df: pd.DataFrame, *, file_format: str = "") -> list[str
 
     规则:
       - Timestamp 列 -> '时间戳'
-      - 波长列（is_wave_col 判定）-> 'wN-类型-位置'（N 仅在波长列上递增）
-      - 其它列（公式列等）-> 空字符串
+      - 光纤格式 (enlight/fiber_custom):
+        · 波长列（is_wave_col 判定）-> 'wN-类型-位置'（N 仅在波长列上递增）
+        · 其它列（公式列等）-> 空字符串
+      - 非光纤格式:
+        · 所有非 Timestamp 列 -> 'wN-类型-位置'（N 顺序递增）
+      - ★ 永远返回与 df.columns 等长的 list，不再因 file_format 返回全空
 
     Args:
         df: 数据 DataFrame（应已在暗号行插入之前，从 data_row 行开始）
-        file_format: 模板文件格式；非 enlight/fiber_custom 时返回全空列表
+        file_format: 模板文件格式
 
     Returns:
         与 df.columns 等长的字符串 list，已带单引号包裹
     """
-    if file_format not in ("enlight", "fiber_custom"):
-        return [""] * len(df.columns)
+    is_fiber = file_format in ("enlight", "fiber_custom")
 
     ann: list[str] = []
     wi = 0
@@ -65,10 +108,15 @@ def build_annotation_row(df: pd.DataFrame, *, file_format: str = "") -> list[str
         col_name = str(col_name)
         if col_name == "Timestamp":
             ann.append("'时间戳'")
-        elif is_wave_col(df, col_name):
+        elif is_fiber and is_wave_col(df, col_name):
+            wi += 1
+            ann.append(f"'w{wi}-类型-位置'")
+        elif not is_fiber:
+            # 非光纤格式：所有非 Timestamp 列顺序编号占位符
             wi += 1
             ann.append(f"'w{wi}-类型-位置'")
         else:
+            # 光纤格式、非波长列 -> 留空
             ann.append("")
     return ann
 
@@ -252,22 +300,29 @@ def apply_annotation_row(
     """将暗号文本列表写入 DataFrame 的指定行。
 
     对每列先行 astype(object) 再写值，确保暗号文字不被 numeric dtype 吞掉。
+    写过暗号文本的列不再尝试恢复原始 dtype（文本无法转回数值）。
     """
+    text_cols: set[str] = set()
     for col_idx, text in enumerate(ann):
+        col_name = str(df.columns[col_idx])
         if not text:
-            col_name = str(df.columns[col_idx])
             if pd.api.types.is_numeric_dtype(df[col_name]):
                 df[col_name] = df[col_name].astype(object)
             continue
-        col_name = str(df.columns[col_idx])
         df[col_name] = df[col_name].astype(object)
         df.iloc[row_idx, col_idx] = text
+        text_cols.add(col_name)
 
     if orig_dtypes:
         for col, dtype in orig_dtypes.items():
+            if col in text_cols:
+                continue  # 暗号文本列不恢复原始 dtype
             try:
                 df[col] = df[col].astype(dtype)
             except (ValueError, TypeError):
                 if "int" in str(dtype):
-                    df[col] = df[col].astype("float64")
+                    try:
+                        df[col] = df[col].astype("float64")
+                    except (ValueError, TypeError):
+                        pass  # 含文本或 NaN，保持 object
     return df

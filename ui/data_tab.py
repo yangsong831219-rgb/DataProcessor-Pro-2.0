@@ -64,8 +64,14 @@ class DataTabWidget(QWidget):
 
         self.setLayout(layout)
 
-    def update_data_table(self, df, max_display_rows=1000):
-        """用 DataFrame 数据填充表格."""
+    def update_data_table(self, df, max_display_rows=1000, annotation=None):
+        """用 DataFrame 数据填充表格.
+
+        Args:
+            df: 数据 DataFrame（可能已含暗号行在 row 0）
+            max_display_rows: 最大显示行数
+            annotation: 可选暗号字典 {列名: 暗号字符串}，非空时 row 0 灰底斜体
+        """
         if df is None:
             self.data_table.setRowCount(0)
             self.data_table.setColumnCount(0)
@@ -77,6 +83,7 @@ class DataTabWidget(QWidget):
         self.data_table.setUpdatesEnabled(False)
 
         total_rows = len(df)
+        has_annot = bool(annotation)
         display_rows = min(total_rows, max_display_rows)
         cols = [str(c) for c in df.columns]
 
@@ -98,16 +105,30 @@ class DataTabWidget(QWidget):
                 item = QTableWidgetItem(str(col_values[i]))
                 self.data_table.setItem(i, j, item)
 
+        # ── 暗号行视觉区分: row 0 灰底 + 斜体 ──
+        if has_annot and display_rows > 0:
+            from PyQt6.QtGui import QFont, QColor, QBrush
+            italic_font = QFont()
+            italic_font.setItalic(True)
+            gray_bg = QBrush(QColor("#f0f0f0"))
+            for j in range(len(cols)):
+                item = self.data_table.item(0, j)
+                if item is not None:
+                    item.setFont(italic_font)
+                    item.setBackground(gray_bg)
+
         self.data_table.setUpdatesEnabled(True)
         self.data_table.blockSignals(False)
         self.data_table.resizeColumnsToContents()
 
+        # 行计数不含暗号行
+        data_rows = total_rows - 1 if has_annot else total_rows
         if total_rows > max_display_rows:
             self.data_info_label.setText(
-                f"显示前 {max_display_rows:,} 行 / 共 {total_rows:,} 行"
+                f"显示前 {max_display_rows:,} 行 / 共 {data_rows:,} 行"
             )
         else:
-            self.data_info_label.setText(f"共 {total_rows:,} 行")
+            self.data_info_label.setText(f"共 {data_rows:,} 行")
 
     def _on_cell_changed(self, item):
         """用户编辑表格单元格后，发射信号让 main.py 同步回 DataFrame."""

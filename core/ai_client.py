@@ -182,6 +182,7 @@ class AIClient:
         # ── 按 backend 选择默认值来源 ──
         _backend = self.get_backend()
         self._backend: str = _backend
+        _cfg = self._load_config_json()
 
         if _backend == 'local':
             _lc = self.get_local_config()
@@ -192,6 +193,11 @@ class AIClient:
             _default_key = os.environ.get('DEEPSEEK_API_KEY', '')
             _default_url = os.environ.get('DEEPSEEK_BASE_URL', self.DEFAULT_BASE_URL)
             _default_model = os.environ.get('DEEPSEEK_MODEL', self.DEFAULT_MODEL)
+
+        # ★ max_tokens 从配置读取（不再硬编 2048），默认为 4096
+        _cfg_mt = _cfg.get('max_tokens') if _backend != 'local' else (_cfg.get('_local') or {}).get('max_tokens')
+        self.max_tokens: int = int(_cfg_mt) if _cfg_mt and int(_cfg_mt) > 0 else 4096
+        self.temperature: float = 0.3
 
         self.api_key = api_key or _default_key
         self.base_url = base_url or _default_url
@@ -206,6 +212,33 @@ class AIClient:
         return self._backend
 
     # ── 公共 API ──
+
+    def configure_online(
+        self, api_key: str, base_url: str = "", model_name: str = "",
+        max_tokens: int = 0, temperature: float = 0.0,
+    ) -> None:
+        """就地更新单例的 online 配置 (不 reset _instance)。
+
+        此方法不抛异常 — 调用方应在连接成功后调用。
+        Args:
+            api_key: API 密钥 (非空)
+            base_url: API 端点 (空则保留现有值)
+            model_name: 模型名 (空则保留现有值)
+            max_tokens: max_tokens (0 则保留现有值)
+            temperature: temperature (≤0 则保留现有值)
+        """
+        if not api_key:
+            return  # 静默退 — 调用方已验证非空
+        self._backend = 'online'
+        self.api_key = api_key
+        if base_url:
+            self.base_url = base_url
+        if model_name:
+            self.model_name = model_name
+        if max_tokens > 0:
+            self.max_tokens = max_tokens
+        if temperature > 0:
+            self.temperature = temperature
 
     def is_available(self) -> bool:
         """检查当前后端是否可用.
@@ -306,7 +339,112 @@ class AIClient:
                     status_code=503,
                 )
 
+    # ── 上下文窗口大小（token） ──
+    LOCAL_CTX_TOKENS: int = 8192     # llama.cpp 本地模型默认上下文
+    ONLINE_CTX_TOKENS: int = 131072  # DeepSeek-V4 Pro 上下文
+
+    def _get_context_size(self) -> int:
+        """返回当前后端的上下文窗口大小（token）。"""
+        _be = getattr(self, '_backend', 'online')
+        if _be == 'local':
+            # 尝试从配置读取 ctx_size，否则用默认 8192
+            cfg = self._load_config_json()
+            local_cfg = cfg.get('_local') or {}
+            return int(local_cfg.get('ctx_size', self.LOCAL_CTX_TOKENS))
+        return self.ONLINE_CTX_TOKENS
+
+    def _get_httpx_timeout(self) -> Any:
+        """返回当前后端对应的 httpx.Timeout，按 backend 分流。
+
+        本地 llama.cpp: read 超时从配置文件 _local.read_timeout_s 读取
+        (默认 LOCAL_READ_TIMEOUT_S=900s)，覆盖最坏单轮生成 ≈ 661s。
+        在线 deepseek: 维持原 ONLINE_READ_TIMEOUT_S=120s。
+        """
+        try:
+            import httpx as _httpx
+        except Exception:
+            return None
+        _be = getattr(self, '_backend', 'online')
+        if _be == 'local':
+            cfg = self._load_config_json()
+            local_cfg = cfg.get('_local') or {}
+            read_s = int(local_cfg.get('read_timeout_s', self.LOCAL_READ_TIMEOUT_S))
+            return _httpx.Timeout(read_s, connect=self.CONNECT_TIMEOUT_S)
+        return _httpx.Timeout(self.ONLINE_READ_TIMEOUT_S, connect=self.CONNECT_TIMEOUT_S)
+
+    def _make_openai_kwargs(self, api_key_override: str = '') -> dict[str, Any]:
+        """构建 OpenAI 客户端构造参数 — 超时按后端分流 + 本地代理豁免。
+
+        本地后端: 传入显式 httpx.Client(trust_env=False)，避免系统 HTTP_PROXY
+        拦截 127.0.0.1 请求。
+        在线后端: 仅传入 timeout，不传 http_client（由 SDK 默认创建）。
+        """
+        import httpx as _httpx
+        _timeout = self._get_httpx_timeout()
+        _be = getattr(self, '_backend', 'online')
+        kwargs: dict[str, Any] = dict(
+            api_key=api_key_override if api_key_override else self.api_key,
+            base_url=self.base_url,
+        )
+        if _timeout is not None:
+            if _be == 'local':
+                # 本地: 显式 httpx.Client 禁代理 + 长超时
+                kwargs['http_client'] = _httpx.Client(
+                    timeout=_timeout,
+                    trust_env=False,
+                )
+            else:
+                # 在线: 仅传 timeout，SDK 默认创建
+                kwargs['timeout'] = _timeout
+        return kwargs
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """粗略估算 token 数（保守: chars/2 + 安全余量）。
+
+        中文每字 ~1-2 token，英文 ~0.25 token/char，取保守的 chars/2。
+        实际 tokenizer 差异大，此估算偏保守，确保不超。
+        """
+        if not text:
+            return 0
+        # 保守估计：每个字符 ≈ 0.5 token + 20% 安全余量
+        return int(len(text) / 2 * 1.2)
+
+    def _safe_max_tokens(self, system_prompt: str, user_prompt: str,
+                         requested: int) -> int:
+        """安全计算 max_tokens: 确保 prompt + max_tokens + margin ≤ ctx。
+
+        Args:
+            system_prompt: 系统提示词
+            user_prompt: 用户提示词
+            requested: 请求的 max_tokens (0 或调用方传入值)
+
+        Returns:
+            安全上限内的 max_tokens，最小 512。
+        """
+        ctx = self._get_context_size()
+        margin = 512  # 安全边距
+        prompt_est = self._estimate_tokens(system_prompt) + self._estimate_tokens(user_prompt)
+        available = ctx - prompt_est - margin
+
+        if requested <= 0:
+            requested = self.max_tokens
+
+        safe = max(512, min(requested, available))
+
+        # 本地后端：硬墙 8192，不允许超额
+        _be = getattr(self, '_backend', 'online')
+        if _be == 'local' and safe > ctx - margin:
+            safe = max(512, ctx - prompt_est - margin)
+
+        return safe
+
     # ── Qwen 官方推荐采样参数 (非思考模式) ──
+    # ── 超时常量 (按后端分流) ──
+    LOCAL_READ_TIMEOUT_S: int = 900      # 本地慢模型最坏单轮 ~661s，留余量
+    ONLINE_READ_TIMEOUT_S: int = 120     # 在线 API 快，维持原值
+    CONNECT_TIMEOUT_S: int = 10
+
     QWEN_TEMPERATURE: float = 0.7
     QWEN_TOP_P: float = 0.8
     QWEN_TOP_K: int = 20
@@ -316,8 +454,8 @@ class AIClient:
         self,
         prompt: str,
         system_prompt: str = '',
-        temperature: float = 0.3,
-        max_tokens: int = 2048,
+        temperature: float = 0.0,  # 0 = 用单例 self.temperature
+        max_tokens: int = 0,        # 0 = 用单例 self.max_tokens
         *,
         enable_thinking: bool = False,
     ) -> str:
@@ -346,83 +484,98 @@ class AIClient:
         if not self.is_available():
             raise AIClientNotConfiguredError("AI API Key 未配置，请在设置中配置 AI 模型")
 
+        # 用单例字段兜底（调用方未显式传值时）
+        _max_tokens = max_tokens if max_tokens > 0 else self.max_tokens
+        # ★ 动态安全钳制: max_tokens 不超过 ctx − prompt − margin
+        _max_tokens = self._safe_max_tokens(system_prompt, prompt, _max_tokens)
+        _temperature = temperature if temperature > 0 else self.temperature
+
         from openai import OpenAI  # pyright: ignore[reportImplicitRelativeImport]
 
         try:
-            client = OpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-            )
+            for attempt in range(2):  # 0=首次, 1=截断重试（放大 max_tokens）
+                kwargs_opts = self._make_openai_kwargs()
+                try:
+                    client = OpenAI(**kwargs_opts)  # pyright: ignore[reportArgumentType]
+                except TypeError:
+                    kwargs_opts.pop('http_client', None)
+                    kwargs_opts.pop('timeout', None)
+                    client = OpenAI(**kwargs_opts)  # pyright: ignore[reportArgumentType]
 
-            messages: list[Dict[str, str]] = []
-            if system_prompt:
-                messages.append({'role': 'system', 'content': system_prompt})
-            messages.append({'role': 'user', 'content': prompt})
+                messages: list[Dict[str, str]] = []
+                if system_prompt:
+                    messages.append({'role': 'system', 'content': system_prompt})
+                messages.append({'role': 'user', 'content': prompt})
 
-            # ── 构建 create kwargs ──
-            create_kwargs: dict = {
-                'model': self.model_name,
-                'messages': messages,
-                'temperature': temperature,
-                'max_tokens': max_tokens,
-            }
-
-            # ── 本地 Qwen3.5：chat_template_kwargs 控制思考开关 ──
-            if self._is_local_qwen():
-                extra_body: dict[str, Any] = {
-                    'chat_template_kwargs': {'enable_thinking': enable_thinking},
+                create_kwargs: dict = {
+                    'model': self.model_name,
+                    'messages': messages,
+                    'temperature': _temperature,
+                    'max_tokens': _max_tokens,
                 }
-                create_kwargs['extra_body'] = extra_body
-                # 非思考模式：Qwen 官方推荐采样参数
-                if not enable_thinking:
-                    create_kwargs.setdefault('temperature', self.QWEN_TEMPERATURE)
-                    create_kwargs['top_p'] = self.QWEN_TOP_P
-                    extra_body.update({
-                        'top_k': self.QWEN_TOP_K,
-                        'presence_penalty': self.QWEN_PRESENCE_PENALTY,
-                    })
 
-            response = client.chat.completions.create(**create_kwargs)
+                if self._is_local_qwen():
+                    extra_body: dict[str, Any] = {
+                        'chat_template_kwargs': {'enable_thinking': enable_thinking},
+                    }
+                    create_kwargs['extra_body'] = extra_body
+                    if not enable_thinking:
+                        create_kwargs.setdefault('temperature', self.QWEN_TEMPERATURE)
+                        create_kwargs['top_p'] = self.QWEN_TOP_P
+                        extra_body.update({
+                            'top_k': self.QWEN_TOP_K,
+                            'presence_penalty': self.QWEN_PRESENCE_PENALTY,
+                        })
+                    print(f"[DIAG] generate extra_body: is_qwen={self._is_local_qwen()}, "
+                          f"enable_thinking_arg={enable_thinking}, extra_body={extra_body!r}")
 
-            content = (response.choices[0].message.content or '').strip()
-            finish = getattr(response.choices[0], 'finish_reason', 'stop')
+                response = client.chat.completions.create(**create_kwargs)
+                content = (response.choices[0].message.content or '').strip()
+                finish = getattr(response.choices[0], 'finish_reason', 'stop')
+                reasoning_content = getattr(response.choices[0].message, 'reasoning_content', '') or ''
+                print(f"[DIAG] generate response: finish={finish}, content_len={len(content)}, "
+                      f"reasoning_len={len(reasoning_content)}, "
+                      f"has_think_tag={'<think>' in (content or '')}, "
+                      f"content_head={content[:120]!r}")
 
-            # ── 截断检测（防静默交付半截报告） ──
-            if finish == 'length':
-                if content:
+                if finish == 'length':
+                    _ctx = self._get_context_size()
+                    if attempt == 0 and _max_tokens < _ctx:
+                        # 截断 → 放大 max_tokens 重试 1 次（不超过上下文窗口）
+                        _max_tokens = min(_max_tokens * 2, _ctx)
+                        continue  # 回到 for attempt 循环开头, 用更大的 max_tokens 重试
+
+                    if content:
+                        raise AIClientTruncationError(
+                            f"AI 输出在 {_max_tokens} token 处被截断"
+                            f"（finish_reason=length），内容不完整。"
+                            "请增大 max_tokens 重试。",
+                            partial_content=content,
+                        )
                     raise AIClientTruncationError(
-                        f"AI 输出在 {max_tokens} token 处被截断"
-                        f"（finish_reason=length），内容不完整。"
-                        "请增大 max_tokens 重试。",
-                        partial_content=content,
+                        f"AI 输出在 {_max_tokens} token 处被截断且 content 为空"
+                        f"（已自动重试 1 次）。"
+                        "请增大 max_tokens 后重试。",
                     )
-                # content 为空 + length → 同样不可用
-                reasoning_len = len(
-                    getattr(response.choices[0].message, 'reasoning_content', '') or ''
-                )
-                raise AIClientTruncationError(
-                    f"AI 输出在 {max_tokens} token 处被截断且 content 为空"
-                    + (f"（reasoning_len={reasoning_len}）" if reasoning_len else "")
-                    + ("。请确认 enable_thinking=false 已生效" if not enable_thinking else ""),
-                )
 
-            if not content:
-                # content 为空但未截断 → 其他故障
-                reasoning_len = len(
-                    getattr(response.choices[0].message, 'reasoning_content', '') or ''
-                )
-                raise AIClientEmptyResponseError(
-                    f"AI 返回空 content（finish_reason={finish}"
-                    + (f", reasoning_len={reasoning_len}" if reasoning_len else "")
-                    + f", max_tokens={max_tokens}）"
-                    + ("。请确认 enable_thinking=false 已生效" if not enable_thinking else "")
-                )
-            return content
+                if not content:
+                    # content 为空但未截断 → 其他故障
+                    reasoning_len = len(
+                        getattr(response.choices[0].message, 'reasoning_content', '') or ''
+                    )
+                    raise AIClientEmptyResponseError(
+                        f"AI 返回空 content（finish_reason={finish}"
+                        + (f", reasoning_len={reasoning_len}" if reasoning_len else "")
+                        + f", max_tokens={_max_tokens}）"
+                        + ("。请确认 enable_thinking=false 已生效" if not enable_thinking else "")
+                    )
+                return content
 
         except AIClientError:
             raise
         except Exception as e:
             raise classify_openai_error(e) from e
+        return ""  # unreachable — 所有路径均 raise/return
 
     # ── 流式推理 ──
 
@@ -443,7 +596,7 @@ class AIClient:
         prompt: str,
         system_prompt: str = '',
         temperature: float = 0.7,
-        max_tokens: int = 2048,
+        max_tokens: int = 0,
         *,
         enable_thinking: bool = False,
     ) -> Generator[str, None, None]:
@@ -455,12 +608,16 @@ class AIClient:
         enable_thinking: True=允许思考流式展示 (诊断/聊天)，
                          False=纯答案 (报告/结构化，经 extra_body 下发)。
 
+        截断重试: finish_reason=length → 自动翻倍重试 1 次（上限不超过上下文窗口）。
+        本地后端: max_tokens 安全上限 = min(配置, 上下文 − prompt占用 − 512边距)。
+
         Yields:
             每次 yield 一个 token 字符串
 
         Raises:
             AIClientNotConfiguredError: 未配置
             AIClientEmptyResponseError: 流结束但无有效内容
+            AIClientTruncationError: 重试后仍截断
             AIClientError: 其他 HTTP/网络错误（经 classify_openai_error）
         """
         if not self.is_available():
@@ -471,72 +628,114 @@ class AIClient:
 
         from openai import OpenAI  # pyright: ignore[reportImplicitRelativeImport]
 
+        # ── 安全上限：min(请求, 上下文−prompt−margin) ──
+        _ctx_size = self._get_context_size()
+        _max_tokens = self._safe_max_tokens(system_prompt, prompt, max_tokens)
+
         try:
-            client = OpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-            )
+            kwargs_opts = self._make_openai_kwargs()
+            try:
+                client = OpenAI(**kwargs_opts)  # pyright: ignore[reportArgumentType]
+            except TypeError:
+                # mock / test fallback — FakeOpenAI doesn't accept timeout / http_client
+                kwargs_opts.pop('http_client', None)
+                kwargs_opts.pop('timeout', None)
+                client = OpenAI(**kwargs_opts)  # pyright: ignore[reportArgumentType]
 
             messages: list[Dict[str, str]] = []
             if system_prompt:
                 messages.append({'role': 'system', 'content': system_prompt})
             messages.append({'role': 'user', 'content': prompt})
 
-            create_kwargs: dict = {
-                'model': self.model_name,
-                'messages': messages,
-                'stream': True,
-                'temperature': temperature,
-                'max_tokens': max_tokens,
-            }
-
-            # ── 本地 Qwen3.5：chat_template_kwargs 控制思考开关 ──
-            if self._is_local_qwen():
-                _eb: dict[str, Any] = {
-                    'chat_template_kwargs': {'enable_thinking': enable_thinking},
+            # ── 截断重试循环（最多 2 次）──
+            for attempt in range(2):
+                create_kwargs: dict = {
+                    'model': self.model_name,
+                    'messages': messages,
+                    'stream': True,
+                    'temperature': temperature,
+                    'max_tokens': _max_tokens,
                 }
-                create_kwargs['extra_body'] = _eb
-                if not enable_thinking:
-                    create_kwargs.setdefault('temperature', self.QWEN_TEMPERATURE)
-                    create_kwargs['top_p'] = self.QWEN_TOP_P
-                    _eb.update({
-                        'top_k': self.QWEN_TOP_K,
-                        'presence_penalty': self.QWEN_PRESENCE_PENALTY,
-                    })
 
-            self._stream_response = None
-            yielded_any = False
-            last_finish = 'stop'
-            try:
-                response = client.chat.completions.create(**create_kwargs)
-                self._stream_response = response  # 存引用，供 cancel 关闭
-                for chunk in response:
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta:
-                        token = delta.content or ''
-                        if not token and enable_thinking:
-                            # 思考开启时：reasoning_content 作为流式后备
-                            reasoning = getattr(delta, 'reasoning_content', None)
-                            if reasoning:
-                                token = str(reasoning)
-                        if token:
-                            yielded_any = True
+                # ── 本地 Qwen3.5：chat_template_kwargs 控制思考开关 ──
+                if self._is_local_qwen():
+                    _eb: dict[str, Any] = {
+                        'chat_template_kwargs': {'enable_thinking': enable_thinking},
+                    }
+                    create_kwargs['extra_body'] = _eb
+                    if not enable_thinking:
+                        create_kwargs.setdefault('temperature', self.QWEN_TEMPERATURE)
+                        create_kwargs['top_p'] = self.QWEN_TOP_P
+                        _eb.update({
+                            'top_k': self.QWEN_TOP_K,
+                            'presence_penalty': self.QWEN_PRESENCE_PENALTY,
+                        })
+                    print(f"[DIAG] generate_stream extra_body: is_qwen={self._is_local_qwen()}, "
+                          f"enable_thinking_arg={enable_thinking}, extra_body={_eb!r}")
+
+                self._stream_response = None
+                yielded_any = False
+                last_finish = 'stop'
+                # 第一次尝试（可能截断）: 缓冲 tokens；第二次（终试）: 直接 yield
+                _buf: list[str] = []
+                _is_final_attempt = (attempt == 1)
+                try:
+                    response = client.chat.completions.create(**create_kwargs)
+                    self._stream_response = response  # 存引用，供 cancel 关闭
+                    for chunk in response:
+                        delta = chunk.choices[0].delta if chunk.choices else None
+                        if delta:
+                            token = delta.content or ''
+                            if not token and enable_thinking:
+                                # 思考开启时：reasoning_content 作为流式后备
+                                reasoning = getattr(delta, 'reasoning_content', None)
+                                if reasoning:
+                                    token = str(reasoning)
+                            if token:
+                                yielded_any = True
+                                if _is_final_attempt:
+                                    yield token
+                                else:
+                                    _buf.append(token)
+                        # 最后一个 chunk 带 finish_reason
+                        if chunk.choices and hasattr(chunk.choices[0], 'finish_reason') and chunk.choices[0].finish_reason:
+                            last_finish = chunk.choices[0].finish_reason
+
+                    # ── 截断判定 ──
+                    if last_finish == 'length':
+                        if not _is_final_attempt and _max_tokens < _ctx_size:
+                            # 翻倍重试（但不超过安全上限：ctx − prompt − margin）
+                            _new_mt = min(_max_tokens * 2, _ctx_size)
+                            _safe = self._safe_max_tokens(system_prompt, prompt, _new_mt)
+                            _max_tokens = _safe
+                            continue  # 回到 for attempt 循环开头，用更大的 max_tokens
+                        # 终试也截断 → 报错
+                        if yielded_any:
+                            raise AIClientTruncationError(
+                                f"AI 流式输出在 {_max_tokens} token 处被截断"
+                                f"（finish_reason=length，上下文窗口={_ctx_size}），内容不完整。"
+                                "请减少 prompt 长度或增大上下文窗口。",
+                            )
+                        raise AIClientTruncationError(
+                            f"AI 流式输出在 {_max_tokens} token 处被截断且 content 为空"
+                            f"（已自动重试 1 次，上下文窗口={_ctx_size}）。",
+                        )
+
+                    # ── 成功完成 ──
+                    if not yielded_any:
+                        raise AIClientEmptyResponseError(
+                            "AI 流式返回了空响应，可能模型不支持当前请求"
+                            + (" (非思考模式下 content 全空)" if not enable_thinking else "")
+                        )
+
+                    # 第一次尝试成功 → yield 缓冲的 tokens
+                    if not _is_final_attempt and _buf:
+                        for token in _buf:
                             yield token
-                    # 最后一个 chunk 带 finish_reason
-                    if chunk.choices and hasattr(chunk.choices[0], 'finish_reason') and chunk.choices[0].finish_reason:
-                        last_finish = chunk.choices[0].finish_reason
+                    return  # 正常结束
 
-                if not yielded_any:
-                    raise AIClientEmptyResponseError(
-                        "AI 流式返回了空响应，可能模型不支持当前请求"
-                        + (" (非思考模式下 content 全空)" if not enable_thinking else "")
-                    )
-                if last_finish == 'length':
-                    raise AIClientTruncationError(
-                        f"AI 流式输出在 {max_tokens} token 处被截断"
-                    )
-            finally:
-                self._stream_response = None  # 清理引用
+                finally:
+                    self._stream_response = None  # 清理引用
 
         except AIClientError:
             raise
@@ -550,8 +749,8 @@ class AIClient:
         messages: list[Dict[str, Any]],
         tools: list[Dict[str, Any]],
         tool_executable_map: Dict[str, Any],
-        temperature: float = 0.3,
-        max_tokens: int = 4096,
+        temperature: float = 0.0,
+        max_tokens: int = 0,
         *,
         enable_thinking: bool = False,
     ) -> str:
@@ -560,6 +759,9 @@ class AIClient:
         经典闭环：
           发起请求 → finish_reason=="tool_calls" → 解析参数 → 执行本地函数
           → 结果注入 history → 再次请求 → finish_reason=="stop" → 返回最终文本
+
+        max_tokens=0 → 使用 self.max_tokens (由 configure_online 同步)。
+        finish_reason=length → 自动翻倍重试 1 次 (上限 16384)。
 
         Args:
             messages: 对话历史 [{'role':'system',...}, {'role':'user',...}]
@@ -575,16 +777,19 @@ class AIClient:
         if not self.is_available():
             raise AIClientNotConfiguredError("AI API Key 未配置，请在设置中配置 AI 模型")
 
+        # 用单例字段兜底（与 generate() 同源）
+        _max_tokens = max_tokens if max_tokens > 0 else self.max_tokens
+        _temperature = temperature if temperature > 0 else self.temperature
+
         from openai import OpenAI  # pyright: ignore[reportImplicitRelativeImport]
 
-        # ── 构建 create kwargs ──
-        def _build_kwargs(msgs: list[Dict[str, Any]]) -> dict:
+        def _build_kwargs(msgs: list[Dict[str, Any]], mt: int) -> dict:
             kw: dict = {
                 'model': self.model_name,
                 'messages': msgs,
                 'tools': tools,
-                'temperature': temperature,
-                'max_tokens': max_tokens,
+                'temperature': _temperature,
+                'max_tokens': mt,
             }
             if self._is_local_qwen():
                 _eb: dict[str, Any] = {
@@ -601,93 +806,114 @@ class AIClient:
             return kw
 
         try:
-            client = OpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-            )
+            kw_openai = self._make_openai_kwargs()
+            try:
+                client = OpenAI(**kw_openai)  # pyright: ignore[reportArgumentType]
+            except TypeError:
+                kw_openai.pop('http_client', None)
+                kw_openai.pop('timeout', None)
+                client = OpenAI(**kw_openai)  # pyright: ignore[reportArgumentType]
 
             MAX_TOOL_TURNS = 10
+            _ctx_size = self._get_context_size()
 
-            for turn in range(MAX_TOOL_TURNS):
-                response = client.chat.completions.create(
-                    **_build_kwargs(messages),
-                )
+            for attempt in range(2):  # 0=首次, 1=截断翻倍重试
+                _current_mt = _max_tokens if attempt == 0 else min(_max_tokens * 2, _ctx_size)
+                truncation_retry = False
 
-                choice = response.choices[0]
-                msg = choice.message
-
-                # ── 情况 A：模型请求调用工具 ──
-                if choice.finish_reason == 'tool_calls' and msg.tool_calls:
-                    # 将 assistant 的 tool_calls 消息追加到历史
-                    assistant_msg: Dict[str, Any] = {
-                        'role': 'assistant',
-                        'content': msg.content or '',
-                    }
-                    assistant_msg['tool_calls'] = [
-                        {
-                            'id': tc.id,
-                            'type': 'function',
-                            'function': {
-                                'name': tc.function.name,
-                                'arguments': tc.function.arguments,
-                            },
-                        }
-                        for tc in msg.tool_calls
-                    ]
-                    messages.append(assistant_msg)
-
-                    # 逐一执行工具，将结果注入历史
-                    for tc in msg.tool_calls:
-                        fn_name = tc.function.name
-                        try:
-                            fn_args = json.loads(tc.function.arguments)
-                        except json.JSONDecodeError:
-                            fn_args = {}
-
-                        executable = tool_executable_map.get(fn_name)
-                        if executable:
-                            try:
-                                result = executable(**fn_args)
-                                result_str = (
-                                    str(result)
-                                    if result is not None
-                                    else '(空结果)'
-                                )
-                            except Exception as e:
-                                result_str = f'[工具执行错误: {e}]'
-                        else:
-                            result_str = f'[未知工具: {fn_name}]'
-
-                        messages.append({
-                            'role': 'tool',
-                            'tool_call_id': tc.id,
-                            'content': result_str,
-                        })
-
-                    continue  # 进入下一轮 Agent Loop
-
-                # ── 情况 B：模型正常输出 ──
-                content = (msg.content or '').strip()
-                finish = getattr(choice, 'finish_reason', 'stop')
-                if finish == 'length':
-                    raise AIClientTruncationError(
-                        f"AI 工具调用输出在 {max_tokens} token 处被截断"
-                        + (f"（content={len(content)} chars）" if content else ""),
-                        partial_content=content if content else "",
+                for turn in range(MAX_TOOL_TURNS):
+                    response = client.chat.completions.create(
+                        **_build_kwargs(messages, _current_mt),
                     )
-                if not content:
-                    raise AIClientEmptyResponseError("AI 工具调用返回了空响应")
-                return content
 
-            # 超轮次保护
-            raise AIClientServerError(
-                f"工具调用超过最大轮次 ({MAX_TOOL_TURNS})，强制终止"
-            )
+                    choice = response.choices[0]
+                    msg = choice.message
+
+                    # ── 情况 A：模型请求调用工具 ──
+                    if choice.finish_reason == 'tool_calls' and msg.tool_calls:
+                        assistant_msg: Dict[str, Any] = {
+                            'role': 'assistant',
+                            'content': msg.content or '',
+                        }
+                        assistant_msg['tool_calls'] = [
+                            {
+                                'id': tc.id,
+                                'type': 'function',
+                                'function': {
+                                    'name': tc.function.name,
+                                    'arguments': tc.function.arguments,
+                                },
+                            }
+                            for tc in msg.tool_calls
+                        ]
+                        messages.append(assistant_msg)
+
+                        for tc in msg.tool_calls:
+                            fn_name = tc.function.name
+                            try:
+                                fn_args = json.loads(tc.function.arguments)
+                            except json.JSONDecodeError:
+                                fn_args = {}
+
+                            executable = tool_executable_map.get(fn_name)
+                            if executable:
+                                try:
+                                    result = executable(**fn_args)
+                                    result_str = (
+                                        str(result)
+                                        if result is not None
+                                        else '(空结果)'
+                                    )
+                                except Exception as e:
+                                    result_str = f'[工具执行错误: {e}]'
+                            else:
+                                result_str = f'[未知工具: {fn_name}]'
+
+                            messages.append({
+                                'role': 'tool',
+                                'tool_call_id': tc.id,
+                                'content': result_str,
+                            })
+
+                        continue  # 进入下一轮 Agent Loop
+
+                    # ── 情况 B：模型正常输出 ──
+                    content = (msg.content or '').strip()
+                    finish = getattr(choice, 'finish_reason', 'stop')
+                    if finish == 'length':
+                        if attempt == 0 and _max_tokens < _ctx_size:
+                            truncation_retry = True
+                            break  # 退出 turn 循环, 翻倍重试
+                        if content:
+                            raise AIClientTruncationError(
+                                f"AI 工具调用输出在 {_current_mt} token 处被截断"
+                                + (f"（content={len(content)} chars）" if content else ""),
+                                partial_content=content,
+                            )
+                        raise AIClientTruncationError(
+                            f"AI 工具调用输出在 {_current_mt} token 处被截断且 content 为空"
+                            f"（已自动翻倍重试 1 次）。",
+                        )
+                    if not content:
+                        raise AIClientEmptyResponseError("AI 工具调用返回了空响应")
+                    return content
+
+                # turn 循环结束: truncation_retry 或 超轮次
+                if truncation_retry:
+                    continue  # next attempt with larger _current_mt
+
+                # 超轮次保护
+                raise AIClientServerError(
+                    f"工具调用超过最大轮次 ({MAX_TOOL_TURNS})，强制终止"
+                )
 
         except AIClientError:
             raise
         except Exception as e:
             raise classify_openai_error(e) from e
+        return ""  # pyright: ignore[reportReturnType]  # unreachable — all paths return/raise
+
+
 
     def reset(self, api_key: str = '', base_url: str = '', model_name: str = '') -> None:
         """重置配置（允许运行时切换模型）."""

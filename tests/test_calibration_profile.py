@@ -4,7 +4,7 @@ from __future__ import annotations
 import os, json, tempfile, shutil
 import pytest
 import numpy as np
-from py.calibration.profile import CalibrationProfile, PROFILES_DIR
+from dp_engine.calibration.profile import CalibrationProfile, PROFILES_DIR
 
 
 @pytest.fixture
@@ -28,7 +28,7 @@ def sample_profile():
 def temp_profiles_dir(monkeypatch):
     """每次测试用临时目录替代 PROFILES_DIR"""
     tmp = tempfile.mkdtemp(prefix="calprof_")
-    monkeypatch.setattr("py.calibration.profile.PROFILES_DIR", tmp)
+    monkeypatch.setattr("dp_engine.calibration.profile.PROFILES_DIR", tmp)
     yield tmp
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -129,7 +129,7 @@ class TestLoadProfileLiveState:
     def test_load_profile_overrides_parser_placeholders(self, qapp, temp_profiles_dir):
         """profile 数据用 profile.annotation 覆盖活状态（模拟 load 核心逻辑）"""
         from ui.calibration_tab import TemperatureCalibrationPage
-        from py.calibration.profile import CalibrationProfile
+        from dp_engine.calibration.profile import CalibrationProfile
         import pandas as pd
 
         profile = CalibrationProfile(
@@ -177,7 +177,7 @@ class TestLoadProfileLiveState:
     def test_load_profile_sets_phase_a_done(self, temp_profiles_dir):
         """profile 含 s_eff_results → _phase_a_done = True"""
         from ui.calibration_tab import TemperatureCalibrationPage
-        from py.calibration.profile import CalibrationProfile
+        from dp_engine.calibration.profile import CalibrationProfile
 
         profile = CalibrationProfile(
             name="has_phase_a", created_at="2026-01-01", last_modified="2026-01-01",
@@ -196,7 +196,7 @@ class TestLoadProfileLiveState:
 
     def test_load_profile_sets_phase_b_state(self, temp_profiles_dir):
         """profile 含 decoupling → _phase_b_state 非空"""
-        from py.calibration.profile import CalibrationProfile
+        from dp_engine.calibration.profile import CalibrationProfile
 
         profile = CalibrationProfile(
             name="has_phase_b", created_at="2026-01-01", last_modified="2026-01-01",

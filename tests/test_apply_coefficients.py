@@ -20,10 +20,10 @@ _app = QApplication.instance() or QApplication(sys.argv)
 import pandas as pd
 import numpy as np
 
-from py.calibration.strain_calibration import (
+from dp_engine.calibration.strain_calibration import (
     StrainCalibrationConfig, StrainCalibrationResult, GratingStrainResult, calibrate_strain,
 )
-from py.calibration.project_config import ProjectConfig, StrainSubConfig
+from dp_engine.calibration.project_config import ProjectConfig, StrainSubConfig
 
 
 def check(label, cond):

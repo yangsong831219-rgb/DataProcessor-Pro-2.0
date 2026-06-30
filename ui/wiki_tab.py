@@ -15,7 +15,7 @@ from PyQt6.QtCore import Qt, QSettings
 from PyQt6.QtGui import QTextDocument, QTextCursor, QTextBlockFormat, QImage
 from PyQt6.QtCore import QByteArray, QUrl
 
-from py.wiki_system import WikiFileSystem
+from dp_engine.wiki_system import WikiFileSystem
 
 
 class WikiTabWidget(QWidget):

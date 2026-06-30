@@ -67,7 +67,7 @@ class TestSaveCapturesAllListSensors:
             _simulate_analyze(page, "B1", "dual_both",
                               grating_map={"G1": "B1-W1", "G2": "B1-W2"})
 
-            from py.calibration.project_config import ProjectConfigManager
+            from dp_engine.calibration.project_config import ProjectConfigManager
             pc = ProjectConfigManager.capture(None, page)
 
             assert pc.strain is not None
@@ -84,7 +84,7 @@ class TestSaveCapturesAllListSensors:
         tmp_dir = tempfile.mkdtemp(prefix="sav_json_")
         try:
             from ui.calibration_tab import StrainCalibrationPage
-            from py.calibration.project_config import ProjectConfigManager
+            from dp_engine.calibration.project_config import ProjectConfigManager
             page = StrainCalibrationPage()
             _simulate_analyze(page, "A1", "single", grating_map={"G1": "A1-W1"})
             _simulate_analyze(page, "A2", "dual_both",
@@ -106,7 +106,7 @@ class TestSaveCapturesAllListSensors:
     def test_capture_prefers_self_strain_configs(self, qapp):
         """_strain_configs 有 3 个传感器，ctw.project_config.strain 只有 1 个 → capture 取并集"""
         from ui.calibration_tab import StrainCalibrationPage, CalibrationTabWidget
-        from py.calibration.project_config import ProjectConfigManager, StrainSubConfig
+        from dp_engine.calibration.project_config import ProjectConfigManager, StrainSubConfig
 
         ctw = CalibrationTabWidget()
         sp = ctw.strain_page
@@ -226,8 +226,8 @@ class TestSaveProjectClearsDirty:
         tmp_dir = tempfile.mkdtemp(prefix="sav_clr_")
         try:
             from ui.calibration_tab import StrainCalibrationPage, CalibrationTabWidget
-            from py.calibration.project_config import ProjectConfigManager
-            import py.calibration.project_config as pcfg
+            from dp_engine.calibration.project_config import ProjectConfigManager
+            import dp_engine.calibration.project_config as pcfg
 
             ctw = CalibrationTabWidget()
             sp = ctw.strain_page

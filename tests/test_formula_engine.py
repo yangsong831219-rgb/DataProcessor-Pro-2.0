@@ -72,7 +72,7 @@ def _new_eval_formula(
     params: dict[str, float],
 ) -> list[float | None]:
     """阶段 1 实现：asteval 向量化求值"""
-    from py.formula import calculate as _engine_calculate
+    from dp_engine.formula import calculate as _engine_calculate
     return _engine_calculate(formula, columns, params, global_params=None)
 
 

@@ -18,32 +18,32 @@ class TestEstimateTokens:
     """_estimate_tokens 字符→token 估算。"""
 
     def test_empty_string(self):
-        from py.multi_agent import _estimate_tokens
+        from dp_engine.multi_agent import _estimate_tokens
         assert _estimate_tokens("") == 0
         assert _estimate_tokens("   ") > 0  # 空格也算字符
 
     def test_english_text(self):
-        from py.multi_agent import _estimate_tokens
+        from dp_engine.multi_agent import _estimate_tokens
         text = "Hello world, this is a test sentence with about fifty characters."
         tokens = _estimate_tokens(text)
         # 英文 ~3.5 char/token → ~14 tokens
         assert 10 <= tokens <= 30, f"英文估算应在合理范围, got {tokens}"
 
     def test_chinese_text(self):
-        from py.multi_agent import _estimate_tokens
+        from dp_engine.multi_agent import _estimate_tokens
         text = "这是一段中文测试文本大约有三十个汉字左右用于估算token数量"
         tokens = _estimate_tokens(text)
         # 中文 ~1.5 char/token → ~20 tokens
         assert 15 <= tokens <= 40, f"中文估算应在合理范围, got {tokens}"
 
     def test_mixed_text(self):
-        from py.multi_agent import _estimate_tokens
+        from dp_engine.multi_agent import _estimate_tokens
         text = "传感器 FBG_A1 的波长均值是 1545.2 nm"
         tokens = _estimate_tokens(text)
         assert tokens > 0
 
     def test_long_text_grows(self):
-        from py.multi_agent import _estimate_tokens
+        from dp_engine.multi_agent import _estimate_tokens
         short = _estimate_tokens("短")
         long = _estimate_tokens("长文本 " * 100)
         assert long > short * 10, "长文本 token 数应明显更大"
@@ -53,24 +53,24 @@ class TestTrimReportForBudget:
     """_trim_report_for_budget 输入裁剪。"""
 
     def test_short_report_untouched(self):
-        from py.multi_agent import _trim_report_for_budget
+        from dp_engine.multi_agent import _trim_report_for_budget
         short = "简短报告"
         result = _trim_report_for_budget(short, 1000)
         assert result == short, "短报告不应被裁剪"
 
     def test_long_report_trimmed(self):
-        from py.multi_agent import _trim_report_for_budget
+        from dp_engine.multi_agent import _trim_report_for_budget
         long = "数据 " * 500  # ~500 CJK chars
         result = _trim_report_for_budget(long, 50)  # 50 token budget
         assert len(result) < len(long), "长报告应被裁剪"
         assert "中间段已裁剪" in result, "应含裁剪标记"
 
     def test_empty_report(self):
-        from py.multi_agent import _trim_report_for_budget
+        from dp_engine.multi_agent import _trim_report_for_budget
         assert _trim_report_for_budget("", 100) == ""
 
     def test_trim_preserves_start(self):
-        from py.multi_agent import _trim_report_for_budget
+        from dp_engine.multi_agent import _trim_report_for_budget
         report = "AAAA" + "X" * 2000 + "ZZZZ"
         result = _trim_report_for_budget(report, 50)
         # 开头保留
@@ -81,7 +81,7 @@ class TestSafeMaxTokens:
     """_safe_max_tokens 安全计算。"""
 
     def test_returns_min_512(self):
-        from py.multi_agent import _safe_max_tokens
+        from dp_engine.multi_agent import _safe_max_tokens
         # 中等长度 prompt → available 在 512-N 之间
         medium = "x" * 5000
         result = _safe_max_tokens(medium, medium, 4096)
@@ -89,19 +89,19 @@ class TestSafeMaxTokens:
         assert 512 <= result <= 4096, f"应在 [512, 4096], got {result}"
 
     def test_huge_prompt_returns_512(self):
-        from py.multi_agent import _safe_max_tokens
+        from dp_engine.multi_agent import _safe_max_tokens
         # 超长 prompt 填满 ctx → 退回最小值 512
         huge = "x" * 20000
         result = _safe_max_tokens(huge, huge, 4096, ctx_tokens=4096)
         assert result == 512, "超长 prompt 应退回最小值 512"
 
     def test_caps_at_requested(self):
-        from py.multi_agent import _safe_max_tokens
+        from dp_engine.multi_agent import _safe_max_tokens
         result = _safe_max_tokens("短", "短", 2048, ctx_tokens=8192)
         assert result == 2048, "prompt 很短时不变"
 
     def test_respects_context_limit(self):
-        from py.multi_agent import _safe_max_tokens
+        from dp_engine.multi_agent import _safe_max_tokens
         # prompt 估算 ≈ 2000 tokens, ctx=3000, margin=600 → available=400
         # 请求 2048 → 应返回 400
         result = _safe_max_tokens("x" * 3000, "y" * 4000, 2048, ctx_tokens=3000)
@@ -117,17 +117,17 @@ class TestLinearGraph:
     """验证图结构为线性: START → DS → Advisor → Chief → END。"""
 
     def test_graph_is_linear_no_conditional_edges(self):
-        from py.multi_agent import create_multi_agent_graph
+        from dp_engine.multi_agent import create_multi_agent_graph
 
         graph = create_multi_agent_graph()
         assert graph is not None
 
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         assert not hasattr(ma, '_MAX_REJECTIONS')
         assert not hasattr(ma, 'should_continue_workflow')
 
     def test_no_rejection_count_in_state(self):
-        from py.multi_agent import MultiAgentState
+        from dp_engine.multi_agent import MultiAgentState
         ann = MultiAgentState.__annotations__
         assert "rejection_count" not in ann
         assert "audit_result" not in ann
@@ -135,7 +135,7 @@ class TestLinearGraph:
 
     def test_run_multi_agent_return_keys(self):
         """Phase 6 返回含 chief_truncated。"""
-        from py.multi_agent import run_multi_agent
+        from dp_engine.multi_agent import run_multi_agent
         import inspect
         src = inspect.getsource(run_multi_agent)
         # 新返回键
@@ -156,7 +156,7 @@ class TestAdvisoryAdvisor:
     """Advisor 为顾问式 (不裁决, 自由文本)。"""
 
     def test_advisor_prompt_is_advisory(self):
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         prompt = ma.DATA_ADVISOR_PROMPT_TPL
         prompt_body = prompt.replace("{data_context}", "")
         assert "{" not in prompt_body
@@ -164,7 +164,7 @@ class TestAdvisoryAdvisor:
         assert "顾问" in prompt or "建议" in prompt or "意见" in prompt
 
     def test_extract_advisory_text_passthrough(self):
-        from py.multi_agent import _extract_advisory_text
+        from dp_engine.multi_agent import _extract_advisory_text
         assert _extract_advisory_text("审查意见") == "审查意见"
         assert _extract_advisory_text("") == ""
         assert _extract_advisory_text("  ") == ""
@@ -180,7 +180,7 @@ class TestChiefTruncationDegrade:
 
     def test_chief_node_catches_truncation(self):
         """mock _invoke_llm 抛 AIClientTruncationError → chief 不抛, 设 chief_truncated=True。"""
-        from py.multi_agent import _make_nodes, AIClientTruncationError
+        from dp_engine.multi_agent import _make_nodes, AIClientTruncationError
 
         ds_node, adv_node, chief_node = _make_nodes()
 
@@ -196,7 +196,7 @@ class TestChiefTruncationDegrade:
         }
 
         # mock _invoke_llm 抛 AIClientTruncationError (有 partial_content)
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         original = ma._invoke_llm
 
         def _mock_invoke(sp, up, max_tokens=4096):
@@ -217,7 +217,7 @@ class TestChiefTruncationDegrade:
 
     def test_chief_node_truncation_empty_content(self):
         """AIClientTruncationError 无 partial_content → chief_report 为空字符串, 不崩。"""
-        from py.multi_agent import _make_nodes, AIClientTruncationError
+        from dp_engine.multi_agent import _make_nodes, AIClientTruncationError
 
         _, _, chief_node = _make_nodes()
 
@@ -231,7 +231,7 @@ class TestChiefTruncationDegrade:
             "current_csv_path": "",
         }
 
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         original = ma._invoke_llm
 
         def _mock_invoke(sp, up, max_tokens=4096):
@@ -247,7 +247,7 @@ class TestChiefTruncationDegrade:
 
     def test_chief_node_non_truncation_still_raises(self):
         """非截断异常 (如 AuthError) 仍向上抛。"""
-        from py.multi_agent import _make_nodes
+        from dp_engine.multi_agent import _make_nodes
 
         _, _, chief_node = _make_nodes()
 
@@ -261,7 +261,7 @@ class TestChiefTruncationDegrade:
             "current_csv_path": "",
         }
 
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         original = ma._invoke_llm
 
         def _mock_invoke(sp, up, max_tokens=4096):
@@ -285,7 +285,7 @@ class TestChiefInputBudget:
 
     def test_chief_prompt_trimmed_for_long_ds(self):
         """超长 DS 报告 → chief prompt 被裁剪。"""
-        from py.multi_agent import _make_nodes
+        from dp_engine.multi_agent import _make_nodes
 
         ds_node, adv_node, chief_node = _make_nodes()
 
@@ -302,7 +302,7 @@ class TestChiefInputBudget:
         }
 
         # 不实际调 LLM — 只验证 prompt 构造逻辑 (通过 mock _invoke_llm 检查参数)
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         original = ma._invoke_llm
         captured_user_prompt = []
 
@@ -326,7 +326,7 @@ class TestChiefInputBudget:
 
     def test_short_ds_not_trimmed(self):
         """短 DS 报告 → chief prompt 不触发裁剪。"""
-        from py.multi_agent import _make_nodes
+        from dp_engine.multi_agent import _make_nodes
 
         _, _, chief_node = _make_nodes()
 
@@ -342,7 +342,7 @@ class TestChiefInputBudget:
             "current_csv_path": "",
         }
 
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         original = ma._invoke_llm
         captured = []
 
@@ -361,7 +361,7 @@ class TestChiefInputBudget:
 
     def test_max_tokens_not_8192(self):
         """chief max_tokens 不再是硬编码 8192。"""
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         src = open(ma.__file__, encoding='utf-8').read()
         # 不应有 8192 硬编码在 chief 相关逻辑中
         # (safe_max_tokens 上限 4096 或 3072, 取决于节点)

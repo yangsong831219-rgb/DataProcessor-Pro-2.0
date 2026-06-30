@@ -41,7 +41,7 @@ def qapp():
 def _make_page_with_config(grating_kind, ke1, ke2=0.0, grating_map=None):
     """创建 StrainCalibrationPage, 填充 activity state 模拟分析完成。"""
     from ui.calibration_tab import StrainCalibrationPage
-    from py.calibration.strain_calibration import (
+    from dp_engine.calibration.strain_calibration import (
         StrainCalibrationConfig, StrainCalibrationResult, GratingStrainResult, calibrate_strain,
     )
     page = StrainCalibrationPage()
@@ -87,7 +87,7 @@ def _simulate_analyze(page, sensor_name, grating_kind="single", grating_map=None
     ke1, ke2 = 1.23, 0.98 if grating_kind == "dual_both" else (1.23, 0.0)
     page._ke_results = {"Ke1": ke1, "Ke2": ke2}
 
-    from py.calibration.strain_calibration import (
+    from dp_engine.calibration.strain_calibration import (
         StrainCalibrationResult, GratingStrainResult,
     )
     gratings = [GratingStrainResult(grating_index=1, k_pm_per_ue=ke1, R2=0.999)]
@@ -153,7 +153,7 @@ class TestAnalyzeAddsToSensorList:
         _simulate_analyze(page, "A1", "single", grating_map={"G1": "A1-W1"})
 
         # 手动添加第二个传感器条目 (模拟已保存的项目恢复)
-        from py.calibration.project_config import StrainSubConfig
+        from dp_engine.calibration.project_config import StrainSubConfig
         sc = StrainSubConfig(
             sensor_name="B2", sensor_mode="dual_working",
             ke_results={"Ke1": 1.50, "Ke2": 1.10},
@@ -292,7 +292,7 @@ class TestInconsistentGratingMapRejected:
         page._grating_map = {"G1": "A1-W1", "G2": "B1-W1"}
         page._ke_results = {"Ke1": 1.23, "Ke2": 0.98}
 
-        from py.calibration.strain_calibration import (
+        from dp_engine.calibration.strain_calibration import (
             StrainCalibrationResult, GratingStrainResult,
         )
         page._last_result = StrainCalibrationResult(
@@ -325,7 +325,7 @@ class TestCurrentSensorIsSelection:
         _simulate_analyze(page, "A1", "single", grating_map={"G1": "A1-W1"})
 
         # 手动加第二个
-        from py.calibration.project_config import StrainSubConfig
+        from dp_engine.calibration.project_config import StrainSubConfig
         page._strain_configs["B1"] = StrainSubConfig(sensor_name="B1")
         page._refresh_sensor_list(select_sensor="A1")
 
@@ -349,7 +349,7 @@ class TestLazyRecomputeGuardsEmpty:
     def test_lazy_recompute_guards_empty(self, qapp):
         """readings 为空的传感器选中 → 不崩 (守卫生效)"""
         from ui.calibration_tab import StrainCalibrationPage
-        from py.calibration.project_config import StrainSubConfig
+        from dp_engine.calibration.project_config import StrainSubConfig
 
         page = StrainCalibrationPage()
         sc = StrainSubConfig(
@@ -368,7 +368,7 @@ class TestLazyRecomputeGuardsEmpty:
     def test_lazy_recompute_without_ke_no_crash(self, qapp):
         """ke_results 全 0 的传感器选中 → 图表不崩"""
         from ui.calibration_tab import StrainCalibrationPage
-        from py.calibration.project_config import StrainSubConfig
+        from dp_engine.calibration.project_config import StrainSubConfig
 
         page = StrainCalibrationPage()
         sc = StrainSubConfig(
@@ -643,7 +643,7 @@ class TestGratingMapCacheRefresh:
     def test_load_sensor_does_not_overwrite_fresh(self, qapp):
         """_grating_map_fresh=True 时 _load_sensor_to_workspace 不覆盖"""
         from ui.calibration_tab import StrainCalibrationPage
-        from py.calibration.project_config import StrainSubConfig
+        from dp_engine.calibration.project_config import StrainSubConfig
         page = StrainCalibrationPage()
         # 模拟用户刚编辑完 grating_map
         page._grating_map = {"G1": "C2-1", "G2": "C2-2"}
@@ -666,7 +666,7 @@ class TestGratingMapCacheRefresh:
     def test_load_sensor_overwrites_when_not_fresh(self):
         """_grating_map_fresh=False 时 _load_sensor_to_workspace 正常恢复"""
         from ui.calibration_tab import StrainCalibrationPage
-        from py.calibration.project_config import StrainSubConfig
+        from dp_engine.calibration.project_config import StrainSubConfig
         page = StrainCalibrationPage()
         page._grating_map_fresh = False
 
@@ -682,7 +682,7 @@ class TestGratingMapCacheRefresh:
     def test_commit_to_list_clears_fresh_flag(self):
         """_commit_to_list 后 _grating_map_fresh 被清除"""
         from ui.calibration_tab import StrainCalibrationPage
-        from py.calibration.strain_calibration import (
+        from dp_engine.calibration.strain_calibration import (
             StrainCalibrationResult, GratingStrainResult,
         )
         page = StrainCalibrationPage()

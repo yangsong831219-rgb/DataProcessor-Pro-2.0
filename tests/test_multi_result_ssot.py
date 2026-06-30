@@ -1047,20 +1047,20 @@ class TestDSAntiFabrication:
     """②: DS prompt 含禁发问/禁臆造规则。"""
 
     def test_prompt_forbids_question_to_reader(self):
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         prompt = ma.DATA_SCIENTIST_PROMPT_TPL
         assert "严禁向读者发问" in prompt
         assert "请确认" in prompt  # 在禁止上下文中出现
 
     def test_prompt_forbids_fabrication(self):
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         prompt = ma.DATA_SCIENTIST_PROMPT_TPL
         assert "严禁臆造数值" in prompt
         assert "未提供" in prompt
         assert "无法计算" in prompt
 
     def test_prompt_requires_assumptions(self):
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         prompt = ma.DATA_SCIENTIST_PROMPT_TPL
         assert "分析口径" in prompt or "假设说明" in prompt
 
@@ -1175,7 +1175,7 @@ class TestASCIIArtBan:
     """②: prompt 禁止 ASCII 字符画。"""
 
     def test_ds_prompt_bans_ascii_art(self):
-        import py.multi_agent as ma
+        import dp_engine.multi_agent as ma
         prompt = ma.DATA_SCIENTIST_PROMPT_TPL
         assert "禁止 ASCII 字符画" in prompt
         assert "字符拼绘" in prompt or "拼绘趋势" in prompt

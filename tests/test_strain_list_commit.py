@@ -39,7 +39,7 @@ def qapp():
 
 def _do_analyze(page, grating_kind="single", grating_map=None, ke1=1.23, ke2=0.0):
     """模拟 _on_strain_result 的完整路径 (不自动入列表)"""
-    from py.calibration.strain_calibration import (
+    from dp_engine.calibration.strain_calibration import (
         StrainCalibrationResult, GratingStrainResult, StrainCalibrationConfig,
     )
     page._config["grating_kind"] = grating_kind
@@ -196,7 +196,7 @@ class TestApplyAllIteratesList:
     def test_apply_all_iterates_list(self, qapp):
         """列表 3 个 (2双栅+1单栅) → 批量应用核心逻辑 → 双栅写 ke_table, 单栅仅存"""
         from ui.calibration_tab import CalibrationTabWidget
-        from py.calibration.project_config import ProjectConfig, StrainSubConfig
+        from dp_engine.calibration.project_config import ProjectConfig, StrainSubConfig
 
         ctw = CalibrationTabWidget()
         sp = ctw.strain_page

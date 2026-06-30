@@ -2,6 +2,12 @@
 
 测试 is_wave_col (1400-1700nm 值域判定) 和 build_annotation_row (逐列对齐暗号行构建)
 的正确行为。全部通过 utils.annotation_utils 导入，锁死刚修复的行为。
+
+★ 覆盖：
+  - 光纤格式: Timestamp→时间戳, 波长列→wN-类型-位置, 公式列→空
+  - 非光纤格式(CSV/TXT): Timestamp→时间戳, 其它列→wN-类型-位置(顺序编号)
+  - 永远插入暗号行（不分有无 annotation）
+  - 真暗号优先、占位回退（逐列合并）
 """
 
 from __future__ import annotations
@@ -45,6 +51,26 @@ def _make_sensors_df(
         w_vals = [f"{1525.0 + i * 2.5 + t * 0.01:.5f}" for i in range(n_wavelength)]
         rows.append([ts] + f_vals + w_vals)
 
+    df = pd.DataFrame(rows, columns=cols)
+    for c in cols[1:]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def _make_plain_csv_df(
+    n_cols: int = 5,
+    n_rows: int = 5,
+) -> pd.DataFrame:
+    """构造普通 CSV DataFrame (无非波长值列)。
+
+    列: Timestamp + 应变1/应变2/位移/压力 (无波长区间值).
+    """
+    cols = ["Timestamp"] + [f"数据{i+1}" for i in range(n_cols)]
+    rows = []
+    for t in range(n_rows):
+        ts = f"2026/5/12 {t+1:02d}:00:00.0"
+        vals = [f"{t * 10.0 + i * 5.0:.2f}" for i in range(n_cols)]
+        rows.append([ts] + vals)
     df = pd.DataFrame(rows, columns=cols)
     for c in cols[1:]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -154,6 +180,144 @@ class TestAnnotationRowAlignment:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 测试 build_annotation_row — 非光纤格式 (CSV/TXT)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestAnnotationRowNonFiber:
+    """非光纤格式 (CSV/TXT) 暗号行构建"""
+
+    def test_non_fiber_all_columns_get_placeholders(self):
+        """非光纤格式：所有非 Timestamp 列都得到 wN-类型-位置 占位符"""
+        df = _make_plain_csv_df(n_cols=4, n_rows=3)
+        ann = build_annotation_row(df, file_format="csv")
+        assert len(ann) == len(df.columns)
+        # Timestamp → 时间戳
+        ts_idx = list(df.columns).index("Timestamp")
+        assert ann[ts_idx] == "'时间戳'"
+        # 其余列 → w1/w2/w3/w4-类型-位置
+        wave_labels = [a for a in ann if "w" in a and "类型" in a]
+        assert len(wave_labels) == 4
+        assert wave_labels[0] == "'w1-类型-位置'"
+        assert wave_labels[3] == "'w4-类型-位置'"
+
+    def test_non_fiber_txt_format_same_behavior(self):
+        """txt 格式与 csv 一致：所有非 Timestamp 列占位符"""
+        df = _make_plain_csv_df(n_cols=3, n_rows=3)
+        ann = build_annotation_row(df, file_format="txt")
+        wave_labels = [a for a in ann if "w" in a and "类型" in a]
+        assert len(wave_labels) == 3
+
+    def test_non_fiber_empty_format_same_behavior(self):
+        """空 file_format → 非光纤分支 → 占位符"""
+        df = _make_plain_csv_df(n_cols=2, n_rows=3)
+        ann = build_annotation_row(df, file_format="")
+        wave_labels = [a for a in ann if "w" in a and "类型" in a]
+        assert len(wave_labels) == 2
+
+    def test_non_fiber_annotation_row_length(self):
+        """非光纤暗号行长度等于列数"""
+        df = _make_plain_csv_df(n_cols=5, n_rows=3)
+        ann = build_annotation_row(df, file_format="csv")
+        assert len(ann) == len(df.columns)
+
+    def test_fiber_format_still_detects_wave_cols(self):
+        """光纤格式不受影响：波长列才给 wN，公式列留空"""
+        df = _make_sensors_df(n_formula=3, n_wavelength=4, n_rows=3)
+        ann = build_annotation_row(df, file_format="enlight")
+        wave_labels = [a for a in ann if "w" in a and "类型" in a]
+        assert len(wave_labels) == 4  # 仅波长列，不含公式列
+        # 公式列应为空
+        for ci, col_name in enumerate(df.columns):
+            if str(col_name).startswith("C") and "_" in str(col_name):
+                assert ann[ci] == "", f"公式列 {col_name} 应为空，got {ann[ci]!r}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 测试真暗号优先 + 占位符回退（逐列合并）
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestAnnotationMerge:
+    """真暗号优先、占位符回退：逐列合并逻辑"""
+
+    def _merge_annotations(
+        self,
+        df: pd.DataFrame,
+        real_annot: dict[str, str],
+        file_format: str,
+    ) -> list[str]:
+        """模拟 _insert_annotation_row_if_timestamp_exists 的逐列合并逻辑。"""
+        placeholder_ann = build_annotation_row(df, file_format=file_format)
+        ann: list[str] = []
+        for i, col_name in enumerate(df.columns):
+            col_str = str(col_name)
+            real_val = real_annot.get(col_str, "")
+            if real_val:
+                ann.append(real_val)
+            else:
+                fallback = placeholder_ann[i] if i < len(placeholder_ann) else ""
+                ann.append(fallback)
+        return ann
+
+    def test_real_annotation_wins_over_placeholder(self):
+        """有真暗号的列用真值，不用占位符"""
+        df = _make_sensors_df(n_formula=2, n_wavelength=3, n_rows=3)
+        real = {"FBG_A": "w1-A1-1部位", "FBG_B": "w2-A1-2部位"}
+        ann = self._merge_annotations(df, real, file_format="enlight")
+        fbg_a_idx = list(df.columns).index("FBG_A")
+        fbg_b_idx = list(df.columns).index("FBG_B")
+        assert ann[fbg_a_idx] == "w1-A1-1部位"  # 真暗号
+        assert ann[fbg_b_idx] == "w2-A1-2部位"  # 真暗号
+
+    def test_no_real_annotation_falls_back_to_placeholder(self):
+        """无真暗号的列用占位符"""
+        df = _make_sensors_df(n_formula=2, n_wavelength=3, n_rows=3)
+        real = {"FBG_A": "w1-A1-1部位"}  # 仅一列有真暗号
+        ann = self._merge_annotations(df, real, file_format="enlight")
+        fbg_c_idx = list(df.columns).index("FBG_C")  # 无真暗号
+        assert "w" in ann[fbg_c_idx] and "类型" in ann[fbg_c_idx]  # 占位符
+
+    def test_all_placeholder_when_empty_annotation(self):
+        """真暗号为空 → 全列占位符"""
+        df = _make_sensors_df(n_formula=2, n_wavelength=3, n_rows=3)
+        ann = self._merge_annotations(df, {}, file_format="enlight")
+        # Timestamp 列
+        ts_idx = list(df.columns).index("Timestamp")
+        assert ann[ts_idx] == "'时间戳'"
+        # 波长列有 wN-类型-位置
+        wave_labels = [a for a in ann if "w" in a and "类型" in a]
+        assert len(wave_labels) == 3
+
+    def test_plain_csv_all_placeholder(self):
+        """普通 CSV 无真暗号 → 全列占位符"""
+        df = _make_plain_csv_df(n_cols=3, n_rows=3)
+        ann = self._merge_annotations(df, {}, file_format="csv")
+        ts_idx = list(df.columns).index("Timestamp")
+        assert ann[ts_idx] == "'时间戳'"
+        wave_labels = [a for a in ann if "w" in a and "类型" in a]
+        assert len(wave_labels) == 3
+
+    def test_plain_csv_partial_real_annotation(self):
+        """普通 CSV 部分列有真暗号 → 有真用真，无真占位"""
+        df = _make_plain_csv_df(n_cols=3, n_rows=3)
+        real = {"数据1": "应变-A区-1号"}
+        ann = self._merge_annotations(df, real, file_format="csv")
+        d1_idx = list(df.columns).index("数据1")
+        assert ann[d1_idx] == "应变-A区-1号"  # 真暗号
+        # 数据2 (无真暗号) → 占位符
+        d2_idx = list(df.columns).index("数据2")
+        assert "w" in ann[d2_idx] and "类型" in ann[d2_idx]
+
+    def test_mixed_annotation_length_matches_columns(self):
+        """合并后暗号行长度等于列数"""
+        df = _make_sensors_df(n_formula=4, n_wavelength=4, n_rows=3)
+        real = {"FBG_A": "w1-A1-1", "FBG_D": "w4-A2-2"}
+        ann = self._merge_annotations(df, real, file_format="enlight")
+        assert len(ann) == len(df.columns)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 测试 insert_blank_row 和 apply_annotation_row
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -213,12 +377,15 @@ class TestApplyAnnotationRow:
         apply_annotation_row(new_df, ann, 0, dtypes)
         assert abs(float(new_df["FBG_A"].iloc[1]) - orig_data_val) < 0.01
 
-    def test_apply_empty_annotation_preserves_dtypes(self):
-        """空暗号行（非光纤格式）不破坏 dtype 结构"""
+    def test_apply_non_fiber_annotation_preserves_dtypes(self):
+        """非光纤格式暗号行（占位符）不破坏 dtype 结构"""
         df = _make_sensors_df(n_formula=2, n_wavelength=1, n_rows=3)
         new_df, dtypes = insert_blank_row(df)
-        # 非光纤格式 → 全空暗号
-        ann = build_annotation_row(df, file_format="")  # 空 file_format
+        # 非光纤格式 → 占位符 wN-类型-位置
+        ann = build_annotation_row(df, file_format="csv")
         apply_annotation_row(new_df, ann, 0, dtypes)
         # 数据行应完好无损
         assert len(new_df) == 4  # 3 + 1 blank
+        # 暗号行 (row 0) 应有占位符内容
+        ts_idx = list(new_df.columns).index("Timestamp")
+        assert "时间戳" in str(new_df.iloc[0, ts_idx])

@@ -281,7 +281,7 @@ total += 1; passed += check("return: G2 cols", gci3[2] == [3, 5])
 # ═══ Test 8: _compute_ke_results ═══
 print("\n═══ TestComputeKeResults ═══")
 
-from py.calibration.strain_calibration import (
+from dp_engine.calibration.strain_calibration import (
     StrainCalibrationConfig, StrainCalibrationResult, GratingStrainResult, calibrate_strain,
 )
 

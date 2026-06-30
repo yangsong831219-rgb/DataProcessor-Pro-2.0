@@ -25,11 +25,11 @@ _app = QApplication.instance() or QApplication(sys.argv)
 import pandas as pd
 import numpy as np
 
-from py.calibration.project_config import (
+from dp_engine.calibration.project_config import (
     ProjectConfig, StrainSubConfig, ProjectConfigManager, PROFILES_DIR,
 )
 from ui.calibration_tab import CalibrationTabWidget, StrainCalibrationPage
-from py.calibration.strain_calibration import (
+from dp_engine.calibration.strain_calibration import (
     StrainCalibrationResult, GratingStrainResult,
 )
 
@@ -142,7 +142,7 @@ setup_strain_page(sp)
 sp._apply_coefficients.__code__  # no-op: just verify method exists
 
 # 手动写入 strain 到 pc
-from py.calibration.project_config import ProjectConfig
+from dp_engine.calibration.project_config import ProjectConfig
 ctw.project_config = ProjectConfig.create_new("测试项目")
 ctw.project_config.strain["A1"] = sp._build_strain_subconfig()
 

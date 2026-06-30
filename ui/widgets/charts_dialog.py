@@ -93,14 +93,14 @@ class PhaseAChartsDialog(BaseChartsDialog):
         if (P is None or P.empty) and df is not None and not df.empty and wcols:
             print("[A4] lazy recompute: plateaus empty, computing...")
             try:
-                from py.calibration.step_extractor import detect_plateaus
-                from py.calibration.temperature_calibration import assign_setpoints, compute_dL
+                from dp_engine.calibration.step_extractor import detect_plateaus
+                from dp_engine.calibration.temperature_calibration import assign_setpoints, compute_dL
                 # ★ 先补 _d 列 (detect_plateaus 需要 _d 后缀列)
                 df_dL, _ = compute_dL(df.copy(), wcols)
                 params = getattr(self.parent(), '_detection_params', {}) if self.parent() else {}
                 tp = self.parent()
-                if hasattr(tp, 'temperature_page'):
-                    tp = tp.temperature_page
+                if hasattr(tp, 'temp_page'):
+                    tp = tp.temp_page
                 temp_page = tp if hasattr(tp, '_detection_params') else None
                 if temp_page:
                     params = temp_page._detection_params
@@ -264,7 +264,7 @@ class PhaseBChartsDialog(BaseChartsDialog):
 
         # 预计算 dL
         if self._df is not None and self._groups:
-            from py.calibration.temperature_calibration import compute_dL
+            from dp_engine.calibration.temperature_calibration import compute_dL
             cols = []
             for pfx, gratings in self._groups.items():
                 for g in gratings:

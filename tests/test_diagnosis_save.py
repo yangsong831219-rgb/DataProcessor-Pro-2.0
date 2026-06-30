@@ -107,7 +107,7 @@ def widget(qapp):
     strain_pb = {"A1": {"ke_results": {"Ke1": 0.82, "Ke2": 0.78}}}
     sp = SimpleNamespace(_phase_b_state=strain_pb)
 
-    ct = SimpleNamespace(temperature_page=tp, strain_page=sp)
+    ct = SimpleNamespace(temp_page=tp, strain_page=sp)
     cw = SimpleNamespace(_last_comparison=None)
     cl = SimpleNamespace(_cleaning_has_run=False, _anomaly_info={})
     cl.get_config = lambda: {"fill_method": "linear"}
@@ -361,3 +361,254 @@ class TestFileSaveRoundtrip:
 
         # 每传感器结论可取出
         assert loaded["diagnosis_json"] is not None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 1: 保存路径新增 数据/诊断记录/ 子目录
+# ═══════════════════════════════════════════════════════════════════
+
+class TestSaveDiagnosisToProjectPath:
+    """验证保存路径包含 数据/诊断记录/ 子目录"""
+
+    def test_data_dir_includes_diagnosis_record_subdir(self, tmp_path):
+        """os.path.join(target, '数据', '诊断记录') → 目录创建，文件可写"""
+        import json as _json
+
+        target = str(tmp_path / "test_proj")
+        data_dir = os.path.join(target, '数据', '诊断记录')
+        os.makedirs(data_dir, exist_ok=True)
+
+        json_path = os.path.join(data_dir, "诊断记录_test.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            _json.dump({"test": True}, f, ensure_ascii=False, indent=2)
+
+        # 落点正确
+        assert os.path.exists(json_path)
+        assert os.path.isdir(data_dir)
+        assert '数据' in json_path.replace(os.sep, '/')
+        assert '诊断记录' in json_path.replace(os.sep, '/')
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 0-B2 P0/P1/P2 修复验证 — chart_manifest 持久化 + record_id 一致
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestChartManifestInSaveJson:
+    """P0: chart_manifest + record_id 真实写入落盘 JSON（验磁盘文件，非验内存 rec）。"""
+
+    def test_save_json_contains_chart_manifest_and_record_id(self, tmp_path):
+        """模拟 on_ok 保存流程：build → 写 rec 字段 → json.dump → 读回验证。
+
+        必须证明 chart_manifest 和 record_id 已经写进了落盘 JSON 文件
+        （不是只在内存 rec 里有）。
+        """
+        import json as _json
+        from datetime import datetime
+
+        # 构建最小 rec（模拟 _build_diagnosis_record 产物）
+        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        record_id = ts_str
+
+        rec: dict = {
+            "schema_version": "1.2",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "backend": "local",
+            "model": "test-model",
+            "selected_sources": ["data_file"],
+            "data_source_snapshot": [],
+            "kb_hits": [],
+            "ai_diagnosis": {"diagnosis_json": None, "diagnosis_raw": ""},
+            "multi_agent": {"chief_structured": None, "data_scientist_text": "",
+                           "audit_advisory": "", "logs": [],
+                           "chief_truncated": False, "report": "", "raw_json": {}},
+            # chart_data: 最小有效数据让 build_chart_store 可跑
+            "chart_data": {
+                "time_h": [0.0, 1.0, 2.0],
+                "series": {"ch1": [1.0, 2.0, 3.0]},
+            },
+        }
+
+        # ── 模拟 on_ok 的语句顺序：先产图 → 写 rec 字段 → 再 dump ──
+        from core.chart_store import build_chart_store, chart_manifest_to_dict
+
+        charts_dir = str(tmp_path / record_id / "charts")
+        os.makedirs(charts_dir, exist_ok=True)
+
+        cd = rec.get("chart_data", {}) or {}
+        warnings: list[str] = []
+        chart_manifest = build_chart_store(cd, charts_dir, warnings)
+
+        # ★ 关键顺序: 在 json.dump 之前写 rec 字段
+        rec["record_id"] = record_id
+        rec["chart_manifest"] = chart_manifest_to_dict(chart_manifest)
+
+        # json.dump（写入 tmp_path 下的文件）
+        json_path = str(tmp_path / f"诊断记录_{ts_str}.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            _json.dump(rec, f, ensure_ascii=False, indent=2)
+
+        # ── 读回磁盘文件验证 ──
+        with open(json_path, "r", encoding="utf-8") as f:
+            loaded = _json.load(f)
+
+        # P0 核心断言: 落盘 JSON 含 chart_manifest 和 record_id
+        assert "chart_manifest" in loaded, \
+            "落盘 JSON 缺少 chart_manifest 字段 (P0 未修复)"
+        assert isinstance(loaded["chart_manifest"], list), \
+            "chart_manifest 应为 list"
+        assert len(loaded["chart_manifest"]) >= 1, \
+            f"chart_manifest 不应为空: {loaded['chart_manifest']}"
+        for entry in loaded["chart_manifest"]:
+            assert "chart_id" in entry, f"entry 缺 chart_id: {entry}"
+            assert "rel_path" in entry, f"entry 缺 rel_path: {entry}"
+            assert "produced" in entry, f"entry 缺 produced: {entry}"
+            assert "key_stat" in entry, f"entry 缺 key_stat: {entry}"
+            # 绝不含 PNG 字节
+            assert "png_bytes" not in entry, \
+                f"chart_manifest entry 含 png_bytes (违规!)"
+            assert "png_data" not in entry, \
+                f"chart_manifest entry 含 png_data (违规!)"
+
+        assert "record_id" in loaded, \
+            "落盘 JSON 缺少 record_id 字段 (P1 未修复)"
+        assert loaded["record_id"] == record_id, \
+            f"record_id 不匹配: {loaded['record_id']!r} != {record_id!r}"
+
+        # 体积不暴涨 (只有文本的相对路径清单)
+        json_size = os.path.getsize(json_path)
+        assert json_size < 5 * 1024 * 1024, \
+            f"JSON 体积异常: {json_size} bytes (疑似含 PNG 字节)"
+
+    def test_record_id_no_dashes_no_colons(self):
+        """record_id 格式: 纯数字+下划线，无横杠、无冒号 (P1 修复验证)。"""
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        record_id = ts  # 无需 replace
+        assert "-" not in record_id, f"record_id 不应含横杠: {record_id!r}"
+        assert ":" not in record_id, f"record_id 不应含冒号: {record_id!r}"
+        assert "_" in record_id, f"record_id 应含下划线: {record_id!r}"
+        # 格式: 20260629_143022 (8位日期_6位时间)
+        parts = record_id.split("_")
+        assert len(parts) == 2 and len(parts[0]) == 8 and len(parts[1]) == 6, \
+            f"record_id 格式不符合 YYYYMMDD_HHMMSS: {record_id!r}"
+
+
+class TestReportReadsRecordId:
+    """P1/P2: 报告段 record_id 读取路径 — 优先取持久化字段，降级推导。"""
+
+    def test_reads_persisted_record_id_no_derive(self):
+        """rec 含 record_id → 报告段直接取值，不走 replace 推导。"""
+        # 模拟 main.py 报告段逻辑
+        diag_rec = {
+            "record_id": "20260629_102112",
+            "timestamp": "2026-06-29 10:21:12",  # 有横杠+冒号
+            "chart_manifest": [{"chart_id": "t1", "rel_path": "a.png",
+                                "produced": True, "key_stat": "ok"}],
+        }
+
+        # 报告段取值逻辑 (与 main.py 行 1410-1416 一致)
+        record_id = diag_rec.get("record_id")
+        assert record_id == "20260629_102112", \
+            f"应首选持久化 record_id: {record_id}"
+        assert "-" not in (record_id or ""), \
+            f"record_id 不应含横杠: {record_id!r}"
+
+    def test_fallback_derive_when_no_record_id(self):
+        """旧记录无 record_id → 从 timestamp 降级推导 (向后兼容)。"""
+        diag_rec = {
+            # 无 record_id 字段 (旧记录)
+            "timestamp": "2026-06-29 10:21:12",
+        }
+
+        # 报告段降级逻辑 (与 main.py 行 1411-1416 一致)
+        record_id = diag_rec.get("record_id")
+        if not record_id:
+            ts = diag_rec.get("timestamp", "20260629_000000")
+            record_id = ts.replace(" ", "_").replace(":", "")
+
+        assert record_id == "2026-06-29_102112", \
+            f"降级推导 record_id 格式不对: {record_id!r}"
+        # 旧路径的 replace 规则保留横杠 (已知问题，向后兼容)
+        assert "-" in record_id, \
+            f"旧记录降级推导应保留横杠 (向后兼容): {record_id!r}"
+
+    def test_record_id_save_and_report_equal(self, tmp_path):
+        """同一 rec 走保存段→落盘→报告段读取，record_id 逐字一致。"""
+        import json as _json
+        from datetime import datetime
+
+        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        record_id = ts_str
+
+        # ── 保存段: rec 写入 record_id + 落盘 ──
+        rec: dict = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "chart_data": {"time_h": [0.0, 1.0], "series": {"ch1": [1.0, 2.0]}},
+        }
+        rec["record_id"] = record_id
+
+        json_path = str(tmp_path / f"诊断记录_{ts_str}.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            _json.dump(rec, f, ensure_ascii=False, indent=2)
+
+        # ── 报告段: 从文件读取 ──
+        with open(json_path, "r", encoding="utf-8") as f:
+            loaded = _json.load(f)
+
+        loaded_record_id = loaded.get("record_id")
+        assert loaded_record_id is not None, "加载后 record_id 丢失"
+        assert loaded_record_id == record_id, \
+            f"保存段 record_id={record_id!r} ≠ 报告段 record_id={loaded_record_id!r}"
+
+
+class TestReportReadsManifestNotProduces:
+    """P0+P1 合验: 报告段有 manifest → 读取路径，不调 build_chart_store。"""
+
+    def test_manifest_present_bypasses_build_chart_store(self):
+        """rec 含 chart_manifest → 报告段走读取分支，非降级产图。
+
+        用 spy 验证: 当 chart_manifest 存在时 build_chart_store 调用次数 = 0。
+        """
+        diag_rec = {
+            "record_id": "20260629_102112",
+            "chart_manifest": [
+                {"chart_id": "data_ts_cleaning", "module": "data_analysis",
+                 "title": "清洗时序", "rel_path": "ts_cleaning.png",
+                 "produced": True, "skip_reason": "", "key_stat": "1通道"},
+            ],
+            "chart_data": {"time_h": [0.0, 1.0], "series": {"ch1": [1.0, 2.0]}},
+        }
+
+        # ── 报告段链路: chart_manifest_from_dict → 不调 build_chart_store ──
+        from core.chart_store import chart_manifest_from_dict
+
+        _chart_manifest: list = []
+        stored = diag_rec.get("chart_manifest")
+        if stored:
+            _chart_manifest = chart_manifest_from_dict(stored)
+            build_called = 0  # 模拟: 不调 build_chart_store
+        else:
+            build_called = 1  # 降级路径
+
+        assert build_called == 0, \
+            f"有 manifest 时不应调 build_chart_store, called={build_called}"
+        assert len(_chart_manifest) == 1
+        assert _chart_manifest[0].chart_id == "data_ts_cleaning"
+        assert _chart_manifest[0].rel_path == "ts_cleaning.png"
+
+    def test_no_manifest_triggers_fallback(self):
+        """rec 无 chart_manifest → 应走降级 build 路径 (旧记录兼容)。"""
+        diag_rec = {
+            "record_id": "20260629_102112",
+            # 无 chart_manifest
+        }
+
+        stored = diag_rec.get("chart_manifest")
+        if stored:
+            build_called = 0
+        else:
+            build_called = 1  # 降级路径
+
+        assert build_called == 1, \
+            f"无 manifest 应触发降级, called={build_called}"

@@ -18,7 +18,7 @@ import tempfile
 import shutil
 import json
 
-from py.calibration.project_config import (
+from dp_engine.calibration.project_config import (
     ProjectConfig, StrainSubConfig, ProjectConfigManager,
     TEMPERATURE_FIELDS, STRAIN_SUB_CONFIG_FIELDS,
 )

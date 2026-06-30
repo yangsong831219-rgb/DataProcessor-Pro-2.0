@@ -70,8 +70,8 @@
     - `ai_errors.py` — 类型化异常层级：`AIClientAuthError`(401)/`RequestError`(400)/`RateLimitError`(429,retryable)/`ServerError`(5xx,retryable)/`TimeoutError`(retryable)/`EmptyResponseError`/`NotConfiguredError`/`ReportSchemaError`(含 missing_fields/type_errors 诊断) + `classify_openai_error()` 分类工厂。
     - `report_models.py` — Pydantic `WordReport`/`WordSection`/`PPTReport`/`PPTSlide` — report_engine 和渲染器的唯一数据契约。
     - `report_engine.py` — `generate_outline`(人审 Markdown 不变) + `generate_structured_report` → 逐节 Pydantic 校验 (Phase 2)。
-- **后端引擎 (`py/`):** 信号处理 (`analyzer.py`)、数学公式解析 (`formula.py`)，Word/PPT 报告引擎 (`report_builder/`)、LangGraph 多智能体审查系统 (`multi_agent.py` — Phase 3: Auditor 产出结构化 `AuditVerdict`，第 3 次驳回 → `task_status="failed"` 显式失败终态)。
-- **标定引擎 (`py/calibration/`):** 温度标定 (平台检测 + KMeans 映射 + 灵敏度回归 + 解耦诊断)、应变标定 (手填表驱动 + 灵敏度/线性度/重复性/迟滞/双栅分析)、Excel 导出。
+- **后端引擎 (`dp_engine/`):** 信号处理 (`analyzer.py`)、数学公式解析 (`formula.py`)，Word/PPT 报告引擎 (`report_builder/`)、LangGraph 多智能体审查系统 (`multi_agent.py` — Phase 3: Auditor 产出结构化 `AuditVerdict`，第 3 次驳回 → `task_status="failed"` 显式失败终态)。
+- **标定引擎 (`dp_engine/calibration/`):** 温度标定 (平台检测 + KMeans 映射 + 灵敏度回归 + 解耦诊断)、应变标定 (手填表驱动 + 灵敏度/线性度/重复性/迟滞/双栅分析)、Excel 导出。
 - **标定 UI (`ui/calibration_tab.py`):** 温度标定子页 (文件加载/列角色指派/设定温度/诊断图/Word报告) + 应变标定子页 (动态填表/自动计算/指标图表/系数闭环)。
   - **对话框 (`ui/` 独立文件):**
     - `fbg_edit_dialog.py` — FBG 编辑/添加对话框。
@@ -98,7 +98,7 @@
    - 只有在 CodeGraph 无法覆盖（如索引尚未就绪的 .txt / .md / .json 文件）时才降级到 Grep/Read。
    - **修改前必查 callers**：改任何函数的签名或行为前，必须用 `codegraph_callers` 确认所有调用点。
 2. **派生子代理（Sub-agent）探路:** 在调试复杂的 Pandas 索引对齐或切片 Bug 时，不要直接在主会话里盲改 `main.py`。请先派生一个子代理（Sub-agent）写个独立的测试脚本，摸清底层的 `.index` 行为后，再在主会话中给出最终代码。
-3. **公式求值统一走 `py/formula.py` 的 asteval 引擎:** 所有公式求值必须通过 `py.formula.calculate()`（基于 `asteval.Interpreter` 安全向量化求值），**禁止再用 `eval` 或字符串替换**。参数与列变量均作为 symtable 注入，彻底消除 k1/k10 误匹配风险。
+3. **公式求值统一走 `dp_engine/formula.py` 的 asteval 引擎:** 所有公式求值必须通过 `dp_engine.formula.calculate()`（基于 `asteval.Interpreter` 安全向量化求值），**禁止再用 `eval` 或字符串替换**。参数与列变量均作为 symtable 注入，彻底消除 k1/k10 误匹配风险。
 
 ---
 
@@ -107,7 +107,7 @@
 1. **标定系数闭环仅限当前会话:** 通过「应用标定系数到当前传感器」按钮注入的实测 k 系数，**仅写入当前 `sensor_system` 实例的 `Sensor.constants`**（会话级）。**严禁**写回全局 `Sensor.TYPE_PARAMS` 或持久化为默认值。
 2. **标定模块不得改动暗号标注机制:** 标定模块有自己独立的列角色指派 UI（`col_table`），**绝不插入标注行**（annotation row），**不复用** `analysis_tab` 的 `_annotated_cols` 解析逻辑。
 3. **温度标定独立加载文件:** 温度标定子页加载的连续波长文件**不写入**主窗口的 `current_data`，在独立的 DataFrame 中完成全流程。
-4. **解耦矩阵与 `core/models.py` 公式一致:** `py/calibration/temperature_calibration.decouple()` 的 2×2 矩阵求逆公式与 `SensorSystem._evaluate_decoupling()` **逐元素等价**。
+4. **解耦矩阵与 `core/models.py` 公式一致:** `dp_engine/calibration/temperature_calibration.decouple()` 的 2×2 矩阵求逆公式与 `SensorSystem._evaluate_decoupling()` **逐元素等价**。
 5. **对话框状态对称恢复:** 任何对话框 `close/accept()` 时写入主 Tab 状态 dict 的数据，**必须在 `__init__` 末尾完整 restore 到 UI**（含表格内容、表格样式、单元格背景色、状态条文本）。禁止只存不取或只取部分。Phase A/B 必须同构——修一边必须同时检查另一边。
 6. **对称 Phase 改动同步:** 凡涉及"Phase A 和 Phase B 对称功能"的改动（状态恢复、对话框形态、暗号显示、结果渲染），**写完一边立即 LSP grep 对偶位置检查另一边是否有相同路径**。禁止"Phase A 修了但 Phase B 漏了"的反复 bug。
 7. **新对话框/流程必须配 smoke test:** 每加一个对话框或完整流程，**必须**配一个 happy-path roundtrip smoke test（构造完整状态→执行→assert no exception）。比单元测试便宜但拦截 80% 的回归。参照 `tests/test_phase_b_dialog.py::test_full_temp_calibration_roundtrip_smoke`。
@@ -121,10 +121,20 @@
   - Phase 2 — Mixin 多继承方案评估后缓做：按职责分拆 DataTabMixin/SensorFbgMixin/ReportMixin 等的收益主要是文件组织而非解耦，多继承+Protocol 维护成本需权衡。ConfigMixin 的方向是改走 AppState 序列化(SSOT)而非横切全属性。
   - main.py 中 16 个委托壳可逐步去壳（调用点直指 utils 函数），但非紧急，不阻塞其他功能。
 - **test_run.py**: 需要 GUI 环境才能运行，无头环境（CI）下会崩溃。
+- **pytest 预存失败 14f+1e**: 全部来自前置提交 79b9b10 / 7fad573 / a7b25b0。完整清单见 `wiki_vault/diagnoses/pytest预存失败清单_20260625.md`。每轮 pytest 跑完对照清单确认无新增回归。
 - **积压（不阻塞）**:
-  - `py/report_builder/flow_controller.py` — `ReportFlowController.generate_outline()` / `expand_section()` 当前无外部调用者，是死代码；若被调用会裸抛异常。建议或删或补兜底。
+  - `dp_engine/report_builder/flow_controller.py` — `ReportFlowController.generate_outline()` / `expand_section()` 当前无外部调用者，是死代码；若被调用会裸抛异常。建议或删或补兜底。
   - `AIClient.generate_structured()` 当前走 Pydantic 校验 + 1 次回喂修复，在线模型（DeepSeek/GPT）可切原生 `response_format=json_schema` 强约束省掉重试往返。不必现在做。
-  - `py/agent_worker.py` — `DeepSeekAgentWorker` 当前无 Python 调用者（仅文档引用）；有 `except Exception → error_signal` 守卫。若未来启用需确认 caller 同时绑定 `error_signal`。
+  - `dp_engine/agent_worker.py` — `DeepSeekAgentWorker` 当前无 Python 调用者（仅文档引用）；有 `except Exception → error_signal` 守卫。若未来启用需确认 caller 同时绑定 `error_signal`。
+  - `parse_enlight_sensors` — 当文件含中段第二条暗号行时，`_looks_like_annotation_row` 漏检（`'nan'` 被 float 解析为 NaN → 判定为数据行）。当前显示层 `_insert_annotation_row` 事后 drop 归一 row 0，能用。可考虑解析层一并剔 + 抽查 drop 点附近数据连续性。
+  - `classify_openai_error` 在 `core/ai_errors.py:190` 用 `"connection" in msg_lower` 匹配，导致 `ConnectError`（`[WinError 10061]` 连接拒绝，本地 llama.cpp 未运行）被误分类为 `AIClientTimeoutError`，提示文案误导用户去调 timeout 而非启动服务。应拆分 connection-refused 为独立异常（如 `AIClientConnectionError`）。仅登记，不修。
+  - **四表注入 docx — 三条已知尾巴 (2026-06-25 封板)**:
+    - `A1 异常表非空验证`: 迄今所有真机数据 `anomaly=False`，A1 异常表"有异常时正常出现"未真机验（只验了空表降级省略）。待有异常数据时补。
+    - `空表 fail-loud`: 四表全空时 `ai_diagnosis.py:3082` `if four_tables:` → `False` → 整段静默跳过（无 heading、无表、无日志、无 UI 提示）。建议加可见提示（如 `doc.add_paragraph("标定数据不可用，跳过数据汇总附表。")`），满足 fail-loud 原则。低优先级。
+    - `[A1]/[B1]` 等预存调试打印: `ui/calibration_tab.py:1448,1450,2114,2123,2128,2144` 共 6 处 `print("[A1]..."/"[B1]..."...)`（来自 `7fad573` 标定 Phase A/B 调试，非本批）。待清理，改为 `logging.debug()` 或删除。
+  - **报告 prompt 领域约束 (甲-1)** — 砍掉。经真机实证：加载诊断记录后 `_build_context` 已含诊断摘要，大纲自然锚定 FBG 领域，不再跑题为 IT 运维报告。硬拦 (甲-2) 已堵死无数据路径。保留观察项：若出现"已加载数据仍跑题"，重启甲-1。
+  - **PPT 报告未选模板 Padding not found at ''**: `ppt_builder.py:274` `build_ppt_report()` 缺空模板 fallback — `Presentation('')` 直接抛错。同文件 `build()` (`line 54`) 有正确的 `if path.exists() else Presentation()` guard，`build_ppt_report()` 漏抄。Word 路径 `word_builder.py:567` 有 `Document(path) if path else Document()`。修复最小：`ppt_builder.py:274` 加同构 guard。评估见 `docs/PPT模板缺失溯源.md`。
+  - **✅ 基建: `py/` → `dp_engine/` 目录改名，pytest 收集冲突已根治 (2026-06-26)**。原 `py/` 目录撞 PyPI `py` 包名（pytest 传递依赖）→ `import py` 时遮蔽导致 `AttributeError: module 'py' has no attribute 'path'`。已 `git mv py dp_engine` + 全仓 import 替换（36 文件 × 153 行）。`run_tests.py` 救火脚本同步退役。`python -m pytest tests/` 现在可正常收集。
 
 ## 🔧 表观应变补偿 + 出厂指标 + 评级 (Phase 1-3b 新增)
 

@@ -316,7 +316,7 @@ class WebClipperWidget(QWidget):
         QApplication.processEvents()
 
         try:
-            from py.web_clipper import WebClipper
+            from dp_engine.web_clipper import WebClipper
 
             clipper = WebClipper()
             cookies = self.clip_cookie_input.toPlainText().strip()
@@ -360,7 +360,7 @@ class WebClipperWidget(QWidget):
         QApplication.processEvents()
 
         try:
-            from py.web_clipper import WebClipper
+            from dp_engine.web_clipper import WebClipper
 
             clipper = WebClipper()
             md_content = self._clipped_md

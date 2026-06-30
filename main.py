@@ -5,8 +5,10 @@ import sys
 import os
 import json
 import re
+import traceback
 from pathlib import Path
 from datetime import datetime
+from typing import Any
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QFileDialog,
@@ -22,6 +24,8 @@ from PyQt6.QtGui import QAction, QIcon
 import pandas as pd
 import numpy as np
 from docx import Document
+from docx.shared import RGBColor, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # Matplotlib for charts
 import matplotlib
@@ -40,8 +44,8 @@ from utils.file_parser import parse_file, detect_format, detect_header, try_read
 from utils.data_cleaning import clean_data, detect_anomalies, fill_missing
 
 # ============ Backend Module Imports ============
-from py.wiki_system import WikiFileSystem
-from py.multi_agent import run_multi_agent, MultiAgentState
+from dp_engine.wiki_system import WikiFileSystem
+from dp_engine.multi_agent import run_multi_agent, MultiAgentState
 
 # ============ UI Module Imports ============
 from ui.report_workbench import ReportWorkbenchWidget
@@ -72,23 +76,242 @@ from core.models import (
 )
 
 # ═══════════════════════════════════════════════
-# 报告输出目录
-# ═══════════════════════════════════════════════
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-REPORT_OUTPUT_DIR = os.path.join(BASE_DIR, 'output_reports')
 
 # ============ App State (SSOT) ============
 from state.app_state import AppState
 
 # ============ Main Window ============
 
+def validate_docx_template(tmpl_path: str) -> str | None:
+    """校验 Word 模板是否可被 python-docx 打开。
+
+    返回 None = 有效，返回字符串 = 错误描述（中文友好提示）。
+    """
+    import os as _os
+    if not tmpl_path or not _os.path.isfile(tmpl_path):
+        return None  # 无模板是可接受的
+    fname = _os.path.basename(tmpl_path)
+    ext = _os.path.splitext(fname)[1].lower()
+    if ext != '.docx':
+        return (
+            f"模板文件「{fname}」不是 .docx 格式"
+            f"（扩展名为 {ext or '无'}，可能为旧 .doc 格式或主题文件）。\n"
+            f"请选择扩展名为 .docx 的有效 Word 模板，或清空模板使用默认样式。"
+        )
+    try:
+        from docx import Document
+        Document(tmpl_path)
+    except Exception as e:
+        return (
+            f"模板文件「{fname}」无法作为 Word 模板打开：{e}\n"
+            f"请选择有效的 .docx 文件，或清空模板使用默认样式。"
+        )
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 项目根反推 — 从关联文件路径反推项目根 (用项目资料库做锚)
+# ═══════════════════════════════════════════════════════════════════════
+
+_KNOWN_PROJECT_SUBDIRS = {'数据', '方案', '图纸', '图片', '视频', '其它', '报告'}
+
+
+def _resolve_project_root_from_files(
+    file_paths: list[str],
+    library_root: str | None = None,
+) -> str:
+    """从关联文件路径反推统一项目根目录 (用项目资料库做锚)。
+
+    项目根 = 项目资料库/ 的直接子目录。
+    对每个文件: abspath → realpath → 核对是否在 library_root 下
+    → 取 relpath 第一段为项目名 → 比较所有文件的项目名是否一致。
+
+    方案 B — 有明确锚点，不依赖「非白名单即项目根」的排除法，
+    在自建子目录/文件不在库下/路径含白名单词 等异常路径下明确报错，不静默假根。
+
+    Args:
+        file_paths: 非空文件路径列表
+        library_root: 项目资料库根路径。缺省 = 软件根/项目资料库/
+
+    Returns:
+        统一项目根目录绝对路径 (library_root/项目名)
+
+    Raises:
+        ValueError: 文件列表为空 / 文件不属于任何项目 / 跨多个项目
+    """
+    if not file_paths:
+        raise ValueError("请先添加项目关联资料")
+
+    # ── 库根锚点 ──
+    if library_root is None:
+        library_root = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "项目资料库")
+    lib_root = os.path.realpath(library_root)
+
+    project_names: set[str] = set()
+    for f in file_paths:
+        abs_path = os.path.realpath(os.path.abspath(f))
+
+        # 前缀判断: 文件必须在项目资料库下
+        prefix = lib_root + os.sep
+        if not abs_path.startswith(prefix):
+            raise ValueError("文件不属于任何项目，请添加项目库内的关联资料")
+
+        # 取项目资料库的直接子目录作为项目名
+        rel = os.path.relpath(abs_path, lib_root)
+        project_name = rel.split(os.sep)[0]
+
+        # 双保险: relpath 不应以 .. 开头（前缀已挡，但兜底）
+        if project_name.startswith(".."):
+            raise ValueError("文件不属于任何项目，请添加项目库内的关联资料")
+
+        project_names.add(project_name)
+
+    if len(project_names) > 1:
+        raise ValueError("关联资料跨多个项目，请统一")
+
+    return os.path.join(lib_root, project_names.pop())
+
+
+def _inject_figures_by_reference(
+    docx_path: str, manifest, warnings: list[str],
+) -> None:
+    """扫描 docx 正文中的「图N」引用，注入对应图片+图题到首次引用段落之后。
+    未被引用的图 → 追加到末尾「图表附录」节 + 警告。
+    引用不存在的图N → 警告。
+    """
+    import re as _re
+    try:
+        doc = Document(docx_path)
+    except Exception as e:
+        warnings.append(f"图注入失败(无法打开docx): {e}")
+        return
+
+    # 收集所有段落文本和索引
+    para_data = [(i, p.text) for i, p in enumerate(doc.paragraphs)]
+
+    # 建立图N→fig 映射
+    fig_map: dict[int, object] = {}
+    for rf in manifest:
+        fig_map[rf.fig_no] = rf
+
+    # 扫描正文中的「图N」引用
+    cited: set[int] = set()
+    fig_to_para: dict[int, int] = {}  # fig_no → 首次引用段落索引
+    pattern = _re.compile(r'图(\d+)')
+    for idx, text in para_data:
+        found = {int(n) for n in pattern.findall(text)}
+        for fn in found:
+            if fn not in cited and fn in fig_map:
+                cited.add(fn)
+                fig_to_para[fn] = idx
+            elif fn not in fig_map:
+                if fn not in cited:  # 只报一次
+                    cited.add(fn)  # mark as seen
+                    warnings.append(f"图引用不存在: 正文引用了「图{fn}」，但该图号未生成")
+
+    # 在图首次引用段落后注入 (从后往前插入以保持索引)
+    for fig_no in sorted(fig_to_para.keys(), reverse=True):
+        rf = fig_map[fig_no]
+        insert_idx = fig_to_para[fig_no]
+        # 在 insert_idx 段落后插入图片 + 图题
+        ref_para = doc.paragraphs[insert_idx]
+        try:
+            # 添加图片
+            img_para = doc.add_paragraph()
+            run = img_para.add_run()
+            run.add_picture(rf.png_path, width=Inches(5.0))
+            img_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            # 移动到引用段落之后
+            ref_para._element.addnext(img_para._element)
+            # 图题
+            cap_para = doc.add_paragraph(rf.caption)
+            cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            img_para._element.addnext(cap_para._element)
+        except Exception as e:
+            warnings.append(f"图{fig_no} 插入失败: {e}")
+
+    # 未被引用的图 → 附录
+    unreferenced = [fn for fn in fig_map if fn not in fig_to_para]
+    if unreferenced:
+        doc.add_heading('图表附录', level=1)
+        for fn in sorted(unreferenced):
+            rf = fig_map[fn]
+            try:
+                doc.add_picture(rf.png_path, width=Inches(5.0))
+                doc.add_paragraph(rf.caption)
+            except Exception as e:
+                warnings.append(f"图{fn}({rf.title}) 附录插入失败: {e}")
+        warnings.append(
+            f"图表附录: {len(unreferenced)}张图未被正文引用, 已追加到末尾 "
+            f"({' '.join(f'图{fn}' for fn in sorted(unreferenced))})"
+        )
+
+    try:
+        doc.save(docx_path)
+    except Exception as e:
+        warnings.append(f"图注入后保存失败: {e}")
+
+
+def _inject_figures_to_pptx(
+    pptx_path: str, manifest, warnings: list[str],
+) -> None:
+    """将 manifest 中所有图表追加为 PPT 附录 slide（一图一 slide，16:9）。
+
+    使用 manifest 的 png_path（已落盘的绝对路径），不依赖 LLM 写引用。
+    空 manifest → 不追加、不崩。
+    """
+    if manifest is None or manifest.count == 0:
+        return
+
+    try:
+        from pptx import Presentation
+        prs = Presentation(pptx_path)
+    except Exception as e:
+        warnings.append(f"PPT图表注入失败(无法打开pptx): {e}")
+        return
+
+    from pptx.util import Inches as _Inches, Pt as _Pt
+
+    # 空白版式 (index 6 = blank)
+    blank_layout = prs.slide_layouts[6]
+
+    for rf in manifest:
+        try:
+            slide = prs.slides.add_slide(blank_layout)
+
+            # 图放中上部，底边留给图题
+            slide.shapes.add_picture(
+                rf.png_path,
+                _Inches(0.8), _Inches(0.6),
+                width=_Inches(11.7), height=_Inches(5.8),
+            )
+
+            # 图题文本框
+            txBox = slide.shapes.add_textbox(
+                _Inches(0.8), _Inches(6.6), _Inches(11.7), _Inches(0.5),
+            )
+            tf = txBox.text_frame
+            tf.word_wrap = True
+            p = tf.paragraphs[0]
+            p.text = rf.caption
+            p.font.size = _Pt(14)
+        except Exception as e:
+            warnings.append(f"图{rf.fig_no}({rf.title}) PPT插入失败: {e}")
+
+    try:
+        prs.save(pptx_path)
+    except Exception as e:
+        warnings.append(f"PPT图表注入后保存失败: {e}")
+
+
 class DataProcessorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        # 确保报告输出目录存在
-        os.makedirs(REPORT_OUTPUT_DIR, exist_ok=True)
         self.current_data = None
+        self._annotation_orig_dtypes: dict[str, Any] | None = None
+        self.current_annotation: dict[str, str] = {}
         self.current_columns = []
         self.sampled_data = None
         self.file_header_lines = []
@@ -749,10 +972,11 @@ class DataProcessorWindow(QMainWindow):
         if ai.is_available():
             return ai.get_generate_fn(enable_thinking=False)
 
-        # 降级：无 AI 配置时返回 mock 函数（用户在 UI 看到模板内容）
+        # 降级：无 AI 配置时返回 mock 函数（用户在 UI 看到模拟模板内容）
         print("[主窗口] AI 未配置，大纲/报告将使用模拟降级")
         def _fallback(prompt: str) -> str:
             return (
+                '# ⚠ AI 未配置 — 以下为降级模板，非真实分析结果\n\n'
                 '# 传感器数据分析报告\n\n'
                 '## 数据概述\n'
                 '- 数据来源与采集方式\n'
@@ -801,27 +1025,64 @@ class DataProcessorWindow(QMainWindow):
     # ═══════════════════════════════════════════════
 
     def _handle_load_diagnosis(self) -> None:
-        """弹出对话框，列出 wiki_vault/diagnoses/ 中的诊断 JSON，用户选择后加载。"""
+        """从关联资料反推项目根 → 扫 数据/诊断记录/ → 用户选择加载。"""
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QPushButton, QHBoxLayout, QLabel
-        from py.wiki_system import WikiFileSystem
 
-        wiki = WikiFileSystem()
-        diags = wiki.list_diagnoses()
-        if not diags:
-            QMessageBox.information(self, '提示', '项目资料库中尚无已存诊断结果。\n请先在 AI 诊断页运行诊断并保存。')
+        config = self.report_workbench_widget.get_config()
+        project_files: list[str] = config.get('project_files', [])
+
+        # ★ 强约束: 关联资料为空 → 硬拦 (只看 project_files, 不被 req_file 僵尸值绕过)
+        if not project_files:
+            QMessageBox.warning(self, '缺少项目关联资料',
+                '请先在报告工作台添加项目关联资料，再加载诊断记录。')
+            return
+
+        # ★ 反推项目根 (含 req_file 兜底，供 resolver 有更多路径可推)
+        req_file = config.get('req_file', '')
+        all_files = [f for f in project_files + ([req_file] if req_file else []) if f]
+
+        # ★ 反推项目根
+        try:
+            project_root = _resolve_project_root_from_files(
+                all_files, library_root=self.get_project_library_dir())
+        except ValueError as e:
+            QMessageBox.warning(self, '无法定位项目', str(e))
+            return
+
+        diag_dir = os.path.join(project_root, '数据', '诊断记录')
+        if not os.path.isdir(diag_dir):
+            QMessageBox.information(self, '暂无诊断记录',
+                f'该项目暂无诊断记录。\n\n'
+                f'请在 AI 诊断页运行诊断后，点击「保存诊断到项目」保存到此项目。')
+            return
+
+        # 扫诊断 JSON
+        entries: list[tuple[str, str, int]] = []  # (stem, path, size)
+        try:
+            for f_name in sorted(os.listdir(diag_dir)):
+                if f_name.endswith('.json'):
+                    f_path = os.path.join(diag_dir, f_name)
+                    stem = os.path.splitext(f_name)[0]
+                    sz = os.path.getsize(f_path)
+                    entries.append((stem, f_path, sz))
+        except OSError:
+            pass
+
+        if not entries:
+            QMessageBox.information(self, '暂无诊断记录',
+                f'该项目暂无诊断记录。\n\n'
+                f'请在 AI 诊断页运行诊断后，点击「保存诊断到项目」保存到此项目。')
             return
 
         dlg = QDialog(self)
         dlg.setWindowTitle('从已存诊断加载')
         dlg.setMinimumWidth(600)
         layout = QVBoxLayout(dlg)
-
-        layout.addWidget(QLabel('选择一份已保存的诊断结果:'))
+        layout.addWidget(QLabel(f'项目: {os.path.basename(project_root)}\n选择一份已保存的诊断结果:'))
 
         lst = QListWidget()
-        for d in diags:
-            item_text = f"{d['name']}  ({d['size']//1024}KB)"
-            lst.addItem(item_text)
+        for stem, _path, sz in entries:
+            lst.addItem(f'{stem}  ({sz // 1024}KB)')
         layout.addWidget(lst)
 
         btn_row = QHBoxLayout()
@@ -834,27 +1095,31 @@ class DataProcessorWindow(QMainWindow):
 
         def on_load():
             row = lst.currentRow()
-            if row < 0 or row >= len(diags):
+            if row < 0 or row >= len(entries):
                 return
-            rec = wiki.read_diagnosis(diags[row]['name'])
-            if rec:
-                sv = str(rec.get('schema_version', '1.0'))
-                if sv not in ('1.0', '1.1'):
-                    QMessageBox.warning(self, '版本不兼容',
-                        f"该记录 schema 版本为 {sv}，当前只支持 1.0 / 1.1")
-                    return
-                self.report_workbench_widget.set_diagnosis_record(rec)
-                # 兼容 1.0 / 1.1 两种 schema
-                ai_d = rec.get('ai_diagnosis', {}).get('diagnosis_json') or rec.get('diagnosis_json') or {}
-                sensors = len(ai_d.get('sensor_analysis', []) if isinstance(ai_d, dict) else [])
-                kb_count = len(rec.get('kb_hits', []))
-                ma_present = '有' if rec.get('multi_agent', {}).get('report') else '无'
-                QMessageBox.information(self, '成功',
-                    f"已加载诊断记录 v{sv}\n时间: {rec.get('timestamp')}\n"
-                    f"传感器数: {sensors}\n"
-                    f"KB 规则: {kb_count} 条\n"
-                    f"多智能体报告: {ma_present}")
-                dlg.accept()
+            f_path = entries[row][1]
+            try:
+                with open(f_path, 'r', encoding='utf-8') as fh:
+                    rec = json.load(fh)
+            except Exception as e:
+                QMessageBox.warning(self, '读取失败', f'无法读取诊断文件:\n{e}')
+                return
+
+            sv = str(rec.get('schema_version', '1.0'))
+            if sv not in ('1.0', '1.1', '1.2'):
+                QMessageBox.warning(self, '版本不兼容',
+                    f"该记录 schema 版本为 {sv}，当前只支持 1.0 / 1.1")
+                return
+            from core.report_engine import summarize_diagnosis_record
+            self.report_workbench_widget.set_diagnosis_record(rec)
+            s = summarize_diagnosis_record(rec)
+            QMessageBox.information(self, '成功',
+                f"已加载诊断记录 v{sv}\n时间: {rec.get('timestamp')}\n"
+                f"诊断来源: {s['source_label']}\n"
+                f"传感器数: {s['sensor_count']}\n"
+                f"KB 规则: {s['kb_count']} 条\n"
+                f"多智能体报告: {'有' if s['has_multi_agent'] else '无'}")
+            dlg.accept()
 
         load_btn.clicked.connect(on_load)
         cancel_btn.clicked.connect(dlg.reject)
@@ -867,90 +1132,322 @@ class DataProcessorWindow(QMainWindow):
     # 完整报告生成 — 后台 AI + 渲染
     # ═══════════════════════════════════════════════
 
+    # ═══════════════════════════════════════════════════
+    # 资料纳入情况 — 代码确定性直插 docx 末尾 (不经过 LLM)
+    # ═══════════════════════════════════════════════════
+
+    @staticmethod
+    def _append_inclusion_footer(
+        docx_path: str, report_type: str,
+        warnings: list[str], diagnosis_loaded: bool,
+    ) -> None:
+        """在已生成的 docx 文件末尾追加「资料纳入情况」段。
+
+        此段由代码直写，不走 LLM — 用于去静默验收。
+        失败时不影响已存报告，仅追加进 warnings 列表后被模态对话框展示。
+        """
+        import traceback
+        if report_type != 'word':
+            return  # PPT 暂不处理
+        try:
+            doc = Document(docx_path)
+            doc.add_heading('资料纳入情况', level=1)
+
+            # 诊断数据状态
+            if diagnosis_loaded:
+                doc.add_paragraph('诊断数据: 已加载 — 本报告包含诊断结论。')
+            else:
+                p = doc.add_paragraph(
+                    '诊断数据: 未加载 — 本报告不含诊断结论。'
+                    '如需包含诊断结论，请先在「报告生成工作台」中'
+                    '点击「从已存诊断加载」载入诊断记录，再重新生成报告。'
+                )
+                for run in p.runs:
+                    run.font.color.rgb = RGBColor(0xFF, 0x4D, 0x4F)  # 红色提示
+
+            # 关联资料读入情况
+            if warnings:
+                doc.add_heading('读入警告', level=2)
+                for w in warnings:
+                    p = doc.add_paragraph(f'• {w}')
+                    for run in p.runs:
+                        run.font.color.rgb = RGBColor(0xFF, 0x4D, 0x4F)
+            else:
+                doc.add_paragraph('所有关联资料均已成功读入，无警告。')
+
+            doc.save(docx_path)
+        except Exception:
+            warnings.append(
+                f'资料纳入情况段写入失败 — {traceback.format_exc()[:120]}'
+            )
+            # 不重抛: 主报告已保存完好, 仅丢失此追加段
+
     def _handle_full_report_generation(self, config: dict, outline: str):
         """后台生成结构化报告 + 渲染保存 + 自动打开输出目录."""
         generate_fn = self._get_generate_fn()
-        self.report_workbench_widget.full_report_btn.setEnabled(False)
-        self.report_workbench_widget.outline_btn.setEnabled(False)
+        self.report_workbench_widget.set_generation_running(True)
         self.status_bar.showMessage('正在生成完整报告...')
 
         report_type = config.get('report_type', 'word')
         ext = '.pptx' if report_type == 'ppt' else '.docx'
         type_label = 'PPT演示' if report_type == 'ppt' else 'Word报告'
 
-        # 构建输出路径: output_reports/项目名_报告类型_时间戳.ext
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        # 构建输出路径：项目根/报告 (与数据/方案同级的一级目录)
+        project_files: list[str] = config.get('project_files', [])
+
+        # ★ 强约束: 关联资料为空 → 硬拦 (只看 project_files, 不被 req_file 僵尸值绕过)
+        if not project_files:
+            QMessageBox.warning(self, '缺少项目关联资料',
+                '请先在报告工作台添加项目关联资料，再生成完整报告。')
+            self.report_workbench_widget.set_generation_running(False)
+            self.status_bar.showMessage('报告生成取消: 缺少项目关联资料')
+            return
+
         req_file = config.get('req_file', '')
+        all_files = [f for f in project_files + ([req_file] if req_file else []) if f]
+
+        try:
+            candidate = _resolve_project_root_from_files(
+                all_files, library_root=self.get_project_library_dir())
+        except ValueError as e:
+            QMessageBox.warning(self, '无法生成报告', str(e))
+            self.report_workbench_widget.set_generation_running(False)
+            self.status_bar.showMessage('报告生成取消')
+            return
+
+        report_dir = os.path.join(candidate, '报告')
+
+        os.makedirs(report_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         project_name = os.path.splitext(os.path.basename(req_file))[0] if req_file else '数据分析报告'
         filename = f'{project_name}_{type_label}_{timestamp}{ext}'
-        output_path = os.path.join(REPORT_OUTPUT_DIR, filename)
+        output_path = os.path.join(report_dir, filename)
 
         template_path = config.get('template_file', '')
 
         # 项目根目录（用于拼接图片绝对路径）
         project_dir = os.path.dirname(os.path.abspath(req_file)) if req_file else ''
 
-        # ── Agentic 工具配置（Function Calling） ──
-        from core.tools.chart_tool import (
-            GENERATE_SENSOR_PLOT_TOOL,
-            generate_sensor_plot,
-        )
+        def _build_and_save(worker=None):
+            _report_warnings: list[str] = []
+            diagnosis_loaded: bool = False
+            manifest = None
+            try:
+                # 0. 预检
+                from core.ai_client import AIClient
+                ai = AIClient.get_instance()
+                if not ai.is_available():
+                    raise RuntimeError(
+                        "AI 模型未配置。\n\n"
+                        "请在「报告生成工作台」左侧点击「AI 模型配置」，\n"
+                        "完成在线模型配置并点击「连接」。"
+                    )
+                # 0.5 模板预校验
+                if template_path:
+                    _tmpl_warn = validate_docx_template(template_path)
+                    if _tmpl_warn:
+                        raise RuntimeError(_tmpl_warn)
 
-        state_data = self.state.to_dict()
-        tools_config = {
-            'definitions': [GENERATE_SENSOR_PLOT_TOOL],
-            'executable_map': {
-                'generate_sensor_plot': lambda sid, pt: generate_sensor_plot(
-                    sensor_id=sid,
-                    plot_type=pt,
-                    project_dir=project_dir,
-                    state_data=state_data,
-                ),
-            },
-        }
+                # ═══════════════════════════════════════════════
+                # 1. 图表 — 优先读已存 manifest (母本B: 诊断保存时已产图落盘)
+                # ═══════════════════════════════════════════════
+                from core.chart_store import (
+                    build_chart_store, chart_manifest_to_figure_manifest,
+                    chart_manifest_from_dict,
+                )
+                diag_rec = config.get('_diagnosis_record')
+                chart_data = (diag_rec or {}).get('chart_data', {}) or {}
 
-        def _build_and_save():
-            # 1. AI 生成结构化数据
-            builder_data = generate_structured_report(
-                config, outline, report_type, generate_fn,
-                tools_config=tools_config,
-            )
-            # 2. 调用文件级渲染器直接保存到 output_path
-            if report_type == 'ppt':
-                from py.report_builder.ppt_builder import PPTBuilder
-                from py.report_builder.models import PPTReport
-                report = PPTReport.from_dict(builder_data)
-                builder = PPTBuilder()
-                builder.build_ppt_report(report, template_path, output_path, project_dir=project_dir)
-            else:
-                from py.report_builder.word_builder import WordBuilder
-                from py.report_builder.models import WordReport
-                report = WordReport.from_dict(builder_data)
-                builder = WordBuilder()
-                builder.build_word_report(report, template_path, output_path, project_dir=project_dir)
-            return output_path
+                # record_id 优先取保存时写入的持久化字段 (母本B P1/P2 对齐)
+                record_id = (diag_rec or {}).get('record_id')
+                if not record_id:
+                    # 降级: 旧记录无 record_id → 从 timestamp 推导 (向后兼容)
+                    ts = (diag_rec or {}).get('timestamp',
+                                              datetime.now().strftime('%Y%m%d_%H%M%S'))
+                    record_id = ts.replace(' ', '_').replace(':', '')
+                    print(f"[图表诊断] 旧记录降级推导 record_id={record_id}")
 
-        def _on_report_done(path: str):
-            self.report_workbench_widget.full_report_btn.setEnabled(True)
-            self.report_workbench_widget.outline_btn.setEnabled(True)
+                stored_manifest = (diag_rec or {}).get('chart_manifest')
+                if stored_manifest:
+                    # 读取路径: 图已在诊断保存时落盘到记录目录, 报告直接引用
+                    charts_dir = os.path.join(candidate, '数据', '诊断记录',
+                                              record_id, 'charts')
+                    _chart_manifest = chart_manifest_from_dict(stored_manifest)
+                    print(f"[图表诊断] 从已存 manifest 读取 (非重产), "
+                          f"record_id={record_id}, "
+                          f"produced={sum(1 for e in _chart_manifest if e.produced)}")
+                else:
+                    # 降级: 旧记录无 manifest, 重新产图到记录目录 (向后兼容)
+                    charts_dir = os.path.join(candidate, '数据', '诊断记录',
+                                              record_id, 'charts')
+                    os.makedirs(charts_dir, exist_ok=True)
+                    print(f"[图表诊断] 旧记录降级产图, record_id={record_id}")
+                    _chart_manifest = build_chart_store(
+                        chart_data, charts_dir, _report_warnings)
+
+                manifest = chart_manifest_to_figure_manifest(
+                    _chart_manifest, charts_dir)
+
+                print(f"[图表诊断] manifest 图数: {manifest.count}")
+                pngs = (
+                    [f for f in os.listdir(charts_dir) if f.endswith('.png')]
+                    if os.path.isdir(charts_dir) else []
+                )
+                print(f"[图表诊断] charts/ 落盘 PNG 数: {len(pngs)} "
+                      f"({', '.join(pngs[:8])}{'…' if len(pngs) > 8 else ''})")
+                charts_context = manifest.to_llm_context(max_chars=600)
+
+                # 2. AI 生成结构化数据 (markdown, 无 JSON, 无工具)
+                builder_data = generate_structured_report(
+                    config, outline, report_type, generate_fn,
+                    charts_context=charts_context,
+                    progress_callback=(
+                        lambda d: worker.progress.emit(d) if worker else None
+                    ),
+                    cancel_check=(
+                        lambda: getattr(worker, '_cancelled', False) if worker else False
+                    ),
+                )
+                _report_warnings.extend(builder_data.pop('_report_warnings', []))
+                diagnosis_loaded = builder_data.pop('_diagnosis_loaded', False)
+
+                # 2b. 注入标定/异常表格 (优先 from chart_data, 降级 from_providers)
+                try:
+                    from core.chart_bundle import ChartBundle, extract_four_tables, _rows_to_md_table
+                    cd = (diag_rec or {}).get('chart_data', {}) or {}
+                    if not cd:
+                        bundle = ChartBundle.from_providers(self)
+                        cd = bundle.to_dict()
+                    four_tables = extract_four_tables(cd)
+                    if four_tables:
+                        # 等价重建 markdown — 与 gen_markdown_tables_from_bundle 同输出格式
+                        # 等价性: extract_four_tables 解析原 md 字符串 → _rows_to_md_table 重生成
+                        #         cell 内容不变（strip→rejoin），分隔行格式一致，heading 前缀一致
+                        md_parts: list[str] = []
+                        for tbl in four_tables:
+                            md = _rows_to_md_table([tbl.headers] + tbl.rows)
+                            md_parts.append(f"\n### {tbl.heading}\n\n{md}\n")
+                        tables_md = "\n".join(md_parts)
+                        builder_data.setdefault("sections", []).append({
+                            "heading": "数据汇总附表",
+                            "content_paragraphs": [tables_md],
+                            "image_anchors": [],
+                            "tables": [],
+                        })
+                        print(f"[报告] 已注入数据汇总附表 (表数={len(four_tables)}, "
+                              f"标题={[t.heading for t in four_tables]})")
+                    else:
+                        print("[报告] 数据汇总附表为空 — 跳过")
+                except Exception as e:
+                    import traceback as _tb
+                    _report_warnings.append(
+                        f"数据汇总附表注入阶段异常：{type(e).__name__}: {e}")
+                    print(f"[报告] 数据汇总附表注入阶段异常: {_tb.format_exc()}")
+
+                # 3. 构建 docx
+                if report_type == 'ppt':
+                    from dp_engine.report_builder.ppt_builder import PPTBuilder
+                    from dp_engine.report_builder.models import PPTReport
+                    report = PPTReport.from_dict(builder_data)
+                    builder = PPTBuilder()
+                    builder.build_ppt_report(report, template_path, output_path, project_dir=project_dir)
+                else:
+                    from dp_engine.report_builder.word_builder import WordBuilder
+                    from dp_engine.report_builder.models import WordReport
+                    report = WordReport.from_dict(builder_data)
+                    builder = WordBuilder()
+                    builder.build_word_report(report, template_path, output_path, project_dir=project_dir)
+                    if builder.missing_images:
+                        for img in builder.missing_images:
+                            _report_warnings.append(f"图片缺失: {img}")
+
+                # 4. 图N 引用驱动放置 (构建时后处理: 扫描正文→注入图+图题)
+                if manifest and manifest.count > 0:
+                    if report_type == 'ppt':
+                        _inject_figures_to_pptx(
+                            output_path, manifest, _report_warnings,
+                        )
+                    else:
+                        _inject_figures_by_reference(
+                            output_path, manifest, _report_warnings,
+                        )
+
+                # 5. 「资料纳入情况」段
+                self._append_inclusion_footer(
+                    output_path, report_type, _report_warnings, diagnosis_loaded,
+                )
+
+                return {
+                    'path': output_path,
+                    'warnings': _report_warnings,
+                    'diagnosis_loaded': diagnosis_loaded,
+                }
+            except Exception as e:
+                import traceback as _tb
+                msg = f'{e}'
+                if _report_warnings:
+                    msg += '\n\n已收集的警告/降级信息:'
+                    for w in _report_warnings:
+                        msg += f'\n  - {w}'
+                msg += f'\n{_tb.format_exc()}'
+                raise RuntimeError(msg) from e
+
+        def _on_report_done(result: dict):
+            path: str = result['path']
+            warnings: list[str] = result.get('warnings', [])
+            diagnosis_loaded: bool = result.get('diagnosis_loaded', False)
+
+            self.report_workbench_widget.set_generation_running(False)
             self.status_bar.showMessage(f'报告已保存: {os.path.basename(path)}')
 
-            QMessageBox.information(self, '生成成功', f'报告已保存至:\n{path}')
-            # 自动打开输出目录
+            # 组装模态对话框文案
+            lines = [f'报告已保存至:', path, '']
+            if not diagnosis_loaded:
+                lines.append(
+                    '诊断数据: 未加载 — 本报告不含诊断结论。'
+                    '如需包含诊断结论，请在生成前点击「从已存诊断加载」。'
+                )
+            if warnings:
+                lines.append(f'资料纳入警告 ({len(warnings)} 项):')
+                for w in warnings:
+                    lines.append(f'  • {w}')
+            else:
+                lines.append('所有关联资料均已成功读入。')
+
+            QMessageBox.information(self, '生成成功', '\n'.join(lines))
+            # 自动打开报告所在的真实保存目录
             try:
-                os.startfile(REPORT_OUTPUT_DIR)
+                os.startfile(os.path.dirname(path))
             except Exception:
                 pass
 
         def _on_report_error(msg: str):
-            self.report_workbench_widget.full_report_btn.setEnabled(True)
-            self.report_workbench_widget.outline_btn.setEnabled(True)
+            self.report_workbench_widget.set_generation_running(False)
             self.status_bar.showMessage('报告生成失败')
-            QMessageBox.critical(self, '报告生成失败', msg)
+
+            if "RuntimeError:" in msg:
+                # 安全错误 (含已收集 warnings) — 友好展示, 不甩栈
+                friendly = msg.split("\nTraceback")[0].strip() if "\nTraceback" in msg else msg.strip()
+                QMessageBox.warning(self, '报告生成失败', friendly)
+            else:
+                QMessageBox.critical(self, '报告生成错误', msg)
+
+        def _on_report_progress(progress: dict):
+            stage = progress.get('stage', '')
+            if stage == 'section':
+                cur = progress.get('current', 0)
+                tot = progress.get('total', 0)
+                heading = progress.get('heading', '')
+                msg = f'⏳ 生成中… 第{cur}/{tot}节: {heading}'
+                self.status_bar.showMessage(msg)
 
         self._report_worker = ReportWorker(_build_and_save)
         self._report_worker.finished.connect(_on_report_done)
         self._report_worker.error.connect(_on_report_error)
+        self._report_worker.progress.connect(_on_report_progress)
+        self.report_workbench_widget.cancel_requested.connect(
+            self._report_worker.cancel
+        )
         self._report_worker.start()
 
     def create_ai_diagnosis_page(self):
@@ -1054,7 +1551,7 @@ class DataProcessorWindow(QMainWindow):
             os.makedirs(project_path)
 
             # 创建默认子文件夹 (三级目录: 图片/图纸/数据/方案/总结/视频/其它)
-            default_folders = ['图片', '图纸', '数据', '方案', '总结', '视频', '其它']
+            default_folders = ['图片', '图纸', '数据', '方案', '报告', '视频', '其它']
             for folder in default_folders:
                 os.makedirs(os.path.join(project_path, folder))
 
@@ -1445,8 +1942,9 @@ class DataProcessorWindow(QMainWindow):
                     if not template:
                         template = DataTemplate('custom_txt', '自定义文本', 'txt', '\t', 0, [])
 
-                    df = parse_file(data_path, template)
+                    df, annotation = parse_file(data_path, template)
                     self.current_data = df
+                    self.current_annotation = annotation
                     self.sampled_file_path = data_path
                     self.current_template = template
                     self.file_header_lines = data_tab.get('file_header_lines', [])
@@ -1716,8 +2214,9 @@ class DataProcessorWindow(QMainWindow):
                 # 确保切换到数据文件标签页
                 if hasattr(self, 'central_widget'):
                     self.central_widget.setCurrentIndex(0)
-                df = parse_file(sample_path, selected_template)
+                df, annotation = parse_file(sample_path, selected_template)
                 self.current_data = df
+                self.current_annotation = annotation
                 self.sampled_file_path = sample_path
                 self.current_template = selected_template
                 self._load_file_header_lines(sample_path, selected_template.skip_rows)
@@ -1777,8 +2276,9 @@ class DataProcessorWindow(QMainWindow):
         QSettings('DataProcessor', 'Pro').setValue('open_file_last_dir', os.path.dirname(file_path))
 
         try:
-            df = parse_file(file_path, selected_template)
+            df, annotation = parse_file(file_path, selected_template)
             self.current_data = df
+            self.current_annotation = annotation
             self.sampled_file_path = file_path
             self.current_template = selected_template
             self._load_file_header_lines(file_path, selected_template.skip_rows)
@@ -1831,7 +2331,9 @@ class DataProcessorWindow(QMainWindow):
 
         df = pd.DataFrame(data)
         self.current_data = df
+        self.current_annotation = {}
         self.current_columns = list(data[0].keys())
+        self._insert_annotation_row_if_timestamp_exists()
         self.update_data_table()
         self.status_bar.showMessage(f'已加载 {len(df)} 行测试数据')
         QMessageBox.information(self, '成功', f'已加载 {len(df)} 行测试数据')
@@ -1849,6 +2351,7 @@ class DataProcessorWindow(QMainWindow):
         self.file_header_lines = read_file_header_lines(file_path, skip_rows)
     def clear_data(self):
         self.current_data = None
+        self.current_annotation = {}
         self.current_columns = []
         self.sampled_data = None
         self.file_header_lines = []
@@ -1920,19 +2423,31 @@ class DataProcessorWindow(QMainWindow):
             return
 
         try:
+            # ── ★ 格式头暗号行: 用 current_annotation 最新值重建 ──
+            annot = getattr(self, 'current_annotation', None) or {}
+            header_lines = list(self.file_header_lines) if self.file_header_lines else []
+            annot_in_header = False
+            if header_lines and fmt in ('enlight', 'fiber_custom') and annot:
+                header_lines, annot_in_header = self._rebuild_annotation_in_header_lines(
+                    header_lines, annot,
+                    col_names=[str(c) for c in data_to_save.columns],
+                )
+
+            # ── 暗号行已在格式头 → 数据体剥掉 row 0 (暗号行) ──
+            if annot_in_header and len(data_to_save) > 1:
+                data_to_save = data_to_save.iloc[1:].reset_index(drop=True)
+
             # 确定输出格式
             if file_path.endswith('.xlsx'):
                 data_to_save.to_excel(file_path, index=False)
             else:
                 with open(file_path, 'w', encoding='utf-8') as f:
-                    # 写入格式头（如果有）
-                    if self.file_header_lines:
-                        for line in self.file_header_lines:
+                    if header_lines:
+                        for line in header_lines:
                             f.write(line)
                             if not line.endswith('\n'):
                                 f.write('\n')
-                    # 写入数据（格式头已包含列头，不再重复写入header）
-                    write_header = len(self.file_header_lines) == 0
+                    write_header = len(header_lines) == 0
                     data_to_save.to_csv(f, sep=delim, index=False, header=write_header)
 
             self.sampled_data = None
@@ -1940,6 +2455,69 @@ class DataProcessorWindow(QMainWindow):
             QMessageBox.information(self, '成功', f'数据已保存到:\n{file_path}')
         except Exception as e:
             QMessageBox.critical(self, '错误', f'保存失败: {str(e)}')
+
+    def _rebuild_annotation_in_header_lines(
+        self, header_lines: list[str], annotation: dict[str, str],
+        col_names: list[str],
+    ) -> tuple[list[str], bool]:
+        """在 file_header_lines 中定位暗号行并替换为 current_annotation 最新值。
+
+        未找到暗号行 → 在表头行后插入一条新暗号行。
+        保持原文件的引号格式 ('w1-A1-1') 和列顺序。
+
+        Returns:
+            (updated_lines, annot_in_header): 更新后的行列表 + 是否成功重建
+        """
+        from utils.file_parser import _looks_like_annotation_row
+
+        result = list(header_lines)
+        header_idx: int | None = None
+        ann_idx: int | None = None
+
+        # ── 定位表头行 + 暗号行 ──
+        for i, line in enumerate(result):
+            stripped = line.rstrip('\n').rstrip('\r')
+            cells = stripped.split('\t')
+            if not cells or not cells[0].strip():
+                continue
+            # 表头行: 以 Timestamp 开头，含多个列名
+            if header_idx is None and cells[0].strip() == 'Timestamp' and len(cells) >= 2:
+                header_idx = i
+                continue
+            # 暗号行: 在表头行之后查找
+            if header_idx is not None and _looks_like_annotation_row(cells):
+                ann_idx = i
+                break
+
+        # ── 构建新暗号行 (逐列，与 header col_names 对齐) ──
+        ann_parts: list[str] = []
+        for col_name in col_names:
+            col_str = str(col_name)
+            val = annotation.get(col_str, '')
+            if val:
+                ann_parts.append(f"'{val}'")
+            elif col_str == 'Timestamp':
+                ann_parts.append("'时间戳'")
+            elif col_str.endswith('_anomaly'):
+                ann_parts.append('False')
+            else:
+                ann_parts.append('')
+        ann_line = '\t'.join(ann_parts) + '\n'
+
+        # ── 替换或插入 ──
+        if ann_idx is not None:
+            result[ann_idx] = ann_line
+        elif header_idx is not None:
+            # 在表头行后插入 (跳过表头后的空行)
+            insert_at = header_idx + 1
+            while insert_at < len(result) and not result[insert_at].strip():
+                insert_at += 1
+            result.insert(insert_at, ann_line)
+        else:
+            # 无表头行 (异常) → 追加到末尾
+            result.append(ann_line)
+
+        return result, True
 
     def save_template_to_file(self):
         """将当前文件的解析参数保存为可复用模板"""
@@ -2138,8 +2716,11 @@ class DataProcessorWindow(QMainWindow):
         if self.current_data is None:
             self.data_tab_widget.update_data_table(None)
             return
-        # 数据表格始终显示完整数据（含暗号行）
-        self.data_tab_widget.update_data_table(self.current_data, self.MAX_DISPLAY_ROWS)
+        # ★ 永远有暗号行 → 始终样式化 row 0；行计数 = 数据行数（不含暗号行）
+        annot = getattr(self, 'current_annotation', None) or True
+        self.data_tab_widget.update_data_table(
+            self.current_data, self.MAX_DISPLAY_ROWS, annotation=annot,
+        )
         # 分析模块接收清洗后的数据（跳过暗号行 + 重命名列）并填充列选择列表
         if hasattr(self, 'analysis_tab_widget'):
             analysis_df, _, annotated_cols = self._get_analysis_data()
@@ -2156,19 +2737,16 @@ class DataProcessorWindow(QMainWindow):
     # ══════════════════════════════════════════════════════════
 
     def _insert_annotation_row_if_timestamp_exists(self):
-        """数据加载后在首行插入暗号备注行，供用户填写/确认暗号。
+        """数据加载后在 row 0 插入暗号备注行，供用户查看/确认暗号。
 
-        规则：
-          - 已有暗号行（含'时间戳'）→ 不插入
-          - 新暗号行按列类型填充：
-            · Timestamp → '时间戳'
-            · 波长列 → 'wN-类型-位置'
-            · 其它列 → 留空
+        规则:
+          - ★ 永远在 row 0 插入暗号行
+          - ★ df 中段残留暗号行 → drop 后再统一 insert_blank_row
+          - ★ 逐列：真暗号优先 → 占位符回退
           - 暗号行逐列对齐 df.columns，杜绝错位
         """
         try:
             from utils.annotation_utils import (
-                is_wave_col,
                 build_annotation_row,
                 insert_blank_row,
                 apply_annotation_row,
@@ -2176,62 +2754,81 @@ class DataProcessorWindow(QMainWindow):
 
             if self.current_data is None or self.current_data.empty:
                 return
-            df = self.current_data
-
-            # ── 1. 检测是否已有暗号行 ──
-            existing_signal_row = None
-            for idx in range(min(100, len(df))):
-                for val in df.iloc[idx]:
-                    s = str(val).strip().strip("'\"'\"'\"")
-                    if '时间戳' in s:
-                        existing_signal_row = idx
-                        break
-                if existing_signal_row is not None:
-                    break
-
+            df_before = self.current_data
+            real_annot = getattr(self, 'current_annotation', None) or {}
             template = getattr(self, 'current_template', None)
             file_fmt = getattr(template, 'file_format', '') if template else ''
 
-            # ── 2. 无暗号行 → 插入空白行 ──
-            if existing_signal_row is None:
-                new_df, dtypes = insert_blank_row(df)
-                self._annotation_orig_dtypes = dtypes
-                self.current_data = new_df
-                annotation_row = 0
-            else:
-                annotation_row = existing_signal_row
+            # ── ★ 占位符：永远生成，用作 fallback ──
+            placeholder_ann = build_annotation_row(df_before, file_format=file_fmt)
 
-            # ── 3. 暗号行填充 — 委托给 annotation_utils ──
+            # ── 1. 检测并 drop 中段残留暗号行 ──
+            df = df_before
+            annot_values = set(real_annot.values())
+            # scan rows 1..99 (skip row 0 which may already be a valid annotation row)
+            for idx in range(1, min(100, len(df))):
+                row_vals = [str(v).strip().strip("'\"''\"") for v in df.iloc[idx]]
+                has_timestamp_mark = any('时间戳' in v for v in row_vals)
+                has_annot_vals = sum(1 for v in row_vals if v in annot_values) >= 2
+                if has_timestamp_mark or has_annot_vals:
+                    df = df.drop(df.index[idx]).reset_index(drop=True)
+                    break  # only one residual expected
+            if df is not df_before:
+                self.current_data = df
+
+            # ── 2. ★ 统一：永远 insert_blank_row 在 row 0 ──
+            new_df, dtypes = insert_blank_row(df)
+            self._annotation_orig_dtypes = dtypes
+            self.current_data = new_df
+            annotation_row = 0
+
+            # ── 3. 暗号行填充: 真暗号优先 → 占位符回退（逐列合并）──
             data_row = annotation_row + 1
             if data_row >= len(self.current_data):
                 return
 
-            ann = build_annotation_row(
-                self.current_data.iloc[data_row:], file_format=file_fmt,
-            )
+            ann: list[str] = []
+            for i, col_name in enumerate(df.columns):
+                col_str = str(col_name)
+                real_val = real_annot.get(col_str, "")
+                if real_val:
+                    ann.append(real_val)
+                else:
+                    fallback = placeholder_ann[i] if i < len(placeholder_ann) else ""
+                    ann.append(fallback)
             apply_annotation_row(
                 self.current_data, ann, annotation_row, self._annotation_orig_dtypes,
             )
-        except Exception as e:
-            print(f'[暗号行插入失败] {e}')
+        except Exception:
+            traceback.print_exc()
 
     # ══════════════════════════════════════════════════════════
     # 表格编辑双向同步（用户编辑 UI → 写回 self.current_data）
     # ══════════════════════════════════════════════════════════
 
     def _on_data_table_cell_edited(self, row: int, col: int, text: str):
-        """用户在数据表格编辑单元格后，将新值写回底层 DataFrame。"""
+        """用户在数据表格编辑单元格后，将新值写回底层 DataFrame。
+
+        写回同时同步更新 current_annotation dict (暗号 SSOT)，
+        确保编辑 → 保存 → 重载 全程暗号一致。
+        """
         if self.current_data is None or not (0 <= row < len(self.current_data)):
             return
+        col_name = str(self.current_data.columns[col])
         try:
             self.current_data.iat[row, col] = text
         except (ValueError, TypeError):
-            # 字符串写入 numeric 列 → 将该列转为 object 再写入
-            col_name = self.current_data.columns[col]
             self.current_data[col_name] = self.current_data[col_name].astype(object)
             self.current_data.iat[row, col] = text
         except Exception as e:
+            traceback.print_exc()
             print(f'[表格回写失败] row={row}, col={col}: {e}')
+            return
+        # 同步 current_annotation (暗号 SSOT): row 0 编辑 → 更新 dict
+        if row == 0:
+            annot = getattr(self, 'current_annotation', None) or {}
+            if annot.get(col_name, ''):
+                annot[col_name] = text
 
     # ══════════════════════════════════════════════════════════
     # 被动暗号标注识别（通用工具方法）

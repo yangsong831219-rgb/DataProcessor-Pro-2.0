@@ -320,14 +320,24 @@ class AnalysisTabWidget(QWidget):
         然后剥离 w{N}- 前缀得到纯净显示名（应变-梁底）。
         """
         ann = self._get_annotation_name(key)
-        return _re.sub(r'^[wW]\d+-', '', ann if ann != key else str(key))
+        return _re.sub(r'^[wW]\d+-+', '', ann if ann != key else str(key))
 
     def _get_annotation_name(self, sensor_id: str) -> str:
-        """从数据列中查找传感器 ID 对应的暗号备注名（如 w1-应变-梁底）。
+        """从主窗口 current_annotation 或 sensor_system 查找完整暗号名。
 
-        遍历传感器公式中的 W{n} 引用，在 DataFrame 列中匹配 W_PATTERN。
-        回退：当找不到匹配时返回 sensor_id 本身。
+        优先：main_win.current_annotation.get(sensor_id) — 文件解析出的真暗号 (w1-A1-1)
+        退而：遍历传感器公式中的 W{n} 引用匹配 DataFrame 列名
+        回退：sensor_id 本身
         """
+        # ★ 优先：直接从 current_annotation 取 (文件解析出的真暗号 w1-A1-1)
+        main_win = self.window()
+        if main_win:
+            annot = getattr(main_win, 'current_annotation', None) or {}
+            val = annot.get(str(sensor_id), '')
+            if val and val != str(sensor_id):
+                return val
+
+        # 退而：从 sensor_system 公式中查 W 引用
         if self._current_data is None:
             return sensor_id
         ss = self._sensor_system
@@ -457,7 +467,20 @@ class AnalysisTabWidget(QWidget):
                 plot_time = time_range
 
             color = colors[i % len(colors)]
-            legend_label = _re.sub(r'^[wW]\d+-', '', col)
+            # ★ 图例名: 从暗号/annotation 解析 → 剥 wN- 前缀
+            _full_name = self._get_annotation_name(col)
+            legend_label = _re.sub(r'^[wW]\d+-+', '', _full_name) if _full_name and _full_name != str(col) else _re.sub(r'^[wW]\d+-+', '', col)
+            # 兜底: 若剥完仍是空或同 wN → 保留 col
+            if not legend_label or legend_label == col:
+                legend_label = col
+            # ★ DIAG: 图例 label 来源追踪
+            _main = self.window()
+            _annot_dict = getattr(_main, 'current_annotation', {}) if _main else {}
+            if i < 3:  # print first 3 curves only
+                print(f"[DIAG] chart legend col[{i}]: col={col!r}, "
+                      f"_get_annotation_name→{_full_name!r}, legend_label={legend_label!r}, "
+                      f"_annotated_cols={self._annotated_cols!r}, "
+                      f"current_annotation[col]={_annot_dict.get(col, 'NOT_FOUND')!r}")
             x_indices = range(len(plot_time))
             self.ax.plot(x_indices, plot_data_sampled, color, linewidth=1,
                          label=legend_label)
@@ -520,7 +543,16 @@ class AnalysisTabWidget(QWidget):
             color = colors[i % len(colors)]
             # 图例：通过公式中的 W 引用查找真实暗号备注名，剥离 w{N}- 前缀
             annotation_name = self._get_annotation_name(sensor_id)
-            legend_label = _re.sub(r'^[wW]\d+-', '', annotation_name)
+            legend_label = _re.sub(r'^[wW]\d+-+', '', annotation_name) if annotation_name else str(sensor_id)
+            if not legend_label or legend_label == sensor_id:
+                legend_label = str(sensor_id)  # 兜底
+            # ★ DIAG: 传感器图例 label 来源
+            _main = self.window()
+            _annot_dict = getattr(_main, 'current_annotation', {}) if _main else {}
+            if i < 3:
+                print(f"[DIAG] sensor legend col[{i}]: sensor_id={sensor_id!r}, "
+                      f"_get_annotation_name→{annotation_name!r}, legend_label={legend_label!r}, "
+                      f"current_annotation[sensor_id]={_annot_dict.get(sensor_id, 'NOT_FOUND')!r}")
             x_indices = range(len(plot_time))
             self.ax.plot(x_indices, plot_data, color, linewidth=1, label=legend_label)
 
@@ -673,10 +705,11 @@ class AnalysisTabWidget(QWidget):
                 # 任务 1：剥离单位后缀，匹配原生列名
                 selected = [self._strip_unit_suffix(s) for s in selected]
                 if not selected:
+                    from utils.column_utils import is_plottable_data_column
                     selected = [c for c in self._current_data.columns
-                                if c != '时间' and '计数' not in str(c)
-                                and not str(c).startswith('CH')
-                                and pd.api.types.is_numeric_dtype(self._current_data[c])]
+                                if is_plottable_data_column(str(c), self._current_data[c])
+                                and '计数' not in str(c)
+                                and not str(c).startswith('CH')]
                 if not selected:
                     return None, '', [], False
                 tc = '时间' if '时间' in self._current_data.columns else ''
@@ -807,21 +840,28 @@ class AnalysisTabWidget(QWidget):
         【光纤 + 原始数据】：直接使用 _annotated_cols 暗号名列表（已重命名到 DataFrame），
         绕过 dtype 检测和成员匹配的脆弱链条。
         无暗号时退化为显示所有数值列。
+        ★ 统一排除 _anomaly/标记/非数值列。
         """
+        from utils.column_utils import is_plottable_data_column
+
         self.analysis_sensor_list.clear()
         if self._current_data is None:
             self.analysis_sensor_list.setEnabled(False)
             return
 
+        df = self._current_data
         if self._annotated_cols:
-            # 暗号标注列 — 确保名称在 DataFrame 中真实存在，不存在的列跳过
-            data_cols = [name for name in self._annotated_cols
-                         if name and '时间戳' not in name
-                         and name in self._current_data.columns]
+            # 暗号标注列 — 确保名称在 DataFrame 中真实存在且是可画数据列
+            data_cols = [
+                name for name in self._annotated_cols
+                if name and name in df.columns
+                and is_plottable_data_column(name, df[name])
+            ]
         else:
-            data_cols = [c for c in self._current_data.columns
-                         if c != '时间'
-                         and pd.api.types.is_numeric_dtype(self._current_data[c])]
+            data_cols = [
+                c for c in df.columns
+                if is_plottable_data_column(str(c), df[c])
+            ]
         if not data_cols:
             self.analysis_sensor_list.setEnabled(False)
             return
@@ -962,15 +1002,34 @@ class AnalysisTabWidget(QWidget):
             QMessageBox.warning(self, '警告', '未找到对应数据列，请刷新选择')
             return
 
+        # ★ 数据列守卫：排除 _anomaly/标记/非数值列
+        from utils.column_utils import is_plottable_data_column
+        for ck, display in [(c1_key, curve1), (c2_key, curve2)]:
+            ck_str = str(ck)
+            if ck_str not in self._current_plot_df.columns:
+                QMessageBox.warning(self, '警告', f"列 '{display}' 在当前数据中不存在")
+                return
+            if not is_plottable_data_column(ck_str, self._current_plot_df[ck_str]):
+                QMessageBox.warning(
+                    self, '无效数据列',
+                    f"'{display}' 不是有效的数值数据列 (可能是标记/异常列)，请选择其它曲线。",
+                )
+                return
+
         # 强制同步"应用范围"切片（与图表保持绝对一致）
         start_idx = self.range_start.value()
         end_idx = self.range_end.value()
         plot_df = self._current_plot_df.iloc[start_idx:end_idx].copy()
 
         # 提取子集并执行联合防错位清洗
-        subset = plot_df[[c1_key, c2_key]].copy()
-        subset[c1_key] = pd.to_numeric(subset[c1_key], errors='coerce')
-        subset[c2_key] = pd.to_numeric(subset[c2_key], errors='coerce')
+        try:
+            subset = plot_df[[c1_key, c2_key]].copy()
+            subset[c1_key] = pd.to_numeric(subset[c1_key], errors='coerce')
+            subset[c2_key] = pd.to_numeric(subset[c2_key], errors='coerce')
+        except (TypeError, ValueError, KeyError) as e:
+            QMessageBox.warning(self, '数据类型错误',
+                f"所选列无法转为数值进行对比，请检查列的数据类型。\n详情: {e}")
+            return
 
         # 联合 Drop：确保留下的每一行两条曲线同时有值
         subset = subset.dropna(how='any')

@@ -18,7 +18,7 @@ import shutil
 
 import pytest
 
-from py.calibration.project_config import (
+from dp_engine.calibration.project_config import (
     ProjectConfig, StrainSubConfig,
     TEMPERATURE_FIELDS, STRAIN_SUB_CONFIG_FIELDS, PROJECT_FIELDS,
     PROFILES_DIR,

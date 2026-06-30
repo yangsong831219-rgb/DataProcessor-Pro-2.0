@@ -13,7 +13,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from py.calibration.temperature_calibration import compute_dL, decouple
+from dp_engine.calibration.temperature_calibration import compute_dL, decouple
 from utils.compensation_metrics import detect_cycles_from_T, GradeThresholds
 from ui.calibration_tab import _run_compensation_pipeline_static
 

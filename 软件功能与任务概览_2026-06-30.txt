@@ -1,0 +1,335 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║          DataProcessor Pro 2.0 — 软件功能与任务概览 (2026-06-30)             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+一、项目基本信息
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  平台：Windows 11 + Python 3.11 + PyQt6
+  分支：llama-cpp (当前)
+  仓库状态：有大量未提交改动 (refactor + feature), 目录从 py/ 改名 dp_engine/
+  最近提交 (79b9b10)：迁移到 llama.cpp 后端 + 诊断知识库 + 数据 provider
+
+  核心能力：
+    - 光纤光栅 (FBG) 传感数据加载、解析、波长转换、物理量计算
+    - 温度/应变标定流程 (Phase A/B)
+    - AI 辅助诊断报告生成 (Word/PPT)
+    - LangGraph 多智能体审查系统
+    - 统一图表产线 (ChartBundle → ChartStore → report_charts)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+二、代码架构 (按目录)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  main.py (~2294行)
+    ├── 主窗口骨架 + 标签页装配 + 信号连线
+    ├── 16 个委托壳调用 utils/ 中的纯函数实现
+    └── DataProcessorWindow(QMainWindow)
+
+  core/  —— AI 客户端 & 报告引擎 & 图表三层架构 & 数据模型
+    ├── models.py          — Sensor/FBG/SensorSystem/DecouplingConfig 数据模型
+    ├── ai_client.py       — AIClient 单例 (llama.cpp/OpenAI 兼容接口)
+    ├── ai_errors.py       — 类型化异常层级 (AIClientAuthError/ServerError/…)
+    ├── report_engine.py   — 报告大纲生成 + 结构化报告 (Pydantic 校验)
+    ├── report_models.py   — Pydantic WordReport/PPTReport 数据契约
+    ├── report_charts.py   — matplotlib 图表绘制函数 (make_timeseries/make_calibration_linearity/…)
+    ├── chart_bundle.py    — ChartBundle 统一画图数据束 (from_providers → to_dict)
+    ├── chart_registry.py  — ChartProducer 注册表 (5 producer + 延迟 draw_fn 绑定)
+    ├── chart_store.py     — build_chart_store (遍历注册表产 PNG → chart_manifest)
+    ├── data_providers.py  — 数据 provider (AnalysisProvider/CalibrationProvider)
+    ├── diagnosis_kb.py    — 诊断知识库
+    └── tools/
+        ├── calibration_chart_tool.py  — 标定图表渲染工具
+        └── chart_tool.py
+
+  dp_engine/  —— 后端引擎 (原 py/, 已改名避免与 PyPI py 包冲突)
+    ├── formula.py         — asteval 安全公式求值引擎
+    ├── analyzer.py        — 信号处理/FFT 分析
+    ├── processor.py       — 数据处理器
+    ├── multi_agent.py     — LangGraph 多智能体审查系统 (Auditor 产出 AuditVerdict)
+    ├── agent_worker.py    — DeepSeekAgentWorker (后台线程)
+    ├── agent_graph.py     — 智能体图定义
+    ├── template.py        — 模板系统
+    ├── web_clipper.py     — 网页裁剪
+    ├── wiki_system.py     — Wiki 系统
+    ├── calibration/
+    │   ├── temperature_calibration.py  — 温度标定 (KMeans + 灵敏度回归 + 解耦)
+    │   ├── strain_calibration.py       — 应变标定 (手填表 + 灵敏度/线性度/迟滞)
+    │   ├── project_config.py           — 项目配置持久化
+    │   ├── export_utils.py             — Excel 导出
+    │   ├── profile.py                  — 标定 Profile 定义
+    │   └── step_extractor.py           — 标定台阶提取
+    └── report_builder/
+        ├── word_builder.py    — Word 报告生成 (python-docx)
+        ├── ppt_builder.py     — PPT 报告生成 (python-pptx)
+        ├── flow_controller.py — 报告流程控制
+        ├── template_engine.py — 模板引擎
+        └── models.py          — 报告模型
+
+  ui/  —— Qt 界面层
+    ├── main.py (嵌入在顶层)
+    ├── analysis_tab.py      — 数据分析标签页 (波长差/物理量时程图表)
+    ├── calibration_tab.py   — 标定标签页 (温度 + 应变子页)
+    ├── cleaning_tab.py      — 数据清洗标签页
+    ├── compare_tab.py       — 多源对比标签页
+    ├── data_tab.py          — 数据加载标签页
+    ├── sensor_tab.py        — 传感器编辑标签页
+    ├── project_tab.py       — 项目管理标签页
+    ├── report_workbench.py  — 报告工作台
+    ├── ai_diagnosis.py      — AI 诊断对话框 (图表产线 + 报告生成总控)
+    ├── report_worker.py     — 后台 ReportWorker(QThread)
+    ├── clipper_tab.py       — 网页裁剪标签页
+    ├── skill_tab.py         — Agent 技能标签页
+    ├── wiki_tab.py          — Wiki 标签页
+    ├── components.py        — 通用 UI 组件
+    ├── fbg_edit_dialog.py   — FBG 编辑对话框
+    ├── sensor_edit_dialog.py — 传感器编辑对话框
+    ├── ai_model_config_dialog.py — AI 模型配置对话框
+    ├── global_parameter_dialog.py — 全局参数编辑对话框
+    └── widgets/
+        ├── chart_panel.py   — matplotlib FigureCanvas 包装
+        └── charts_dialog.py — 独立图表对话框 (PhaseA/B 共用)
+
+  utils/  —— 纯函数层 (零 Qt 依赖, Phase 1 重构产物)
+    ├── file_parser.py       — ENLIGHT/Hyperion 文件解析 + 模板检测
+    ├── parse_validation.py  — 解析后硬门禁校验
+    ├── annotation_utils.py  — 暗号行构建/扫描/列角色解析
+    ├── column_utils.py      — 列名清洗/行分类/FBG 列检测
+    ├── dataframe_utils.py   — DataFrame 行定位
+    ├── data_cleaning.py     — 数据清洗
+    ├── apparent_strain_comp.py    — 表观应变补偿 (LUT + polynomial)
+    └── compensation_metrics.py    — 补偿指标/评级/循环检测
+
+  state/
+    └── app_state.py         — AppState 全局应用状态 (SSOT)
+
+  tests/  —— 92 个测试文件
+    ├── 图表三层架构: test_chart_bundle_from_providers.py / test_chart_registry_store.py / test_chart_bundle_tables.py
+    ├── 标定: test_calibration_math.py / test_calibration_profile.py / test_calibration_tab_ui.py
+    ├── 补偿: test_apparent_strain_comp.py / test_compensation_metrics.py / test_phase_b_compensation_integration.py
+    ├── Phase A/B: test_phase_a_dialog.py / test_phase_a_worker.py / test_phase_b_dialog.py / test_phase_b_guard_regression.py
+    ├── 公式引擎: test_formula_engine.py
+    ├── 解析: test_enlight_parser.py / test_parse_validation.py / test_parse_enlight_sensors.py
+    ├── AI: test_ai_client.py / test_ai_client_backend.py / test_multi_agent_auditor.py
+    ├── 报告: test_report_charts.py / test_word_builder.py / test_ppt_builder_guard.py
+    ├── 项目: test_project_config.py / test_project_save_load.py / test_project_library.py
+    ├── 应变: test_strain_list_commit.py / test_strain_readings.py / test_strain_sensor_list.py
+    └── 其他: 共 92 文件
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+三、已完成的核心功能
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. 数据加载与解析
+     ✅ ENLIGHT Peaks 格式 (矩形格式)
+     ✅ ENLIGHT Sensors 格式 (暗号行解析)
+     ✅ Hyperion Peaks 格式
+     ✅ 通用 TXT/CSV/XLSX (lenient 模式)
+     ✅ 自定义模板持久化
+     ✅ 解析后校验层 (硬门禁, 波长区间 1400-1700nm)
+
+  2. FBG & 传感器系统
+     ✅ FBG 列表管理 + 波长校验
+     ✅ Sensor 公式求值 (asteval 安全引擎)
+     ✅ 双参量解耦矩阵 (2×2 应变-温度)
+     ✅ 全局参数注入
+     ✅ Δλ 计算 (λ − λ₀)
+
+  3. 温度标定 (Phase A)
+     ✅ KMeans 聚类 + 平台检测
+     ✅ 灵敏度回归 (S_eff)
+     ✅ 解耦诊断 (2×2 矩阵求逆)
+     ✅ 诊断四联图
+     ✅ Word 报告导出
+
+  4. 应变标定 (Phase B)
+     ✅ 对话框化手填表 (读数录入)
+     ✅ 灵敏度/线性度/重复性/迟滞指标
+     ✅ 双栅分析 (双工作/锚固模式)
+     ✅ 标定图表 (Δλ-ε 曲线 + 指标柱状图)
+     ✅ Excel 导出
+
+  5. 表观应变补偿 (Phase B 补偿流水线)
+     ✅ LUT + polynomial 双模型
+     ✅ LOOCV 残差评估
+     ✅ %FS 阈值评级 (优≤1% / 良≤2% / 合格≤4%)
+     ✅ FAIL 传感器拦截 (迟滞>5%FS / 单栅 N/A)
+     ✅ 补偿形式选型对话框 (PHASE B 3c)
+     ✅ 降采样加速 (向量化 median, 实测 25× 提升)
+
+  6. AI 诊断 & 报告生成 (Phase 3)
+     ✅ AIClient 类型化异常 (不再静默返回 "")
+     ✅ Pydantic schema 校验 (所有 LLM 输出)
+     ✅ Auditor 结构化 AuditVerdict (verdict/reasons/required_fixes)
+     ✅ ReportWorker 后台线程 + 错误链可达
+     ✅ Word 报告生成 (python-docx, 含表格渲染)
+     ✅ PPT 报告生成 (python-pptx, 图表注入)
+     ✅ 诊断知识库 (diagnosis_kb.py)
+     ✅ 图表注入报告 (chart_store → report_charts → ppt/word)
+
+  7. 图表三层架构 (阶段 0-A/B/C + 母本阶段 1-a)
+     ✅ 阶段 0-A: ChartBundle 统一数据束 + ChartProducer 注册表 + build_chart_store 产图器
+     ✅ 阶段 0-B: chart_manifest 清单 + get_chart 消费者 + chart_manifest_to_figure_manifest
+     ✅ 阶段 0-C: 测试套件 (38 测试, chart_registry + chart_store + from_providers)
+     ✅ 标定6图修复 (第一段+第二段全部完成):
+        - 数据层: calib_sensors: list[dict] 装6传感器, from_providers 去 break
+        - 产图层: strain_calib_lin → 列表类, per-sensor 文件名, 6张独立标定图
+     ✅ 阶段 1-a (当前刚完成): 物理量序列 T2 接入
+        - ChartBundle 新增 phys_series + series_delta
+        - from_providers 读 sensor_results → 降采样进 chart_data
+        - Δλ 自动计算 (W列 − λ₀)
+        - 所有序列共用同一降采样 step, 点数对齐
+
+  8. 代码质量
+     ✅ main.py Phase 1 重构 (16 纯函数 → utils/)
+     ✅ main.py Phase 3 重构 (4 QDialog/QThread → ui/ 独立文件)
+     ✅ py/ → dp_engine/ 目录改名 (根治 pytest 收集冲突)
+     ✅ 43 测试全部通过 (零回归)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+四、当前任务流水线
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  【已完成 — SEAL】
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ 标定6图修复 (第一段 + 第二段)                                            │
+  │   根因: calib_lin 只产 A1 1张图 (甲+乙叠加: 数据装配取首即break +       │
+  │         单图类未循环)                                                    │
+  │   修复: ChartBundle.calib_sensors (6传感器压入) + strain_calib_lin       │
+  │         改为列表类 (per-sensor 独立图, 对齐 hyst)                         │
+  │   验证: 38 测试全通过, 真机待验                                           │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  【刚完成 — 待真机验证】
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ 阶段 1-a: 物理量序列 T2 数据源接入                                       │
+  │   新增字段: ChartBundle.phys_series (应变/温度/自定义公式 降采样序列)     │
+  │            ChartBundle.series_delta (波长差 Δλ 降采样序列)               │
+  │   from_providers: 读 main_win.sensor_results + 自算 Δλ                  │
+  │   降采样: 复用同一 step (max(1, n//200)), 所有序列点数对齐                │
+  │   验证: 43 测试全通过, 真机待验                                           │
+  │   JSON: ~33KB (降采样后 200点, 非 98450全量)                              │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  【下一阶段 — 等 1-a 真机验通后启动】
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ 阶段 1-b: 注册 4 个物理量时程图 producer                                  │
+  │   新增 producer:                                                         │
+  │     data_ts_dlambda    (波长差时程, 多W列叠加, 复用 make_timeseries)      │
+  │     data_ts_strain     (应变时程, 多传感器叠加, 复用 make_timeseries)     │
+  │     data_ts_temperature(温度时程, 多传感器叠加, 复用 make_timeseries)     │
+  │     data_ts_formula    (自定义公式时程, 剩余 key 叠加)                     │
+  │   全部单图类 (不在 _LIST_PRODUCER_IDS), 直接复用 make_timeseries          │
+  │   零新绘制函数, ~60行代码                                                 │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  【后续 — 等 1-b 完成后】
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ 阶段 1-c: 测试 + 集成验证                                                │
+  │   新增测试覆盖 4 producer + key_stat + skip 行为                         │
+  │   真机验证 5 类物理量时程图从无到有                                       │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  母本阶段1 完成后 — 报告里物理量时程图从"只有原始波长前5列"变为完整的:
+    原始波长 + 波长差(Δλ) + 应变 + 温度 + 自定义公式 = 共5类时程图
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+五、图表产线全景 (当前 5 producer + 待添加 4 producer)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  现有 (5 图):
+  ┌──────────────────────┬──────────┬──────────────────────────────────────┐
+  │ chart_id             │ 类型     │ 数据来源                             │
+  ├──────────────────────┼──────────┼──────────────────────────────────────┤
+  │ data_ts_cleaning     │ 单图     │ series (原始波长前5列)                │
+  │ strain_calib_lin_*   │ 列表类   │ calib_sensors[6] (每传感器一张)       │
+  │ phaseb_hyst_*        │ 列表类   │ hyst_sensors (每传感器一张)          │
+  │ compare_ol           │ 单图     │ compare_time_h + compare_sources     │
+  │ compare_corr_scatter_*│ 列表类  │ compare_pairs[:3] (每对一张)         │
+  └──────────────────────┴──────────┴──────────────────────────────────────┘
+
+  待添加 (4 图) — 阶段 1-b:
+  ┌──────────────────────┬──────────┬──────────────────────────────────────┐
+  │ data_ts_dlambda      │ 单图     │ series_delta (W列 Δλ)               │
+  │ data_ts_strain       │ 单图     │ phys_series (含"应变" key)           │
+  │ data_ts_temperature  │ 单图     │ phys_series (含"温度" key)           │
+  │ data_ts_formula      │ 单图     │ phys_series (其余 key)               │
+  └──────────────────────┴──────────┴──────────────────────────────────────┘
+
+  产图流程: from_providers → ChartBundle → to_dict → build_chart_store → PNG
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+六、数据表 (Batch A — 4 张, 已集成)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. 传感器分级汇总 (grade_table_md)
+  2. 温度标定 — 解耦诊断标量 (decoupling_table_md)
+  3. 应变标定 — Ke 系数汇总 (ke_table_md)
+  4. 异常统计 (anomaly_table_md)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+七、已知待办 (不阻塞)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  代码级:
+  - main.py Phase 2 (Mixin 拆解) 缓做
+  - test_run.py 需 GUI 环境, 无头 CI 崩溃
+  - flow_controller.py 死代码 (无外部调用者)
+  - AIClientConnectionError 未从 TimeoutError 拆分
+  - PPT 模板缺失 guard (ppt_builder.py:274)
+  - 应变标定 6 处调试 print 待清理
+
+  功能级 (依赖真机验证):
+  - 标定6图 + 物理量序列4图 → 真机逐张验收
+  - 旧记录 (无 calib_sensors) 兼容性
+  - AI 诊断全链路 (ChartBundle → to_dict → from_diagnosis_record → build_chart_store)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+八、关键工程纪律 (CLAUDE.md 硬约束摘录)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. Pandas 2.0+ 严格类型安全 — 禁止切片就地赋值插入 object 到 float64
+  2. PyQt6 跨标签页访问用 self.window() 而非 self.parent()
+  3. UI/后端数据对齐 — "卸妆"正则剥离括号单位
+  4. 光纤/通用数据物理隔离 — 强制 IF-ELSE 分支
+  5. 修改前必查 CodeGraph callers
+  6. Pyright 零红线提交 (提交前 clean)
+  7. 类型 ignore 必须用 pyright: ignore[具体rule] + 原因注释, 禁止裸 type: ignore
+  8. LLM 输出必须经 Schema 校验 — 禁止 json.loads 静默降级
+  9. 配置取值缺键 + None 双守卫 — d.get(key) or default 而非 d.get(key, default)
+  10. 阶段B 重算只在 PhaseBWorker 子线程 (绝对铁律)
+  11. 枚举/分类字段原样透传 — 不得改写 (grade/comp_form 等)
+  12. 判 live/dead code 看"从入口可达性"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+九、常用开发命令
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  python main.py                          # 启动主程序
+  pyright <changed_files>                 # 类型检查 (提交前零红线)
+  python -m pytest tests/                 # 运行全部测试
+  python -m pytest tests/<specific_test> -v --tb=short  # 单个测试文件
+  python -c "import py_compile; py_compile.compile('main.py', doraise=True)" # 语法检查
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+十、本分支未提交改动清单
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  核心改动 (chart_bundle / chart_store / chart_registry):
+    - core/chart_bundle.py: ChartBundle 新增 calib_sensors/phys_series/series_delta
+    - core/chart_store.py: _produce_calib_lin 列表类改造 + _LIST_PRODUCER_IDS
+    - core/chart_registry.py: calib_lin produces_when/key_stat_fn/required_keys 更新
+
+  测试新增:
+    - tests/test_chart_registry_store.py: 新增 4 个 calib 列表类测试
+    - tests/test_chart_bundle_from_providers.py: 新增 7 个测试 (6-sensor + phys_series + series_delta)
+
+  配套更新:
+    - ui/ai_diagnosis.py: 日志字段从 calib_ref → calib_sensors_n/phys_series_n/series_delta_n
+    - config/annotation_cache.json: 运行时缓存
+    - core/ai_client.py / core/data_providers.py / core/models.py / core/report_engine.py: 已有改动
+    - dp_engine/ 目录: 整体从 py/ 重命名
+
+  ★ 所有未提交改动仅在本工作树, 等真机验证通过后统一提交。
+═══════════════════════════════════════════════════════════════════════════════

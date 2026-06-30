@@ -41,15 +41,15 @@ from ui.components import (
 )
 from ui.widgets.chart_panel import ChartPanel
 
-from py.calibration.temperature_calibration import (
+from dp_engine.calibration.temperature_calibration import (
     load_continuous, assign_setpoints, regress_sensitivity,
     decouple, compare_given_vs_measured, run_temperature_calibration,
 )
-from py.calibration.strain_calibration import (
+from dp_engine.calibration.strain_calibration import (
     compute_theoretical_strain,
     StrainCalibrationConfig, calibrate_strain,
 )
-from py.calibration.export_utils import (
+from dp_engine.calibration.export_utils import (
     export_temperature_excel, export_strain_excel,
 )
 from utils.apparent_strain_comp import (
@@ -408,14 +408,28 @@ class DetectionParamsDialog(QDialog):
 
     def _preview(self):
         """在温度曲线上高亮检出的平台段，显示检出数"""
-        from py.calibration.step_extractor import detect_plateaus
+        from dp_engine.calibration.step_extractor import detect_plateaus
+        from dp_engine.calibration.temperature_calibration import compute_dL
         if self._df is None or not self._wavelength_cols:
             self.match_info.setText("⚠ 缺少数据")
             return
 
         try:
+            df_dL, _base = compute_dL(self._df, self._wavelength_cols)
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "波长漂移计算失败",
+                f"无法计算波长漂移 dL:\n{e}\n\n"
+                f"波长列: {self._wavelength_cols}\n"
+                f"请检查数据文件是否包含有效波长列。"
+            )
+            self.match_info.setText("⚠ dL 计算失败")
+            return
+
+        try:
             P = detect_plateaus(
-                self._df, self._wavelength_cols,
+                df_dL, self._wavelength_cols,
                 rolling_window=self.rolling_spin.value(),
                 std_percentile=self.std_pct_spin.value(),
                 min_plateau_samples=self.min_plat_spin.value(),
@@ -428,36 +442,68 @@ class DetectionParamsDialog(QDialog):
                 + (" ✅" if self._n_expected and n == self._n_expected else "")
             )
         except Exception as e:
-            self.match_info.setText(f"⚠ 预览失败: {e}")
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "平台检测失败",
+                f"平台检测出错:\n{e}\n\n"
+                f"波长列: {self._wavelength_cols}\n"
+                f"请调整检测参数后重试。"
+            )
+            self.match_info.setText("⚠ 平台检测失败")
 
     def _auto_match(self):
         """自动调整阈值百分位使检出数=期望数"""
-        from py.calibration.step_extractor import detect_plateaus
+        from dp_engine.calibration.step_extractor import detect_plateaus
+        from dp_engine.calibration.temperature_calibration import compute_dL
         if self._df is None or not self._wavelength_cols or not self._n_expected:
             self.match_info.setText("⚠ 缺少数据或期望数")
             return
 
-        best_pct = self.std_pct_spin.value()
-        best_n = 0
-        for pct in range(10, 95, 5):
-            P = detect_plateaus(
-                self._df, self._wavelength_cols,
-                rolling_window=self.rolling_spin.value(),
-                std_percentile=float(pct),
-                min_plateau_samples=self.min_plat_spin.value(),
-                head_trim_ratio=self.head_trim_spin.value(),
+        # ★ 先算 dL（只需一次，循环内复用 df_dL）
+        try:
+            df_dL, _base = compute_dL(self._df, self._wavelength_cols)
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "波长漂移计算失败",
+                f"无法计算波长漂移 dL:\n{e}\n\n"
+                f"波长列: {self._wavelength_cols}\n"
+                f"请检查数据文件是否包含有效波长列。"
             )
-            n = len(P)
-            if n == self._n_expected:
-                best_pct = float(pct); best_n = n
-                break
-            if abs(n - self._n_expected) < abs(best_n - self._n_expected):
-                best_pct = float(pct); best_n = n
+            self.match_info.setText("⚠ dL 计算失败")
+            return
 
-        self.std_pct_spin.setValue(best_pct)
-        self.match_info.setText(
-            f"检出 {best_n}/{self._n_expected} 个平台 (阈值={best_pct:.0f}%)"
-        )
+        try:
+            best_pct = self.std_pct_spin.value()
+            best_n = 0
+            for pct in range(10, 95, 5):
+                P = detect_plateaus(
+                    df_dL, self._wavelength_cols,
+                    rolling_window=self.rolling_spin.value(),
+                    std_percentile=float(pct),
+                    min_plateau_samples=self.min_plat_spin.value(),
+                    head_trim_ratio=self.head_trim_spin.value(),
+                )
+                n = len(P)
+                if n == self._n_expected:
+                    best_pct = float(pct); best_n = n
+                    break
+                if abs(n - self._n_expected) < abs(best_n - self._n_expected):
+                    best_pct = float(pct); best_n = n
+
+            self.std_pct_spin.setValue(best_pct)
+            self.match_info.setText(
+                f"检出 {best_n}/{self._n_expected} 个平台 (阈值={best_pct:.0f}%)"
+            )
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "自动匹配失败",
+                f"平台检测出错:\n{e}\n\n"
+                f"波长列: {self._wavelength_cols}\n"
+                f"请调整检测参数后重试。"
+            )
+            self.match_info.setText("⚠ 自动匹配失败")
 
     def get_params(self) -> dict:
         return {
@@ -543,8 +589,8 @@ class PhaseAWorker(QThread):
 
     def run(self):
         try:
-            from py.calibration.step_extractor import detect_plateaus
-            from py.calibration.temperature_calibration import compute_dL
+            from dp_engine.calibration.step_extractor import detect_plateaus
+            from dp_engine.calibration.temperature_calibration import compute_dL
 
             self.progress.emit("正在计算波长漂移...")
             df, base = compute_dL(self.df, self.wavelength_cols)
@@ -705,7 +751,7 @@ class PhaseBWorker(QThread):
 
     def run(self):
         try:
-            from py.calibration.temperature_calibration import compute_dL
+            from dp_engine.calibration.temperature_calibration import compute_dL
             self.progress.emit("正在运行解耦分析...")
 
             # ★ Phase B 自己算 dL（只传了原始 df，没有 _d 列）
@@ -892,22 +938,31 @@ class _PasteTable(QTableWidget):
         super().keyPressEvent(ev)
 
     def _handle_multi_row_paste(self, start_row: int = -1):
-        """取剪贴板→拆行→逐行 setItem→逐行校验"""
+        """取剪贴板→拆行→逐行 setItem → 循环后一次刷新对话框状态。"""
         text = QApplication.clipboard().text()
         rows_list = [r for r in text.replace('\r\n', '\n').split('\n') if r.strip()]
         if not rows_list:
             return
         start = start_row if start_row >= 0 else (self.currentRow() if self.currentRow() >= 0 else 0)
         INPUT_COL = 2
-        for i, value in enumerate(rows_list):
-            target = start + i
-            if target >= self.rowCount():
-                break
-            cell_value = value.split('\t')[0].strip()
-            item = QTableWidgetItem(cell_value)
-            item.setFlags(Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-            self.setItem(target, INPUT_COL, item)
-            self._validate_row(target)
+        # ★ 循环内 blockSignals: 避免每行 setItem 触发 itemChanged → 多次 _on_apply()
+        self.blockSignals(True)
+        try:
+            for i, value in enumerate(rows_list):
+                target = start + i
+                if target >= self.rowCount():
+                    break
+                cell_value = value.split('\t')[0].strip()
+                item = QTableWidgetItem(cell_value)
+                item.setFlags(Qt.ItemFlag.ItemIsEditable | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                self.setItem(target, INPUT_COL, item)
+                self._validate_row(target)
+        finally:
+            self.blockSignals(False)
+        # ★ 循环后统一刷新对话框状态 (只调一次，避免 N 次全表扫描)
+        parent_dlg = self.parent()
+        if parent_dlg is not None and hasattr(parent_dlg, '_on_apply'):
+            parent_dlg._on_apply()
 
     def _validate_row(self, row: int):
         """校验单行: 取 col(0)列名 + col(2)输入框文本 → 更新 col(3)校验结果"""
@@ -1053,21 +1108,31 @@ class PhaseADialog(QDialog):
                  detection_params, time_col_idx, parent=None):
         super().__init__(parent)
         self._df = loaded_df
+        # 以主页面当前 annotation 为底 (用户已存/accept 写回的值)
         self._annotation = dict(annotation_dict) if annotation_dict else {}
         self._groups = dict(annotation_groups) if annotation_groups else {}
         self._params = dict(detection_params)
         self._time_col_idx = time_col_idx
         self._worker = None
         self._phase_a_result = None
+        # 用户手动编辑过的列 (dirty = 锁定, 文件/profile 都不许盖)
+        self._annotation_dirty: set[str] = set()
         self._build_ui()
         self._refresh_all()
 
         # ── 状态恢复: 从主 Tab 状态 dict 读取上次关闭时的值 ──
+        # ★ 以主页面 annotation 为底 (用户已存/accept 写回的值), saved_annot 兜底
         tp = self._get_temp_page()
         if tp and tp._phase_a_state:
             state = tp._phase_a_state
-            if state.get("annotation"):
-                self._annotation = dict(state["annotation"])
+            saved_annot = state.get("annotation", {}) or {}
+            self._annotation_dirty = set(state.get("annotation_dirty", []) or [])
+            from utils.annotation_utils import merge_annotations
+            self._annotation = merge_annotations(
+                base=self._annotation,
+                fallback=saved_annot,
+                dirty=self._annotation_dirty,
+            )
             if state.get("groups"):
                 self._groups.update(state["groups"])
             if state.get("tmin") is not None:
@@ -1084,7 +1149,7 @@ class PhaseADialog(QDialog):
         if p and hasattr(p, '_loaded_df'):
             return p  # TemperatureCalibrationPage itself
         # 通道: CalibrationTabWidget → TemperatureCalibrationPage
-        return p.temperature_page if p and hasattr(p, 'temperature_page') else None
+        return p.temp_page if p and hasattr(p, 'temp_page') else None
 
     def _build_ui(self):
         self.setWindowTitle("阶段 A: 解析温度系数")
@@ -1117,10 +1182,10 @@ class PhaseADialog(QDialog):
         self.fill_table.setMaximumHeight(320)
         layout.addWidget(self.fill_table)
 
+        # ★ 实时同步: 列2 手动编辑 → itemChanged → 刷新对话框状态
+        self.fill_table.itemChanged.connect(self._on_annotation_cell_changed)
+
         btn_row = QHBoxLayout()
-        self.apply_btn = create_button("✓ 应用暗号", self._on_apply, "primary",
-            tooltip="将新暗号写入 annotation 字典并重新评估")
-        btn_row.addWidget(self.apply_btn)
         reset_btn = create_button("↺ 重置为占位", self._on_reset, "secondary")
         btn_row.addWidget(reset_btn)
         btn_row.addStretch()
@@ -1273,71 +1338,89 @@ class PhaseADialog(QDialog):
             self.fill_table.setItem(i, 2, inp_item)
             self.fill_table.setItem(i, 3, QTableWidgetItem(""))
 
+    def _on_annotation_cell_changed(self, item: QTableWidgetItem):
+        """列2 手动编辑 → 实时刷新对话框状态 (按钮 + 信息条 + 分组)。
+
+        仅响应列2 (输入新暗号) 的修改，其他列忽略。
+        _on_apply() 内部有 blockSignals 防递归 — 它 setItem 不会重触发本 handler。
+        """
+        if item.column() != 2:
+            return
+        if not item.text().strip():
+            return
+        self._on_apply()
+
     def _on_apply(self):
         """应用暗号: 读取 QTableWidgetItem → 更新 annotation → 刷新校验列 → 同步按钮/信息。"""
         from ui.calibration_tab import is_valid_annotation
         col_list = list(self._df.columns)
 
-        # Step 1: 快照所有 QTableWidgetItem
-        snapshots = []
-        for i in range(self.fill_table.rowCount()):
-            col_item = self.fill_table.item(i, 0)
-            inp_item = self.fill_table.item(i, 2)
-            if not col_item or not inp_item:
-                continue
-            cname = col_item.text().strip()
-            entered = inp_item.text().strip()
-            if cname and entered:
-                snapshots.append((i, cname, entered))
+        # ★ blockSignals: 避免 setItem 触发 itemChanged → 递归 _on_apply()
+        self.fill_table.blockSignals(True)
+        try:
+            # Step 1: 快照所有 QTableWidgetItem
+            snapshots = []
+            for i in range(self.fill_table.rowCount()):
+                col_item = self.fill_table.item(i, 0)
+                inp_item = self.fill_table.item(i, 2)
+                if not col_item or not inp_item:
+                    continue
+                cname = col_item.text().strip()
+                entered = inp_item.text().strip()
+                if cname and entered:
+                    snapshots.append((i, cname, entered))
 
-        # Step 2: 更新 annotation + 校验状态列
-        applied = 0
-        for i, cname, entered in snapshots:
-            ok = is_valid_annotation(entered)
-            status_item = self.fill_table.item(i, 3)
-            if status_item:
-                status_item.setText("✓" if ok else "✗ 格式: '传感器-W列号'")
-            else:
-                self.fill_table.setItem(i, 3, QTableWidgetItem("✓" if ok else "✗ 格式: '传感器-W列号'"))
-            if ok:
-                self._annotation[cname] = entered
-                applied += 1
-                # 同步更新"当前暗号"列 (用户看到即时反馈)
-                cur_item = self.fill_table.item(i, 1)
-                if cur_item:
-                    cur_item.setText(entered)
+            # Step 2: 更新 annotation + 校验状态列
+            applied = 0
+            for i, cname, entered in snapshots:
+                ok = is_valid_annotation(entered)
+                status_item = self.fill_table.item(i, 3)
+                if status_item:
+                    status_item.setText("✓" if ok else "✗ 格式: '传感器-W列号'")
+                else:
+                    self.fill_table.setItem(i, 3, QTableWidgetItem("✓" if ok else "✗ 格式: '传感器-W列号'"))
+                if ok:
+                    self._annotation[cname] = entered
+                    self._annotation_dirty.add(cname)  # 标记为用户手动编辑 (三层优先级锁定)
+                    applied += 1
+                    # 同步更新"当前暗号"列 (用户看到即时反馈)
+                    cur_item = self.fill_table.item(i, 1)
+                    if cur_item:
+                        cur_item.setText(entered)
 
-        # 防御断言: 填入数应等于表中非空行数 (漏空列名则警告)
-        expected_rows = sum(
-            1 for i in range(self.fill_table.rowCount())
-            if self.fill_table.item(i, 0) and self.fill_table.item(i, 0).text().strip()
-        )
-        if applied < expected_rows:
-            print(f"[PhaseADialog] ⚠ 只应用了 {applied}/{expected_rows} 行暗号 — 检查空列名行")
+            # 防御断言: 填入数应等于表中非空行数 (漏空列名则警告)
+            expected_rows = sum(
+                1 for i in range(self.fill_table.rowCount())
+                if self.fill_table.item(i, 0) and self.fill_table.item(i, 0).text().strip()
+            )
+            if applied < expected_rows:
+                print(f"[PhaseADialog] ⚠ 只应用了 {applied}/{expected_rows} 行暗号 — 检查空列名行")
 
-        # Step 3: 重建 groups
-        data_cols_for_group = {}
-        for col_name, name in self._annotation.items():
-            try:
-                idx = col_list.index(col_name)
-                s = str(name).strip().strip("'\"'\"'\"")
-                if s and '-' in s:
-                    data_cols_for_group[idx] = s
-            except ValueError:
-                pass
-        if data_cols_for_group:
-            from ui.calibration_tab import _group_annotations_by_prefix
-            self._groups = _group_annotations_by_prefix(data_cols_for_group, self._df)
+            # Step 3: 重建 groups
+            data_cols_for_group = {}
+            for col_name, name in self._annotation.items():
+                try:
+                    idx = col_list.index(col_name)
+                    s = str(name).strip().strip("'\"'\"'\"")
+                    if s and '-' in s:
+                        data_cols_for_group[idx] = s
+                except ValueError:
+                    pass
+            if data_cols_for_group:
+                from ui.calibration_tab import _group_annotations_by_prefix
+                self._groups = _group_annotations_by_prefix(data_cols_for_group, self._df)
 
-        # Step 4: 重新统计合法/占位
-        from ui.calibration_tab import _count_annotations
-        from utils.file_parser import detect_numeric_wavelength_columns
-        _, wave_cols = detect_numeric_wavelength_columns(self._df)
-        self._legal_cnt, self._placeholder_cnt = _count_annotations(self._annotation, wave_cols)
+            # Step 4: 重新统计合法/占位
+            from ui.calibration_tab import _count_annotations
+            from utils.file_parser import detect_numeric_wavelength_columns
+            _, wave_cols = detect_numeric_wavelength_columns(self._df)
+            self._legal_cnt, self._placeholder_cnt = _count_annotations(self._annotation, wave_cols)
 
-        # Step 5: 同步按钮+信息条 (不碰表格)
-        self._sync_button_state()
-        self._sync_info_label()
+            # Step 5: 同步按钮+信息条 (不碰表格)
+            self._sync_button_state()
+            self._sync_info_label()
+        finally:
+            self.fill_table.blockSignals(False)
 
     def _on_reset(self):
         """重置为占位: 清空输入列 → 恢复 placeholder annotation → 仅刷新按钮/信息条"""
@@ -1475,16 +1558,18 @@ class PhaseADialog(QDialog):
         dlg.exec()
 
     def _write_state_to_main_page(self):
-        """写回主 Tab 状态 (被 accept + reject 共用)"""
+        """写回主 Tab 状态 (仅 accept 调用)"""
         tp = self._get_temp_page()
         if tp:
             tp._annotation_dict = dict(self._annotation)
             tp._annotation_groups = dict(self._groups)
+            tp._annotation_dirty = set(self._annotation_dirty)  # 持久化 dirty 标记
             if self._phase_a_result:
                 tp._last_result = self._phase_a_result
                 tp._phase_a_done = True
             tp._phase_a_state = {
                 "annotation": dict(self._annotation),
+                "annotation_dirty": list(self._annotation_dirty),
                 "groups": dict(self._groups),
                 "tmin": self.tmin.value(),
                 "tmax": self.tmax.value(),
@@ -1494,11 +1579,13 @@ class PhaseADialog(QDialog):
             }
 
     def accept(self):
+        """确定: 先读取'输入新暗号'列更新本地 annotation/groups, 再写回主页面。"""
+        self._on_apply()
         self._write_state_to_main_page()
         super().accept()
 
     def reject(self):
-        self._write_state_to_main_page()
+        # reject 不写回 — 只有 accept(确定) 才持久化状态
         super().reject()
 
     def get_result(self):
@@ -1638,8 +1725,8 @@ class PhaseBDialog(QDialog):
         p = self.parent()
         if hasattr(p, '_loaded_df'):
             return p
-        if hasattr(p, 'temperature_page'):
-            return p.temperature_page
+        if hasattr(p, 'temp_page'):
+            return p.temp_page
         return None
 
     def _ensure_decoupled_result(self, show_warning: bool = True) -> dict | None:
@@ -1965,7 +2052,7 @@ class PhaseBDialog(QDialog):
             label.setText(f"ⓘ 单栅传感器 ({display_names}) 不进 Phase B 解耦，温度系数 S_eff 保留在 Phase A 结果中")
 
     def _write_state_to_main_page(self):
-        """写回主 Tab 状态 (被 accept + reject 共用)
+        """写回主 Tab 状态 (仅 accept 调用)
 
         Phase 3b: 评级用 grade_sensor (%FS), 补偿模型/指标/评级持久化。
         comp_form / poly_order 随 compensation 一起存。
@@ -2048,6 +2135,7 @@ class PhaseBDialog(QDialog):
                 "comp_form": comp_form,
                 "poly_order": poly_order,
                 "subsample_step": subsample_step,
+                "sensors": (self._last_result or {}).get("sensors", {}),
             }
 
     def accept(self):
@@ -2055,7 +2143,18 @@ class PhaseBDialog(QDialog):
         super().accept()
 
     def reject(self):
-        self._write_state_to_main_page()
+        """取消/关闭: 有未保存的分析结果时弹确认，防止静默丢失。"""
+        if self._last_result is not None:
+            from PyQt6.QtWidgets import QMessageBox
+            answer = QMessageBox.question(
+                self, "未保存的分析结果",
+                "有未保存的分析结果，确定放弃？\n\n"
+                "提示：点击「确定」按钮可保存分析结果后再关闭。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return  # 用户选 No → 留在对话框
         super().reject()
 
     def _show_fail_banner(self):
@@ -2460,7 +2559,7 @@ class PhaseBDialog(QDialog):
     def _do_export_excel(self):
         path, _ = QFileDialog.getSaveFileName(self, "导出", "温度标定结果.xlsx", "Excel (*.xlsx)")
         if not path: return
-        from py.calibration.export_utils import export_temperature_excel
+        from dp_engine.calibration.export_utils import export_temperature_excel
         ra = self._phase_a_result
         rb = self._last_result
         sample_s = 2.0
@@ -2483,8 +2582,8 @@ class PhaseBDialog(QDialog):
         self._on_run()
 
     def _do_export_word(self):
-        from py.report_builder.word_builder import WordBuilder
-        from py.report_builder.models import WordReport, WordSection
+        from dp_engine.report_builder.word_builder import WordBuilder
+        from dp_engine.report_builder.models import WordReport, WordSection
         ra = self._phase_a_result
         rb = self._last_result
         lines = ["## 温度标定结果\n"]
@@ -2538,6 +2637,7 @@ class TemperatureCalibrationPage(QWidget):
         self._annotation_dict = {}
         self._annotation_groups = {}
         self._annotation_meta = {}
+        self._annotation_dirty: set[str] = set()  # 用户手动编辑过的列名 (三层优先级: 手改>文件>profile)
         self._detection_params = {
             "rolling_window": 25, "std_percentile": 45.0,
             "min_plateau_samples": 180, "head_trim_ratio": 0.70,
@@ -2636,6 +2736,7 @@ class TemperatureCalibrationPage(QWidget):
             self._loaded_df = df
             self._annotation_dict = annotation
             self._annotation_meta = meta
+            self._annotation_dirty = set()  # 新文件 → 清空旧 dirty 标记
             # 新文件 → 清空旧状态 (避免旧暗号污染新文件)
             self._phase_a_state = {}
             self._phase_b_state = {}
@@ -2703,7 +2804,7 @@ class TemperatureCalibrationPage(QWidget):
 
     def _save_profile(self):
         """保存项目配置 (温度段 + 应变段)"""
-        from py.calibration.project_config import ProjectConfigManager
+        from dp_engine.calibration.project_config import ProjectConfigManager
         ctw = self._get_cal_tab_widget()
         sp = ctw.strain_page if ctw is not None else None
         pc = ProjectConfigManager.capture(self, sp)
@@ -2742,7 +2843,7 @@ class TemperatureCalibrationPage(QWidget):
 
     def _load_profile(self):
         """加载项目配置，回填温度段 + 应变段"""
-        from py.calibration.project_config import ProjectConfigManager, PROFILES_DIR
+        from dp_engine.calibration.project_config import ProjectConfigManager, PROFILES_DIR
 
         projects = ProjectConfigManager.list_all()
         if not projects:
@@ -2791,13 +2892,14 @@ class TemperatureCalibrationPage(QWidget):
             QMessageBox.information(self, "已加载",
                 f"项目 '{name}' 已恢复。\n\n"
                 f"温度段: {'有' if pc.temperature else '无'}  |  "
-                f"应变传感器: {len(pc.strain)} 个")
+                f"应变传感器: {len(pc.strain)} 个\n\n"
+                f"⚠ 原始波长读数不包含在项目配置中，请用「📂 加载读数」单独恢复。")
         except Exception as e:
             QMessageBox.critical(self, "加载失败", str(e))
 
     def _manage_profiles(self):
         """配置管理: 查看/删除已保存的项目配置"""
-        from py.calibration.project_config import ProjectConfigManager
+        from dp_engine.calibration.project_config import ProjectConfigManager
 
         projects = ProjectConfigManager.list_all()
         if not projects:
@@ -2834,7 +2936,7 @@ class TemperatureCalibrationPage(QWidget):
         dlg.exec()
 
     def _delete_project_and_refresh(self, name: str, dlg, tbl):
-        from py.calibration.project_config import ProjectConfigManager
+        from dp_engine.calibration.project_config import ProjectConfigManager
         r = QMessageBox.question(self, "确认删除", f"确定删除项目配置 '{name}'？")
         if r == QMessageBox.StandardButton.Yes:
             ProjectConfigManager.delete(name)
@@ -2917,6 +3019,11 @@ class StrainCalibrationPage(QWidget):
             tooltip="保存温度+应变全部标定参数"))
         proj_row.addWidget(create_button("📂 加载项目", self._load_project, "secondary",
             tooltip="从文件恢复温度+应变标定参数"))
+        # ── 读数 profile 管理 (独立 sidecar, 与项目配置零耦合) ──
+        proj_row.addWidget(create_button("💾 保存读数", self._save_readings, "secondary",
+            tooltip="仅保存当前应变原始读数 (波长/位移/暗号映射)"))
+        proj_row.addWidget(create_button("📂 加载读数", self._load_readings, "secondary",
+            tooltip="加载已保存的应变原始读数 (需先在温度标定完成阶段A)"))
         self._dirty_label = QLabel("")
         self._dirty_label.setStyleSheet("color: #fa8c16; font-weight: bold; padding: 2px 6px;")
         proj_row.addWidget(self._dirty_label)
@@ -3079,7 +3186,7 @@ class StrainCalibrationPage(QWidget):
         优先从 CalibrationTabWidget.project_config 获取，
         若不存在则创建并缓存到 self._project_config。
         """
-        from py.calibration.project_config import ProjectConfig
+        from dp_engine.calibration.project_config import ProjectConfig
         # 先查缓存在页面上的
         cached = getattr(self, '_project_config', None)
         if cached is not None:
@@ -3138,7 +3245,7 @@ class StrainCalibrationPage(QWidget):
 
     def _build_strain_subconfig(self):
         """从当前应变标定状态构造 StrainSubConfig。"""
-        from py.calibration.project_config import StrainSubConfig
+        from dp_engine.calibration.project_config import StrainSubConfig
         kind = self._config["grating_kind"]
         sensor_mode_map = {"single": "single", "dual_anchored": "dual_anchored", "dual_both": "dual_working"}
         # 构建 readings 列表
@@ -3731,7 +3838,7 @@ class StrainCalibrationPage(QWidget):
     def _upsert_strain_config(self, sensor_name: str):
         """从当前活动态 (_config/_levels/_readings/_grating_map/_ke_results) 构造 StrainSubConfig，
         写入 self._strain_configs, 同步 project.strain, 刷新列表。"""
-        from py.calibration.project_config import StrainSubConfig
+        from dp_engine.calibration.project_config import StrainSubConfig
         sub = self._build_strain_subconfig()
         self._strain_configs[sensor_name] = sub
         # 同步到 project.strain
@@ -3962,11 +4069,123 @@ class StrainCalibrationPage(QWidget):
         self._refresh_sensor_list()
         self.sensor_list.setCurrentRow(-1)
 
+    # ── 读数 profile 管理 (独立 sidecar, 与 ProjectConfig 零耦合) ──
+
+    def _save_readings(self):
+        """保存当前应变原始读数到独立 sidecar JSON。"""
+        from dp_engine.calibration.readings_profile import capture_from_page, ReadingsProfile
+
+        profile = capture_from_page(self)
+        if not profile.readings:
+            QMessageBox.warning(self, "无读数数据",
+                "当前没有录入的原始波长读数。\n请先点击「读数录入…」填写数据后再保存。")
+            return
+
+        default_name = f"应变读数_{datetime.now().strftime('%Y%m%d_%H%M')}"
+        name, ok = QInputDialog.getText(
+            self, "保存应变读数", "读数配置名称:", text=default_name)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        profile.name = name
+
+        try:
+            path = profile.save()
+            QMessageBox.information(self, "已保存",
+                f"应变原始读数已保存到:\n{path}\n\n"
+                f"传感器模式: {profile.sensor_mode}  |  加载模式: {profile.mode}\n"
+                f"循环数: {profile.n_cycles}  |  位移等级: {len(profile.levels)} 行")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", str(e))
+
+    def _load_readings(self):
+        """加载已保存的应变原始读数 — 校验暗号 + dual_anchored 提示 + 回填。"""
+        from dp_engine.calibration.readings_profile import ReadingsProfile, apply_to_page
+
+        items = ReadingsProfile.list_all()
+        if not items:
+            QMessageBox.information(self, "无读数配置",
+                "还没有保存的应变读数配置文件。\n\n"
+                "提示: 填写读数录入表后，点击「💾 保存读数」创建一份。")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("加载应变读数"); dlg.resize(600, 400)
+        layout = QVBoxLayout(dlg)
+        info_label = QLabel(
+            "⚠ 加载读数前，请先在温度标定页加载数据并完成阶段 A\n"
+            "（使暗号下拉列表有可用选项，否则暗号无法校验）")
+        info_label.setStyleSheet("color: #d35400; font-weight: bold; padding: 4px 8px;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        lst = QListWidget()
+        for it in items:
+            lst.addItem(
+                f"{it.get('name', it['_key'])}\n"
+                f"  创建: {it.get('created_at', '?')}  |  "
+                f"模式: {it.get('sensor_mode', '?')}/{it.get('mode', '?')}  |  "
+                f"行数: {it.get('n_levels', '?')}"
+            )
+        layout.addWidget(lst)
+
+        btn_row = QHBoxLayout()
+        load_btn = create_button("加载选中", dlg.accept, "primary")
+        btn_row.addWidget(load_btn)
+        btn_row.addWidget(create_button("取消", dlg.reject, "secondary"))
+        layout.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted or lst.currentRow() < 0:
+            return
+
+        name = items[lst.currentRow()]["_key"]
+
+        try:
+            profile = ReadingsProfile.load(name)
+        except Exception as e:
+            QMessageBox.critical(self, "加载失败", f"无法读取读数配置文件:\n{e}")
+            return
+
+        # ── 暗号校验: grating_map 的全部值必须在当前温度页暗号列表中 ──
+        temp_codes = self._get_temp_annotations()
+        if profile.grating_map and temp_codes:
+            for g_key, ann in profile.grating_map.items():
+                if ann.strip() and ann.strip() not in temp_codes:
+                    QMessageBox.critical(self, "暗号校验失败",
+                        f"读数配置中的暗号 '{ann}' (光栅 {g_key}) "
+                        f"在当前温度标定页的暗号列表中不存在。\n\n"
+                        f"当前可用暗号: {', '.join(temp_codes[:10])}"
+                        f"{'…' if len(temp_codes) > 10 else ''}\n\n"
+                        f"请先在温度标定页完成阶段 A (暗号补填)，"
+                        f"确保暗号列表包含所需项，再重新加载。")
+                    return
+        elif profile.grating_map and not temp_codes:
+            QMessageBox.warning(self, "暗号列表为空",
+                f"读数配置含暗号映射 ({', '.join(profile.grating_map.values())})，"
+                f"但当前温度标定页无暗号数据。\n"
+                f"加载将继续，但下拉框可能无选项供选择。\n\n"
+                f"建议: 先在温度标定页加载数据并完成阶段 A。")
+
+        # ── dual_anchored 锚固号提示 (报告 6.4 缺口 — 不静默丢失) ──
+        if profile.sensor_mode == "dual_anchored":
+            QMessageBox.information(self, "锚固光栅号未保存",
+                "本读数为双栅锚固模式，锚固光栅号未随读数配置保存。\n"
+                "请在加载后打开「⚙ 标定参数」对话框，重新指定锚固光栅号。")
+
+        # ── 回填活状态 ──
+        apply_to_page(self, profile)
+
+        QMessageBox.information(self, "已加载",
+            f"应变原始读数 '{profile.name}' 已恢复到工作区。\n\n"
+            f"传感器模式: {profile.sensor_mode}  |  加载模式: {profile.mode}\n"
+            f"循环数: {profile.n_cycles}  |  位移等级: {len(profile.levels)} 行\n\n"
+            f"请点击「📋 读数录入…」查看/编辑已恢复的波长数据。")
+
     # ── 项目配置管理 ──
 
     def _save_project(self):
         """保存项目配置 (温度段 + 应变段)，可从温度页或应变页调用"""
-        from py.calibration.project_config import ProjectConfigManager
+        from dp_engine.calibration.project_config import ProjectConfigManager
         ctw = self._get_cal_tab_widget()
         tp = ctw.temp_page if ctw is not None else None
         pc = ProjectConfigManager.capture(tp, self)
@@ -4005,7 +4224,7 @@ class StrainCalibrationPage(QWidget):
                 if self._project_dirty:  # 用户取消了保存对话框
                     return
 
-        from py.calibration.project_config import ProjectConfigManager
+        from dp_engine.calibration.project_config import ProjectConfigManager
 
         projects = ProjectConfigManager.list_all()
         if not projects:
@@ -4047,7 +4266,8 @@ class StrainCalibrationPage(QWidget):
             QMessageBox.information(self, "已加载",
                 f"项目 '{name}' 已恢复。\n\n"
                 f"温度段: {'有' if pc.temperature else '无'}  |  "
-                f"应变传感器: {len(pc.strain)} 个")
+                f"应变传感器: {len(pc.strain)} 个\n\n"
+                f"⚠ 原始波长读数不包含在项目配置中，请用「📂 加载读数」单独恢复。")
         except Exception as e:
             QMessageBox.critical(self, "加载失败", str(e))
 
@@ -4137,7 +4357,7 @@ class StrainCalibrationPage(QWidget):
             cfg = self._strain_configs[self._current_sensor]
             ke = getattr(cfg, 'ke_results', {}) or {}
             if ke:
-                from py.calibration.strain_calibration import (
+                from dp_engine.calibration.strain_calibration import (
                     StrainCalibrationResult,
                     GratingStrainResult,
                 )

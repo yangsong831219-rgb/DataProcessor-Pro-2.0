@@ -403,7 +403,7 @@ class SensorSystem:
         使用 asteval.Interpreter (minimal 模式) 安全求值，
         参数与列变量均作为 symtable 注入，彻底消除正则替换 k1/k10 误匹配风险。
         """
-        from py.formula import calculate as _engine_calculate
+        from dp_engine.formula import calculate as _engine_calculate
 
         # 合并: 全局参数打底，局部常量覆盖
         merged: Dict[str, Any] = {}

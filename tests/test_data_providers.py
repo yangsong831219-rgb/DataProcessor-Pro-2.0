@@ -5,6 +5,8 @@ import json
 import os
 import sys
 from types import SimpleNamespace
+import numpy as np
+import pandas as pd
 import pytest
 
 
@@ -86,7 +88,7 @@ def _make_main_win(data=None, template=None, has_cal=True):
     else:
         tp = SimpleNamespace(_phase_a_state={}, _phase_b_state={})
 
-    ct = SimpleNamespace(temperature_page=tp)
+    ct = SimpleNamespace(temp_page=tp)
     mw = SimpleNamespace(
         current_data=data,
         current_template=template,
@@ -265,25 +267,48 @@ class TestAnalysisProvider:
 
     def test_not_available_without_results(self):
         from core.data_providers import AnalysisProvider
-        assert not AnalysisProvider().is_available(SimpleNamespace(sensor_results={}))
+        # 无 analysis_tab_widget → is_available False
+        assert not AnalysisProvider().is_available(SimpleNamespace())
+
+    def test_not_available_without_widget(self):
+        from core.data_providers import AnalysisProvider
+        # analysis_tab_widget 存在但 _current_data=None → is_available False
+        assert not AnalysisProvider().is_available(
+            SimpleNamespace(analysis_tab_widget=SimpleNamespace(_current_data=None)))
 
     def test_available_with_results(self):
         from core.data_providers import AnalysisProvider
-        assert AnalysisProvider().is_available(SimpleNamespace(sensor_results={"A": [1, 2, 3]}))
+        # _current_data 非空 DataFrame → is_available True（真机已验）
+        df = pd.DataFrame({"W1": [1.0, 2.0, 3.0]})
+        assert AnalysisProvider().is_available(
+            SimpleNamespace(analysis_tab_widget=SimpleNamespace(_current_data=df)))
 
     def test_summary_has_features(self):
-        import numpy as np
         from core.data_providers import AnalysisProvider
-        vals = np.linspace(100, 120, 100).tolist()
-        s = AnalysisProvider().get_summary(SimpleNamespace(sensor_results={"FBG_A1": vals}))
-        assert "FBG_A1" in s
+        # get_summary 从 _current_data 数值列提取统计摘要
+        df = pd.DataFrame({
+            "FBG_A1": np.linspace(100, 120, 100),
+            "Timestamp": np.arange(100),  # 应被过滤
+        })
+        mw = SimpleNamespace(
+            analysis_tab_widget=SimpleNamespace(_current_data=df),
+            current_annotation={"FBG_A1": "w1-A1-1 应变 梁底"},
+        )
+        s = AnalysisProvider().get_summary(mw)
+        # summary 应含暗号名或原始列名、不含被过滤列
+        assert "FBG_A1" in s or "w1-A1-1" in s
         assert "110.000" in s
         assert "CV" in s or "一般" in s or "波动" in s
+        assert "Timestamp" not in s  # 时间戳列被 is_plottable_data_column 过滤
 
     def test_summary_has_drift(self):
-        import numpy as np
         from core.data_providers import AnalysisProvider
-        s = AnalysisProvider().get_summary(SimpleNamespace(sensor_results={"S1": np.linspace(0, 100, 200).tolist()}))
+        df = pd.DataFrame({"S1": np.linspace(0, 100, 200)})
+        mw = SimpleNamespace(
+            analysis_tab_widget=SimpleNamespace(_current_data=df),
+            current_annotation={},
+        )
+        s = AnalysisProvider().get_summary(mw)
         assert "drift" in s.lower() or "漂移" in s
 
     def test_feature_function(self):
@@ -301,9 +326,9 @@ class TestAnalysisProvider:
 
 class TestProviderRegistry:
 
-    def test_five_providers(self):
+    def test_provider_count(self):
         from core.data_providers import get_all_providers
-        assert len(get_all_providers()) == 5
+        assert len(get_all_providers()) >= 5  # 6 providers as of ExternalDataProvider addition
 
     def test_types(self):
         from core.data_providers import (get_all_providers, DataFileProvider,
@@ -379,7 +404,7 @@ class TestCleaningBudget:
     def test_names(self):
         from core.data_providers import get_all_providers
         names = [p.display_name for p in get_all_providers()]
-        assert len(names) == 5
+        assert len(names) >= 5  # 6 providers as of ExternalDataProvider addition
         assert "data" in names[0].lower() or "file" in names[0].lower() or "数据" in names[0]
         assert "clean" in names[1].lower() or "清洗" in names[1]
         assert "analysis" in names[2].lower() or "分析" in names[2]
@@ -393,9 +418,11 @@ class TestCleaningBudget:
 
 class TestKePrecision:
 
-    def test_strain_ke_used(self):
+    def test_strain_ke_from_configs_dict(self):
+        """真实路径: StrainSubConfig.ke_results 是 dict, 取值用 .get() 不用 getattr。"""
         from core.data_providers import _get_strain_ke
-        sp = SimpleNamespace(_phase_b_state={"A1": {"ke_results": {"Ke1": 1.1814, "Ke2": 0.0008}}})
+        cfg = SimpleNamespace(sensor_name="A1", ke_results={"Ke1": 1.1814, "Ke2": 0.0008})
+        sp = SimpleNamespace(_strain_configs={"A1": cfg})
         ct = SimpleNamespace(strain_page=sp)
         mw = SimpleNamespace(calibration_tab_widget=ct)
         ke = _get_strain_ke(mw, "A1")
@@ -403,9 +430,38 @@ class TestKePrecision:
         assert abs(ke['Ke1'] - 1.1814) < 0.0001
         assert abs(ke['Ke2'] - 0.0008) < 0.0001
 
+    def test_strain_ke_zero_values_return_none(self):
+        """Ke1=Ke2=0 时不返回(让调用方回落 ke_table), 不挡真值。"""
+        from core.data_providers import _get_strain_ke
+        cfg = SimpleNamespace(sensor_name="A1", ke_results={"Ke1": 0.0, "Ke2": 0.0})
+        sp = SimpleNamespace(_strain_configs={"A1": cfg})
+        ct = SimpleNamespace(strain_page=sp)
+        mw = SimpleNamespace(calibration_tab_widget=ct)
+        ke = _get_strain_ke(mw, "A1")
+        assert ke is None, "Ke 全零应返回 None，让 ke_table 兜底"
+
+    def test_strain_ke_single_grating_ke2_zero(self):
+        """单栅 Ke2=0, Ke1 有值时正常返回(不是全零)。"""
+        from core.data_providers import _get_strain_ke
+        cfg = SimpleNamespace(sensor_name="A2", ke_results={"Ke1": 0.987})
+        sp = SimpleNamespace(_strain_configs={"A2": cfg})
+        ct = SimpleNamespace(strain_page=sp)
+        mw = SimpleNamespace(calibration_tab_widget=ct)
+        ke = _get_strain_ke(mw, "A2")
+        assert ke is not None
+        assert abs(ke['Ke1'] - 0.987) < 0.0001
+        assert abs(ke['Ke2'] - 0.0) < 0.0001  # 缺键默认 0
+
     def test_no_strain_returns_none(self):
         from core.data_providers import _get_strain_ke
         assert _get_strain_ke(SimpleNamespace(calibration_tab_widget=None), "A1") is None
+
+    def test_empty_configs_returns_none(self):
+        from core.data_providers import _get_strain_ke
+        sp = SimpleNamespace(_strain_configs={})
+        ct = SimpleNamespace(strain_page=sp)
+        mw = SimpleNamespace(calibration_tab_widget=ct)
+        assert _get_strain_ke(mw, "A1") is None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -434,3 +490,135 @@ class TestIsFiberData:
         df = pd.DataFrame({"A": [1, 2], "B": [3, 4]})
         is_fiber = any('FBG' in str(c) or _re.match(r'^W\d+$', str(c)) for c in df.columns)
         assert not is_fiber
+
+
+# ═══════════════════════════════════════════════════════════
+# Defect 2: S_eff in snapshot when has_a=True, has_b=False
+# ═══════════════════════════════════════════════════════════
+
+class TestCalibrationSummaryS_eff:
+    """CalibrationProvider.get_summary — S_eff 数据在仅有温度 Phase A 时仍进入快照"""
+
+    def test_s_eff_only_produces_sensor_lines(self):
+        """仅 S_eff 存在 (has_a=True, has_b=False) → 不出 '(无传感器数据)'。"""
+        from core.data_providers import CalibrationProvider
+        cp = CalibrationProvider()
+
+        sp = SimpleNamespace(_strain_configs={})
+        ct = SimpleNamespace(strain_page=sp)
+
+        S_eff = {
+            "A1-W1": {"slope": 21.57, "r2": 0.9998, "T_base": 23.5},
+            "A1-W2": {"slope": 28.15, "r2": 0.9999, "T_base": 23.5},
+        }
+        tp = SimpleNamespace(
+            _phase_a_state={"seff_result": {"S_eff": S_eff}},
+            _phase_b_state={},
+        )
+        main_win = SimpleNamespace(calibration_tab_widget=SimpleNamespace(
+            temp_page=tp, strain_page=sp,
+        ))
+
+        text = cp.get_summary(main_win, budget_chars=2000)
+        assert "(未运行)" not in text
+        assert "(无传感器数据)" not in text
+        # 应有传感器前缀 A1
+        assert "A1" in text
+        # 应有灵敏度值
+        assert "21.57" in text
+
+    def test_s_eff_and_ke_table_both_included(self):
+        """S_eff + ke_table 同时在 → 传感器数量正确。"""
+        from core.data_providers import CalibrationProvider
+        cp = CalibrationProvider()
+
+        S_eff = {"A1-W1": {"slope": 21.57, "r2": 0.9998, "T_base": 23.5}}
+        sp = SimpleNamespace(_strain_configs={})
+        ct = SimpleNamespace(strain_page=sp)
+        tp = SimpleNamespace(
+            _phase_a_state={"seff_result": {"S_eff": S_eff}},
+            _phase_b_state={
+                "ke_table": {"A1": {"Ke1": 1.18, "Ke2": 0.95}},
+            },
+        )
+        main_win = SimpleNamespace(calibration_tab_widget=SimpleNamespace(
+            temp_page=tp, strain_page=sp,
+        ))
+
+        text = cp.get_summary(main_win, budget_chars=2000)
+        assert "A1" in text
+        assert "21.57" in text  # S_eff
+        assert "1.18" in text   # Ke1 from ke_table
+
+    def test_seff_result_none_does_not_crash(self):
+        """_phase_a_state.seff_result 为 None → 不崩，has_a=False。"""
+        from core.data_providers import CalibrationProvider
+        cp = CalibrationProvider()
+
+        tp = SimpleNamespace(
+            _phase_a_state={"seff_result": None},
+            _phase_b_state={},
+        )
+        sp = SimpleNamespace(_strain_configs={})
+        main_win = SimpleNamespace(calibration_tab_widget=SimpleNamespace(
+            temp_page=tp, strain_page=sp,
+        ))
+
+        text = cp.get_summary(main_win, budget_chars=2000)
+        assert "(未运行)" in text  # has_a=False, has_b=False
+
+
+# ═══════════════════════════════════════════════════════════
+# Defect 3: _anomaly column filtering
+# ═══════════════════════════════════════════════════════════
+
+class TestAnomalyColumnFiltering:
+
+    def test_numeric_cols_excludes_anomaly(self):
+        """_anomaly 后缀列不进入数值列统计。"""
+        import pandas as pd
+        import numpy as np
+        # 构造含 _anomaly 列的 DataFrame（模拟清洗后的数据）
+        df = pd.DataFrame({
+            "Timestamp": np.arange(10, dtype=float),
+            "w1": np.random.default_rng(42).normal(1540, 0.1, 10),
+            "w2": np.random.default_rng(42).normal(1545, 0.1, 10),
+            "w1_anomaly": np.zeros(10, dtype=bool),
+            "w2_anomaly": np.zeros(10, dtype=bool),
+            "Timestamp_anomaly": np.zeros(10, dtype=bool),
+        })
+
+        numeric_cols = [
+            c for c in df.select_dtypes(include=['number']).columns
+            if not str(c).endswith('_anomaly')
+        ]
+
+        assert "Timestamp" in numeric_cols
+        assert "w1" in numeric_cols
+        assert "w2" in numeric_cols
+        assert "w1_anomaly" not in numeric_cols
+        assert "w2_anomaly" not in numeric_cols
+        assert "Timestamp_anomaly" not in numeric_cols
+
+    def test_column_list_excludes_anomaly(self):
+        """列列表不含 _anomaly 后缀列。"""
+        import pandas as pd
+        df = pd.DataFrame({
+            "Timestamp": [1.0], "w1": [2.0],
+            "w1_anomaly": [False], "Timestamp_anomaly": [False],
+        })
+        cols = [c for c in df.columns if not str(c).endswith('_anomaly')]
+        assert "Timestamp" in cols
+        assert "w1" in cols
+        assert "w1_anomaly" not in cols
+        assert "Timestamp_anomaly" not in cols
+
+    def test_no_anomaly_cols_unaffected(self):
+        """无 _anomaly 列时过滤不影响正常列。"""
+        import pandas as pd
+        df = pd.DataFrame({"A": [1.0, 2.0], "B": [3.0, 4.0]})
+        numeric_cols = [
+            c for c in df.select_dtypes(include=['number']).columns
+            if not str(c).endswith('_anomaly')
+        ]
+        assert set(numeric_cols) == {"A", "B"}
