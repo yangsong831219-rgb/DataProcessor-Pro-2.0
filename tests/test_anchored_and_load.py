@@ -145,7 +145,7 @@ class TestAnchoredModeFix:
         # 验证结果文本
         page._show_strain_text(result)
         text = page.strain_result_text.toPlainText()
-        assert "光栅1" in text
+        assert "G1" in text
         assert "G1" in text or "光栅1" in text
 
     def test_anchored_grating_persists_in_config(self, qapp):

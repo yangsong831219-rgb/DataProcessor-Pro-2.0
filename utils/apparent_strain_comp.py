@@ -184,8 +184,12 @@ def build_apparent_strain_lut(
         T_base=T_base,
         T_grid=[float(v) for v in T_grid_arr],
         eps_app=[float(v) for v in eps_app_arr],
-        T_min=float(np.min(T_grid_arr)),
-        T_max=float(np.max(T_grid_arr)),
+        # T_grid contains bin centres.  Its end points are intentionally
+        # inside the measured range, so using them as the model domain marks
+        # samples that trained the LUT as out-of-bounds.  The valid domain is
+        # the actual temperature span selected for fitting.
+        T_min=T_min_data,
+        T_max=T_max_data,
         n_cycles=n_cycles,
         source=src_label,
     )

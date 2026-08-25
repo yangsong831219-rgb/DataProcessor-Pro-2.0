@@ -18,11 +18,232 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # 中文字体 — 与 main.py 全局设置一致
-plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS"]
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS"]
 plt.rcParams["axes.unicode_minus"] = False
 
 _COLORS = ["#2980b9", "#e67e22", "#27ae60", "#c0392b",
            "#8e44ad", "#16a085", "#d35400", "#2c3e50"]
+
+
+def _figure_to_png_bytes(fig) -> bytes:
+    """统一关闭 Figure 并返回 PNG 字节。"""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def render_temp_regression_grid(
+    regressions: list[dict],
+    title: str = "阶段 A — 温度系数回归",
+) -> bytes:
+    """把阶段 A 全部光栅回归结果渲染为一张网格图。"""
+    valid = [item for item in regressions if isinstance(item, dict)]
+    if not valid:
+        return b""
+
+    ncols = 2 if len(valid) > 1 else 1
+    nrows = (len(valid) + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(14, max(4.5, 3.4 * nrows)),
+        squeeze=False,
+    )
+    for index, item in enumerate(valid):
+        ax = axes[index // ncols, index % ncols]
+        temperature = np.asarray(item.get("temperature", []), dtype=float)
+        drift = np.asarray(item.get("drift_pm", []), dtype=float)
+        count = min(len(temperature), len(drift))
+        temperature = temperature[:count]
+        drift = drift[:count]
+        finite = np.isfinite(temperature) & np.isfinite(drift)
+        color = _COLORS[index % len(_COLORS)]
+        if int(finite.sum()) >= 2:
+            x = temperature[finite]
+            y = drift[finite]
+            ax.scatter(x, y, s=28, alpha=0.7, color=color, zorder=3, label="平台均值")
+            slope = float(item.get("slope", 0.0))
+            intercept = float(item.get("intercept", 0.0))
+            fit_x = np.linspace(float(np.min(x)), float(np.max(x)), 100)
+            ax.plot(
+                fit_x,
+                slope * fit_x + intercept,
+                color="#c0392b",
+                lw=1.8,
+                label=f"k={slope:.3f} pm/°C, R²={float(item.get('r2') or 0.0):.5f}",
+            )
+        ax.set_title(str(item.get("display") or item.get("name") or f"光栅{index + 1}"))
+        ax.set_xlabel("设定温度 (°C)")
+        ax.set_ylabel("波长漂移 (pm)")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=7)
+
+    for index in range(len(valid), nrows * ncols):
+        axes[index // ncols, index % ncols].set_visible(False)
+    fig.suptitle(title, fontweight="bold", fontsize=14)
+    fig.tight_layout()
+    return _figure_to_png_bytes(fig)
+
+
+def render_phase_b_diagnostic(
+    diagnostic: dict,
+    title: str | None = None,
+) -> bytes:
+    """渲染单传感器阶段 B 标准诊断四联图（补偿前或补偿后）。"""
+    time_h = np.asarray(diagnostic.get("time_h", []), dtype=float)
+    dl1 = np.asarray(diagnostic.get("dl1_pm", []), dtype=float)
+    dl2 = np.asarray(diagnostic.get("dl2_pm", []), dtype=float)
+    d_temperature = np.asarray(diagnostic.get("d_temperature", []), dtype=float)
+    absolute_temperature = np.asarray(
+        diagnostic.get("absolute_temperature", []),
+        dtype=float,
+    )
+    variant = str(diagnostic.get("variant", "raw") or "raw")
+    is_compensated = variant == "compensated"
+    strain_values = diagnostic.get(
+        "eps_compensated" if is_compensated else "eps_raw"
+    )
+    if strain_values is None:
+        strain_values = diagnostic.get("eps_corr", [])
+    eps = np.asarray(strain_values, dtype=float)
+    strain_label = "补偿后应变" if is_compensated else "原始（补偿前）解耦应变"
+    count = min(
+        len(time_h),
+        len(dl1),
+        len(dl2),
+        len(d_temperature),
+        len(absolute_temperature),
+        len(eps),
+    )
+    if count < 3:
+        return b""
+    time_h = time_h[:count]
+    dl1 = dl1[:count]
+    dl2 = dl2[:count]
+    d_temperature = d_temperature[:count]
+    absolute_temperature = absolute_temperature[:count]
+    eps = eps[:count]
+    sensor_name = str(diagnostic.get("name", "?"))
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), squeeze=False)
+
+    ax = axes[0, 0]
+    ax.plot(time_h, dl1, lw=0.65, label="Δλ1")
+    ax.plot(time_h, dl2, lw=0.65, label="Δλ2")
+    ax.set_title("(a) 双栅波长漂移时程")
+    ax.set_xlabel("时间 (h)")
+    ax.set_ylabel("Δλ (pm)")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+    ax = axes[0, 1]
+    ax.plot(time_h, d_temperature, lw=0.65, color="#2980b9", label="ΔT")
+    ax.plot(time_h, absolute_temperature, lw=0.65, color="#7f8c8d", label="T")
+    ax.set_title("(b) 解耦温度")
+    ax.set_xlabel("时间 (h)")
+    ax.set_ylabel("温度 (°C)")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+    ax = axes[1, 0]
+    ax.plot(time_h, eps, lw=0.65, color="#27ae60")
+    ax.axhline(0.0, color="black", lw=0.6)
+    sigma = float(np.nanstd(eps))
+    ax.set_title(f"(c) {strain_label}时程：σ={sigma:.2f} με")
+    ax.set_xlabel("时间 (h)")
+    ax.set_ylabel("应变 (με)")
+    ax.grid(alpha=0.3)
+
+    ax = axes[1, 1]
+    finite_eps = eps[np.isfinite(eps)]
+    if len(finite_eps) > 0:
+        ax.hist(finite_eps, bins=min(50, max(10, int(np.sqrt(len(finite_eps))))),
+                color="#e67e22", alpha=0.8, edgecolor="white")
+        mean_value = float(np.mean(finite_eps))
+        ax.axvline(mean_value, color="#c0392b", lw=1.2, label=f"μ={mean_value:.2f}")
+        ax.axvline(mean_value - sigma, color="#7f8c8d", lw=0.8, ls="--")
+        ax.axvline(mean_value + sigma, color="#7f8c8d", lw=0.8, ls="--", label=f"σ={sigma:.2f}")
+    ax.set_title(f"(d) {strain_label}分布")
+    ax.set_xlabel("应变 (με)")
+    ax.set_ylabel("频数")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+
+    variant_title = "补偿后" if is_compensated else "原始（补偿前）"
+    fig.suptitle(
+        title or f"{sensor_name} — 阶段 B {variant_title}诊断四联图",
+        fontweight="bold",
+        fontsize=14,
+    )
+    fig.tight_layout()
+    return _figure_to_png_bytes(fig)
+
+
+def render_strain_calibration_curves(
+    reference: list[float],
+    curves: dict[str, list[float]],
+    *,
+    sensor: str,
+    source: str,
+) -> bytes:
+    """渲染单传感器应变标定曲线，并明确区分实测与旧配置拟合。"""
+    ref = np.asarray(reference, dtype=float)
+    if len(ref) < 3 or not curves:
+        return b""
+
+    fig, ax = plt.subplots(figsize=(8.5, 5))
+    plotted = 0
+    for index, (grating, values) in enumerate(sorted(curves.items())):
+        measured = np.asarray(values, dtype=float)
+        count = min(len(ref), len(measured))
+        x = ref[:count]
+        y = measured[:count]
+        finite = np.isfinite(x) & np.isfinite(y)
+        if int(finite.sum()) < 3:
+            continue
+        x = x[finite]
+        y = y[finite]
+        color = _COLORS[index % len(_COLORS)]
+        slope, intercept = np.polyfit(x, y, 1)
+        if source == "measured":
+            ax.scatter(x, y, s=25, alpha=0.7, color=color, label=f"{grating} 实测")
+            fit_x = np.linspace(float(np.min(x)), float(np.max(x)), 100)
+            ax.plot(
+                fit_x,
+                slope * fit_x + intercept,
+                lw=1.8,
+                color=color,
+                label=f"{grating} 拟合 k={slope:.4f} pm/με",
+            )
+        else:
+            ax.plot(
+                x,
+                y,
+                lw=2.0,
+                color=color,
+                marker="o",
+                ms=3,
+                label=f"{grating} Ke 拟合响应 k={slope:.4f} pm/με",
+            )
+        plotted += 1
+
+    if plotted == 0:
+        plt.close(fig)
+        return b""
+    source_note = (
+        "原始波长读数"
+        if source == "measured"
+        else "旧项目未保存原始波长读数；曲线由已保存 Ke 与理论应变计算"
+    )
+    ax.set_title(f"{sensor} — 应变标定曲线\n{source_note}", fontsize=11)
+    ax.set_xlabel("理论应变 (με)")
+    ax.set_ylabel("波长漂移 (pm)")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    return _figure_to_png_bytes(fig)
 
 
 def render_temp_regression(plateaus: pd.DataFrame, S_eff: dict,

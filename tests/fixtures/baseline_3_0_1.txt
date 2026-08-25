@@ -1,0 +1,14 @@
+Batch 3.0.1 Baseline — test collection before any code changes
+=============================================================
+Date: 2026-07-22
+Command: python -m pytest tests/test_runtime_l1_models.py tests/test_runtime_l2_subprocess.py --collect-only -q
+
+L1 (test_runtime_l1_models.py): 39 tests
+L2 (test_runtime_l2_subprocess.py): 15 tests
+Total: 54 tests
+
+Difference explanation vs "探索" numbers (L1:27, L2:17):
+- The "探索" count was from a different collection scope or filter.
+- Full collection confirms L1=39, L2=15 (matching previous round).
+- No tests were deleted or renamed between rounds.
+- Parameterization has not changed.

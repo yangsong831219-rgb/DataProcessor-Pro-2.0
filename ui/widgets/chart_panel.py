@@ -3,7 +3,7 @@
 每个 ChartPanel 封装:
   - matplotlib Figure + FigureCanvasQTAgg
   - 工具栏: mpl 原生 zoom/pan/home + 图表设置 + 全屏 + 保存
-  - 可全屏弹窗 (纯 reparent，零重绘)
+  - 可全屏弹窗 (深拷贝 Figure，零 reparent，零 Figure 共享)
   - 图表设置对话框 (标题/轴范围/标签/图例/线宽/网格/字号)
 """
 
@@ -32,17 +32,15 @@ from ui.components import create_button
 
 
 class _EscFilter(QObject):
-    """ESC 键事件过滤器"""
+    """ESC 键事件过滤器 — 全屏对话框: 一次 ESC 直接关闭 (非两步)"""
     def __init__(self, dialog, parent=None):
         super().__init__(parent)
         self._dlg = dialog
 
     def eventFilter(self, obj, event):
         if event.type() == event.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
-            if obj.isFullScreen():
-                obj.showNormal()
-            else:
-                obj.accept()
+            # 全屏 frameless 对话框只做全屏一件事，ESC 直接关闭
+            obj.accept()
             return True
         return False
 
@@ -137,7 +135,7 @@ class ChartSettingsDialog(QDialog):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ChartPanel — 纯 reparent 全屏 + 轻量增量刷新
+# ChartPanel — 深拷贝 Figure 全屏 + 轻量增量刷新
 # ═══════════════════════════════════════════════════════════════════════
 
 class ChartPanel(QWidget):
@@ -153,8 +151,6 @@ class ChartPanel(QWidget):
         self._canvas = FigureCanvasQTAgg(self._fig)
         self._show_fs_btn = show_fs_btn
         self._fullscreen_dialog = None
-        self._original_parent = None
-        self._original_layout_index = None
         self._build_ui()
 
     def _build_ui(self):
@@ -206,19 +202,40 @@ class ChartPanel(QWidget):
             self._canvas.draw_idle()  # 非阻塞
 
     def _enter_fullscreen(self):
-        """纯 reparent — 零绘制操作"""
+        """全屏 — 深拷贝 Figure 到新窗口 (零 reparent，零 Figure 共享)"""
         if self._fullscreen_dialog is not None:
             return
 
-        dlg = QDialog(self, Qt.WindowType.FramelessWindowHint)
+        dlg = QDialog(self.window(), Qt.WindowType.FramelessWindowHint)
         dlg.setStyleSheet("background-color: #1a1a1a;")
         self._fullscreen_dialog = dlg
-        layout = QVBoxLayout(dlg); layout.setContentsMargins(0,0,0,0)
+        layout = QVBoxLayout(dlg); layout.setContentsMargins(0, 0, 0, 0)
 
-        # 保存原始父容器
-        self._original_parent = self.parent()
-        self.setParent(dlg)
-        layout.addWidget(self)
+        # ★ 深拷贝 Figure: 避免 reparent 死锁 + 禁止 Figure 多 Canvas 共享
+        import io, pickle
+        try:
+            buf = io.BytesIO()
+            pickle.dump(self._fig, buf)
+            buf.seek(0)
+            new_fig = pickle.load(buf)
+        except Exception:
+            new_fig = None  # fallback to PNG bitmap below
+
+        if new_fig is not None:
+            new_canvas = FigureCanvasQTAgg(new_fig)
+            layout.addWidget(new_canvas)
+        else:
+            # 极低概率 fallback: 渲染为高分辨率 PNG 位图
+            buf = io.BytesIO()
+            self._fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+            buf.seek(0)
+            from PyQt6.QtGui import QPixmap
+            pixmap = QPixmap()
+            pixmap.loadFromData(buf.read())
+            label = QLabel()
+            label.setPixmap(pixmap)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(label)
 
         hint = QLabel("按 ESC 退出全屏")
         hint.setFixedHeight(28); hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -228,14 +245,9 @@ class ChartPanel(QWidget):
         esc = _EscFilter(dlg, dlg); dlg.installEventFilter(esc)
 
         def _on_closed():
-            layout.removeWidget(self); self.setParent(None)
             self._fullscreen_dialog = None
-            orig = self._original_parent
-            if orig and hasattr(orig, 'layout') and orig.layout():
-                orig.layout().addWidget(self)
-            self._original_parent = None
             self.fullscreen_closed.emit()
-            self._canvas.draw_idle()  # 轻量，不走 tight_layout
+            self._canvas.draw_idle()  # 强制重绘，清除全屏窗口覆盖区域的渲染残影
 
         dlg.finished.connect(_on_closed)
         dlg.showFullScreen()

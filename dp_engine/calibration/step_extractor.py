@@ -24,6 +24,57 @@ import numpy as np
 import pandas as pd
 
 
+def filter_plateaus_by_adjacent_jumps(
+    df: pd.DataFrame,
+    source_col: str,
+    plateaus: pd.DataFrame,
+    *,
+    jump_threshold_nm: Optional[float],
+    min_jump_count: int = 10,
+    delta_suffix: str = "_d",
+) -> tuple[pd.DataFrame, list[int], list[int]]:
+    """Keep only plateaus that are locally free of repeated discontinuities.
+
+    A temperature trace naturally changes rapidly between plateaus, so a
+    whole-file adjacent-jump count is not a valid reason to discard a grating.
+    This helper evaluates each *trimmed plateau* independently.  It returns
+    ``(usable_plateaus, excluded_positions, jump_counts)``; the positions are
+    relative to the supplied plateau table and are suitable for audit output.
+    """
+    if plateaus.empty or jump_threshold_nm is None or jump_threshold_nm <= 0.0:
+        return plateaus.copy(), [], [0] * len(plateaus)
+
+    value_col = source_col
+    scale_to_nm = 1.0
+    if value_col not in df.columns:
+        value_col = f"{source_col}{delta_suffix}"
+        scale_to_nm = 1.0 / 1000.0
+    if value_col not in df.columns:
+        return plateaus.copy(), [], [0] * len(plateaus)
+
+    source_values = pd.Series(df[value_col])
+    values = np.asarray(
+        pd.to_numeric(source_values, errors="coerce"), dtype=np.float64,
+    )
+    jumps = np.abs(np.diff(values) * scale_to_nm) > float(jump_threshold_nm)
+    counts: list[int] = []
+    excluded: list[int] = []
+    required_count = max(1, int(min_jump_count))
+    for position, row in enumerate(plateaus.itertuples(index=False)):
+        start = int(getattr(row, "idx_start"))
+        end = int(getattr(row, "idx_end"))
+        count = int(np.count_nonzero(jumps[start:max(start, end - 1)]))
+        counts.append(count)
+        if count >= required_count:
+            excluded.append(position)
+
+    excluded_set = set(excluded)
+    usable = plateaus.iloc[[
+        position for position in range(len(plateaus)) if position not in excluded_set
+    ]].copy()
+    return usable, excluded, counts
+
+
 def detect_plateaus(
     df: pd.DataFrame,
     wavelength_cols: list[str],
@@ -34,6 +85,8 @@ def detect_plateaus(
     head_trim_ratio: float = 0.70,
     proxy_cols: Optional[list[str]] = None,
     delta_suffix: str = "_d",
+    quality_jump_threshold_nm: Optional[float] = None,
+    min_serial_jump_count: int = 10,
 ) -> pd.DataFrame:
     """从连续波长数据中检测温度阶梯平台段。
 
@@ -82,6 +135,58 @@ def detect_plateaus(
         )
     proxy = proxy_series / len(proxy_names)
 
+    # dL is stored in pm whereas the user-facing serial-data threshold is nm.
+    # A rapid but monotonic temperature transition can exceed the threshold;
+    # it must not invalidate a whole grating.  Only repeated back-and-forth
+    # jumps are global serial evidence.  Individual plateau quality is checked
+    # later by ``filter_plateaus_by_adjacent_jumps`` before its regression.
+    proxy_columns_used = [
+        source_col for source_col, name in zip(proxy_cols, proxy_names)
+        if name in df.columns
+    ]
+    proxy_columns_rejected: dict[str, int] = {}
+    adjacent_jump_counts: dict[str, int] = {}
+    serial_reversal_counts: dict[str, int] = {}
+    if quality_jump_threshold_nm is not None and quality_jump_threshold_nm > 0.0:
+        jump_limit_pm = float(quality_jump_threshold_nm) * 1000.0
+        retained: list[np.ndarray] = []
+        retained_names: list[str] = []
+        for source_col, name in zip(proxy_cols, proxy_names):
+            if name not in df.columns:
+                continue
+            values = df[name].values.astype(np.float64)
+            diff = np.diff(values)
+            jumps = np.isfinite(diff) & (np.abs(diff) > jump_limit_pm)
+            adjacent_jump_counts[source_col] = int(np.count_nonzero(jumps))
+            reversals = jumps[:-1] & jumps[1:] & (diff[:-1] * diff[1:] < 0.0)
+            reversal_count = int(np.count_nonzero(reversals))
+            serial_reversal_counts[source_col] = reversal_count
+            # Alternating back-and-forth jumps are not a normal thermal
+            # trajectory.  Keep monotonic transitions in the median proxy.
+            if reversal_count >= max(1, int(min_serial_jump_count)):
+                proxy_columns_rejected[source_col] = reversal_count
+                continue
+            retained.append(values)
+            retained_names.append(source_col)
+        if retained:
+            proxy = np.nanmedian(np.vstack(retained), axis=0)
+            proxy_columns_used = retained_names
+        else:
+            proxy_columns_used = []
+
+    def _set_proxy_metadata(result: pd.DataFrame) -> pd.DataFrame:
+        result.attrs["proxy_columns_used"] = list(proxy_columns_used)
+        result.attrs["proxy_columns_rejected"] = dict(proxy_columns_rejected)
+        result.attrs["quality_jump_threshold_nm"] = quality_jump_threshold_nm
+        result.attrs["source_adjacent_jump_counts"] = dict(adjacent_jump_counts)
+        result.attrs["source_serial_reversal_counts"] = dict(serial_reversal_counts)
+        return result
+
+    if not proxy_columns_used:
+        return _set_proxy_metadata(pd.DataFrame(columns=[
+            "idx_start", "idx_end", "mid", "proxy",
+        ] + [f"{c}{delta_suffix}" for c in wavelength_cols]))
+
     # ── 滚动标准差 ──
     rstd = (
         pd.Series(proxy)
@@ -95,9 +200,9 @@ def detect_plateaus(
     # ── 稳定阈值 ──
     valid_std = rstd[~np.isnan(rstd)]
     if len(valid_std) == 0:
-        return pd.DataFrame(columns=[
+        return _set_proxy_metadata(pd.DataFrame(columns=[
             "idx_start", "idx_end", "mid", "proxy",
-        ] + [f"{c}{delta_suffix}" for c in wavelength_cols])
+        ] + [f"{c}{delta_suffix}" for c in wavelength_cols]))
     thr = np.percentile(valid_std, std_percentile)
     stable = rstd < thr
 
@@ -120,7 +225,9 @@ def detect_plateaus(
     dL_cols = [f"{c}{delta_suffix}" for c in wavelength_cols]
     rows = []
     for a, b in segments:
-        d = {"idx_start": a, "idx_end": b, "mid": (a + b) // 2}
+        d: dict[str, float | int] = {
+            "idx_start": a, "idx_end": b, "mid": (a + b) // 2,
+        }
         d["proxy"] = float(np.mean(proxy[a:b]))
         for dc in dL_cols:
             if dc in df.columns:
@@ -130,10 +237,10 @@ def detect_plateaus(
         rows.append(d)
 
     if not rows:
-        return pd.DataFrame(
+        return _set_proxy_metadata(pd.DataFrame(
             columns=["idx_start", "idx_end", "mid", "proxy"] + dL_cols
-        )
+        ))
 
-    P = pd.DataFrame(rows)
+    P = _set_proxy_metadata(pd.DataFrame(rows))
     print(f"  检测到稳定平台段: {len(P)} 个")
     return P

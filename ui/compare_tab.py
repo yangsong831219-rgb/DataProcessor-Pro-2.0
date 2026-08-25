@@ -1100,6 +1100,7 @@ class CompareTabWidget(QWidget):
           3. HTML 横向仪表盘呈报
         """
         if len(plot_bucket) < 2:
+            self._last_comparison = None
             self._comparison_result.setVisible(False)
             return
 
@@ -1112,6 +1113,7 @@ class CompareTabWidget(QWidget):
         # ── 3. 联合去空对齐 ──
         df_clean = df_zeroed.dropna(how='any')
         if df_clean.empty or len(df_clean) < 2:
+            self._last_comparison = None
             self._comparison_result.setHtml(
                 '<div style="color: #999; padding: 8px;">'
                 '有效重叠数据不足，无法计算对比指标</div>'
@@ -1181,12 +1183,26 @@ class CompareTabWidget(QWidget):
         for col_name in cols:
             device_features[str(col_name)] = compute_time_series_features(df_zeroed[col_name].dropna())
 
+        # 报告图表必须复用用户在多源对比页实际看到的对齐时程。
+        # 指标表使用首点归零值，图表则保留 UI 绘制的原序列，二者含义不同。
+        time_index = pd.to_datetime(plot_bucket[0][0])
+        elapsed_h = (
+            np.asarray((time_index - time_index[0]).total_seconds(), dtype=float)
+            / 3600.0
+        )
+        chart_sources = {
+            str(label): np.asarray(values, dtype=float).tolist()
+            for _, values, label in plot_bucket
+        }
+
         self._last_comparison = {
             'pairs': pair_results,
             'device_features': device_features,
             'baseline_method': '窗口首点归零',
             'align_method': '绝对时间插值 (numpy.interp)',
             'n_points': int(len(df_clean)),
+            'time_h': elapsed_h.tolist(),
+            'sources': chart_sources,
         }
 
         self._comparison_result.setHtml(html)

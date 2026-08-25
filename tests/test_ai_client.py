@@ -818,3 +818,232 @@ class TestSchemaRoundtrip:
         d = report.to_builder_dict()
         assert d["title"] == "PPT"
         assert d["slides"][0]["slide_title"] == "Slide 1"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Batch 3.6.6 Scenario A — Structured JSON extraction & fence handling
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestJsonFenceExtraction:
+    """Deterministic fence unwrap — only complete fences, no guesswork."""
+
+    def test_valid_raw_json_passes(self, monkeypatch):
+        """Plain JSON without fences → PASS."""
+        from core.ai_client import AIClient
+        from core.report_models import WordSection
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        valid = '{"heading": "H", "paragraphs": ["p"], "image_anchors": []}'
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: valid)
+        result = client.generate_structured("test", WordSection, max_schema_retries=0)
+        assert result["heading"] == "H"
+
+    def test_valid_fenced_json_unwrapped(self, monkeypatch):
+        """Complete ```json ... ``` fence → deterministic unwrap → PASS."""
+        from core.ai_client import AIClient
+        from core.report_models import WordSection
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        valid = '{"heading": "H", "paragraphs": ["p"], "image_anchors": []}'
+        fenced = f'```json\n{valid}\n```'
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: fenced)
+        result = client.generate_structured("test", WordSection, max_schema_retries=0)
+        assert result["heading"] == "H"
+
+    def test_incomplete_opening_fence_stripped(self, monkeypatch):
+        """Opening ```json without closing ``` → stripped, JSON parsed."""
+        from core.ai_client import AIClient
+        from core.report_models import WordSection
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        valid = '{"heading": "H", "paragraphs": ["p"], "image_anchors": []}'
+        incomplete = f'```json\n{valid}'  # no closing ```
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: incomplete)
+        result = client.generate_structured("test", WordSection, max_schema_retries=0)
+        assert result["heading"] == "H"
+
+    def test_malformed_json_with_shell_text_fails(self, monkeypatch):
+        """'slides': python main.py — must FAIL, no heuristic repair."""
+        from core.ai_client import AIClient
+        from core.report_models import PPTSlide
+        from core.ai_errors import ReportSchemaError
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        # Simulates the real DeepSeek malformed output
+        malformed = (
+            '```json\n'
+            '{\n'
+            '  "slide_title": "Test",\n'
+            '  "bullet_points": python main.py "slide_id": "s1"\n'
+            '}'
+        )
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: malformed)
+        with pytest.raises(ReportSchemaError):
+            client.generate_structured("write slide", PPTSlide, max_schema_retries=0)
+
+    def test_prose_before_json_not_guessed(self, monkeypatch):
+        """Prose + JSON mixed — must NOT guess JSON fragment, must FAIL."""
+        from core.ai_client import AIClient
+        from core.report_models import WordSection
+        from core.ai_errors import ReportSchemaError
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        mixed = (
+            "Here is the report outline:\n"
+            '{"heading": "H", "paragraphs": ["p"], "image_anchors": []}'
+        )
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: mixed)
+        # 内容不以 { 开头 → 不会被当作 JSON 解析 → 必然失败
+        with pytest.raises(ReportSchemaError):
+            client.generate_structured("test", WordSection, max_schema_retries=0)
+
+    def test_corrective_retry_first_malformed_then_valid(self, monkeypatch):
+        """First response malformed → retry → second valid → PASS."""
+        from core.ai_client import AIClient
+        from core.report_models import WordSection
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        calls = [0]
+        responses = [
+            'not json at all',  # first attempt fails
+            '{"heading": "H", "paragraphs": ["p"], "image_anchors": []}',  # retry succeeds
+        ]
+
+        def fake_gen(**kw):
+            r = responses[calls[0]]
+            calls[0] += 1
+            return r
+
+        monkeypatch.setattr(client, "generate", fake_gen)
+        result = client.generate_structured("test", WordSection, max_schema_retries=1)
+        assert result["heading"] == "H"
+        assert calls[0] == 2
+
+    def test_retry_exhaustion_with_malformed_raises_schema_error(self, monkeypatch):
+        """Both attempts malformed → ReportSchemaError, state preserved."""
+        from core.ai_client import AIClient
+        from core.report_models import WordSection
+        from core.ai_errors import ReportSchemaError
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: "not valid json")
+        with pytest.raises(ReportSchemaError, match="回馈"):
+            client.generate_structured("test", WordSection, max_schema_retries=1)
+
+    def test_schema_invalid_json_distinct_from_malformed(self, monkeypatch):
+        """Valid JSON parse but wrong types → classified as schema failure, NOT syntax."""
+        from core.ai_client import AIClient
+        from core.report_models import WordSection
+        from core.ai_errors import ReportSchemaError
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        # Valid JSON but string where int expected would fail at Pydantic level
+        # Here: missing required field 'heading'
+        valid_json_missing_field = '{"paragraphs": ["p"], "image_anchors": []}'
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: valid_json_missing_field)
+        with pytest.raises(ReportSchemaError) as exc_info:
+            client.generate_structured("test", WordSection, max_schema_retries=0)
+        assert len(exc_info.value.missing_fields) > 0
+
+
+class TestGenerateStructuredSlideIntent:
+    """End-to-end structured generation for SlideIntentPlan-sized schema."""
+
+    def test_large_schema_fenced_valid_json_passes(self, monkeypatch):
+        """SlideIntentPlan with fence → deterministic unwrap → PASS."""
+        from core.ai_client import AIClient
+        from pydantic import BaseModel, Field
+        from typing import Literal
+
+        # Minimal slide-intent-like schema for test
+        class _TestSlide(BaseModel):
+            slide_id: str
+            section_id: str
+            sequence: int
+            title: str
+            message: str
+            layout: Literal["title", "data_focus", "conclusion"] = "data_focus"
+            content_points: list[str] = Field(min_length=1, max_length=5)
+            asset_ids: list[str] = Field(default_factory=list)
+            visual_brief: str
+            speaker_notes_intent: str = ""
+
+        class _TestSlidePlan(BaseModel):
+            deck_title: str
+            slides: list[_TestSlide]
+
+        client = object.__new__(AIClient)
+        object.__setattr__(client, "_initialized", False)
+        AIClient.__init__(client, api_key="sk-test")
+
+        valid = json.dumps({
+            "deck_title": "Test Deck",
+            "slides": [
+                {
+                    "slide_id": "s01",
+                    "section_id": "sec_intro",
+                    "sequence": 1,
+                    "title": "Intro",
+                    "message": "Opening context",
+                    "layout": "title",
+                    "content_points": ["Overview"],
+                    "asset_ids": [],
+                    "visual_brief": "Title slide with branding",
+                    "speaker_notes_intent": "Welcome and set expectations",
+                },
+                {
+                    "slide_id": "s02",
+                    "section_id": "sec_data",
+                    "sequence": 2,
+                    "title": "Data",
+                    "message": "Key findings",
+                    "layout": "data_focus",
+                    "content_points": ["Point 1", "Point 2"],
+                    "asset_ids": ["chart_01"],
+                    "visual_brief": "Chart with annotations",
+                },
+                {
+                    "slide_id": "s03",
+                    "section_id": "sec_conclusion",
+                    "sequence": 3,
+                    "title": "Conclusion",
+                    "message": "Summary",
+                    "layout": "conclusion",
+                    "content_points": ["Takeaway"],
+                    "asset_ids": [],
+                    "visual_brief": "Clean summary slide",
+                },
+            ],
+        })
+        fenced = f'```json\n{valid}\n```'
+        monkeypatch.setattr(client, "generate", lambda *a, **kw: fenced)
+        result = client.generate_structured(
+            "slide plan", _TestSlidePlan, max_schema_retries=0
+        )
+        assert result["deck_title"] == "Test Deck"
+        assert len(result["slides"]) == 3

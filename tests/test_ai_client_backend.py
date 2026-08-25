@@ -214,6 +214,96 @@ class TestBackendRouting:
         assert client.is_available() is False
 
 
+class TestThinkingModeRouting:
+    """不同 OpenAI 兼容后端必须收到各自支持的思考模式开关。"""
+
+    def test_online_deepseek_generate_explicitly_disables_thinking(self, monkeypatch):
+        """DeepSeek V4 默认开启思考；报告路径必须显式发送 disabled。"""
+        import types
+
+        _patch_config(monkeypatch, {"_backend": "online"})
+        client = _fresh_client(monkeypatch)
+        _init_client(
+            client,
+            monkeypatch,
+            api_key="sk-test",
+            base_url="https://api.deepseek.com/v1",
+            model_name="deepseek-v4-pro",
+        )
+        captured: dict = {}
+
+        class FakeMessage:
+            content = '{"ok": true}'
+            reasoning_content = ""
+
+        class FakeChoice:
+            message = FakeMessage()
+            finish_reason = "stop"
+
+        class FakeResponse:
+            choices = [FakeChoice()]
+
+        class FakeCompletions:
+            @staticmethod
+            def create(**kwargs):
+                captured.update(kwargs)
+                return FakeResponse()
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs):
+                self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+        fake_mod = types.ModuleType("openai")
+        setattr(fake_mod, "OpenAI", FakeOpenAI)
+        monkeypatch.setitem(sys.modules, "openai", fake_mod)
+
+        assert client.generate("return json", enable_thinking=False) == '{"ok": true}'
+        assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+
+    def test_non_deepseek_online_endpoint_gets_no_vendor_extension(self, monkeypatch):
+        """不得把 DeepSeek 私有参数发送给其它 OpenAI 兼容服务。"""
+        import types
+
+        _patch_config(monkeypatch, {"_backend": "online"})
+        client = _fresh_client(monkeypatch)
+        _init_client(
+            client,
+            monkeypatch,
+            api_key="sk-test",
+            base_url="https://example.invalid/v1",
+            model_name="generic-model",
+        )
+        captured: dict = {}
+
+        class FakeMessage:
+            content = "ok"
+            reasoning_content = ""
+
+        class FakeChoice:
+            message = FakeMessage()
+            finish_reason = "stop"
+
+        class FakeResponse:
+            choices = [FakeChoice()]
+
+        class FakeCompletions:
+            @staticmethod
+            def create(**kwargs):
+                captured.update(kwargs)
+                return FakeResponse()
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs):
+                self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+        fake_mod = types.ModuleType("openai")
+        setattr(fake_mod, "OpenAI", FakeOpenAI)
+        monkeypatch.setitem(sys.modules, "openai", fake_mod)
+
+        assert client.generate("hello", enable_thinking=False) == "ok"
+        assert "extra_body" not in captured
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Test 2: 健康检查
 # ═══════════════════════════════════════════════════════════════════════

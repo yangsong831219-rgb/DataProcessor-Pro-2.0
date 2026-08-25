@@ -18,6 +18,10 @@ ai_models_config.json
 # Claude Code
 .claude/
 
+# Local Codex / agent state (may contain credentials)
+/.codex/
+/.tmp/
+
 # CodeGraph
 .codegraph/
 
@@ -26,6 +30,18 @@ ai_models_config.json
 
 # Temp screenshots
 screenshot_temp.png
+/screenshot_*.png
+
+# Local build, acceptance and generated-output artifacts
+/build_temp/
+/outputs/
+/work/
+/tests/.artifacts/
+/.pytest_cache/
+/readings_profiles/
+/报告/
+/项目资料库/
+/C*UsersAdministratorAppDataLocalTemp*.txt
 
 # OS files
 Thumbs.db

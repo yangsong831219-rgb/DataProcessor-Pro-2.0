@@ -352,17 +352,34 @@ class TestCalibrationTabUI:
             assert si and "✓" in (si.text() or ""), f"第 {i} 行校验列应为 ✓"
         dlg.close()
 
-    def test_paste_selected_state_multi_row(self, qtbot):
+    def test_paste_selected_state_multi_row(self, qapp):
         """选中态 Ctrl+V → 多行分发 (Excel-like)"""
         from ui.calibration_tab import PhaseADialog
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtWidgets import QWidget
+        from PyQt6.QtCore import QPoint
+        from collections.abc import Callable
+        from typing import cast
         import pandas as pd
+
+        _qwait = cast(Callable[[int], None], getattr(QTest, "qWait"))
+        _mouse_click = cast(
+            Callable[[QWidget, Qt.MouseButton, Qt.KeyboardModifier, QPoint], None],
+            getattr(QTest, "mouseClick"),
+        )
+        _key_click = cast(
+            Callable[[QWidget, Qt.Key, Qt.KeyboardModifier], None],
+            getattr(QTest, "keyClick"),
+        )
+
         df = pd.DataFrame({f"ch{i}": [1550.0] for i in range(1, 9)})
         dlg = PhaseADialog(df,
             {f"ch{i}": f"w{i}-类型-位置" for i in range(1, 9)},
             {}, {"hold_time_min": 6.0, "sample_interval_s": 2.0, "rolling_window": 25,
                  "std_percentile": 45.0, "min_plateau_samples": 50, "head_trim_ratio": 0.70}, None)
         dlg.show()
-        qtbot.waitExposed(dlg)
+        QApplication.processEvents()
+        _qwait(100)
 
         tbl = dlg.fill_table
         QApplication.clipboard().setText(
@@ -370,14 +387,17 @@ class TestCalibrationTabUI:
         )
         # 单击选中 (不进入编辑态)
         cell_rect = tbl.visualRect(tbl.model().index(0, 2))
-        qtbot.mouseClick(tbl.viewport(), Qt.MouseButton.LeftButton, pos=cell_rect.center())
-        qtbot.wait(100)
+        viewport = tbl.viewport()
+        assert viewport is not None
+        _mouse_click(viewport, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier, cell_rect.center())
+        _qwait(100)
         # 关键断言: 点击后不是编辑态 (NoEditTriggers + 单击 = select only)
         assert tbl.state().value != 2, f"select-only click should not enter EditState"
 
         # Ctrl+V → 表级拦截, 多行分发
-        qtbot.keySequence(tbl, "Ctrl+V")
-        qtbot.wait(100)
+        _key_click(tbl, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+        _qwait(100)
 
         expected = ["A1-W1","A1-W2","A2-W1","A2-W2","B1-W1","B1-W2","B2-W1","B2-W2"]
         for i, exp in enumerate(expected):

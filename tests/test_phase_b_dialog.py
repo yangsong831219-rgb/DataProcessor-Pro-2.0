@@ -114,6 +114,68 @@ def test_phase_b_decouple_per_sensor(qapp, sample_df, phase_a_result):
     assert sensors["A1"]["S2"] > 0
 
 
+def test_phase_b_worker_materializes_raw_and_compensated_diagnostic_series(
+    qapp, sample_df, phase_a_result, monkeypatch
+):
+    """补偿应用必须在 worker 内完成，并随瞬态结果供诊断记录消费。"""
+    from ui import calibration_tab
+    from utils.apparent_strain_comp import ApparentStrainLUT, CompensationModel
+
+    model = CompensationModel(
+        form="lut",
+        model=ApparentStrainLUT(
+            sensor="A1",
+            T_base=10.0,
+            T_grid=[-1_000_000.0, 1_000_000.0],
+            eps_app=[5.0, 5.0],
+            T_min=-1_000_000.0,
+            T_max=1_000_000.0,
+            n_cycles=1,
+            source="test",
+        ),
+    )
+
+    def fake_pipeline(sensors, fs_map, **kwargs):
+        return {
+            name: {"model": model, "metrics": None, "grade": None}
+            for name, sensor in sensors.items()
+            if not sensor.get("single_grating", False)
+        }
+
+    monkeypatch.setattr(
+        calibration_tab,
+        "_run_compensation_pipeline_static",
+        fake_pipeline,
+    )
+    groups = {
+        "A1": [
+            {"col_name": "A1-W1", "name": "A1-W1"},
+            {"col_name": "A1-W2", "name": "A1-W2"},
+        ],
+    }
+    time_h = np.arange(len(sample_df)) * 2.0 / 3600.0
+    worker = calibration_tab.PhaseBWorker(
+        sample_df,
+        time_h,
+        ["A1-W1", "A1-W2"],
+        groups,
+        phase_a_result["S_eff"],
+        {"A1": {"Ke1": 1.2, "Ke2": 1.2}},
+        2.0,
+    )
+
+    worker.run()
+
+    result = worker._last_result
+    assert result is not None
+    raw = np.asarray(result["diagnostic_series"]["A1"]["eps_raw"])
+    compensated = np.asarray(
+        result["diagnostic_series"]["A1"]["eps_compensated"]
+    )
+    assert raw == pytest.approx(result["sensors"]["A1"]["eps_corr"])
+    assert compensated == pytest.approx(raw - 5.0)
+
+
 def test_phase_b_handles_single_grating(qapp, sample_df, phase_a_result):
     """单栅传感器跳过解耦但不崩溃"""
     phase_a_result["df"] = sample_df
@@ -214,7 +276,7 @@ def test_full_temp_calibration_roundtrip_smoke(qapp):
 
 
 def test_phase_b_result_table(qapp, sample_df, phase_a_result):
-    """Phase B 解耦结果表格 — 4行10列 + 评级着色 + 单栅占位符"""
+    """Phase B 解耦结果表格 — 4行12列 + 评级着色 + 单栅占位符"""
     from ui.calibration_tab import PhaseBDialog
     np.random.seed(42)
     # 构造 4 传感器解耦结果 (模拟 Phase B worker 输出)
@@ -246,13 +308,14 @@ def test_phase_b_result_table(qapp, sample_df, phase_a_result):
     # 填入 Ke 系数
     dlg._coeffs = {"A1": {"Ke1": 1.2, "Ke2": 1.2}, "A2": {"Ke1": 0.8, "Ke2": 1.1},
                    "B1": {"Ke1": 0.7, "Ke2": 1.1}, "B2": {"Ke1": 0.8, "Ke2": 1.1}}
-    dlg._on_done(result)
+    dlg._last_result = result
+    dlg._render_result_table(sensors, dlg._phase_a_result.get("S_eff", {}))
     QApplication.processEvents()
 
     tbl = dlg.result_table
     tbl.setSortingEnabled(False)  # disable sorting for stable indexing
     assert tbl.rowCount() == 4, f"expected 4 rows, got {tbl.rowCount()}"
-    assert tbl.columnCount() == 10, f"expected 10 cols, got {tbl.columnCount()}"
+    assert tbl.columnCount() == 12, f"expected 12 cols, got {tbl.columnCount()}"
 
     # Build row_map by sensor name (dict iteration order may vary)
     row_map = {}
@@ -264,7 +327,9 @@ def test_phase_b_result_table(qapp, sample_df, phase_a_result):
 
     # Rating verification (compensation pipeline runs in _on_done; monotonic data → NaN hys → capped at liang)
     for i in range(tbl.rowCount()):
-        rating = tbl.item(i, 9).text()
+        rating_item = tbl.item(i, 11)
+        assert rating_item is not None
+        rating = rating_item.text()
         assert rating != "FAIL", f"row {i}: expected not FAIL, got {rating}"
         assert rating != "ERROR", f"row {i}: expected not ERROR, got {rating}"
 
@@ -276,7 +341,7 @@ def test_phase_b_result_table(qapp, sample_df, phase_a_result):
 # ═══════════════════════════════════════════════════════════════════════
 
 def test_ensure_decoupled_result_lazy_decouple(qapp, sample_df, phase_a_result):
-    """_last_result=None → 惰性解耦触发 → 返回 sensors + 跑补偿流水线"""
+    """_last_result=None → _ensure_decoupled_result 返回 None (主线程禁止重算)"""
     from ui.calibration_tab import PhaseBDialog
 
     dlg = PhaseBDialog(sample_df,
@@ -287,12 +352,8 @@ def test_ensure_decoupled_result_lazy_decouple(qapp, sample_df, phase_a_result):
     dlg._coeffs = {"A1": {"Ke1": 1.2, "Ke2": 1.2}}
     assert dlg._last_result is None
 
-    sensors = dlg._ensure_decoupled_result()
-    assert sensors is not None, "should lazy-decouple"
-    assert "A1" in sensors
-    assert dlg._last_result is not None
-    assert getattr(dlg, '_compensation_results', None) is not None, \
-        "compensation pipeline should run after lazy decouple"
+    sensors = dlg._ensure_decoupled_result(show_warning=False)
+    assert sensors is None, "should return None — heavy compute only in PhaseBWorker"
     dlg.close()
 
 
@@ -359,7 +420,9 @@ def test_render_result_table_high_hysteresis_shows_fail(qapp, sample_df, phase_a
         {"S_eff": {"B2-W1": {"slope": 41.0, "T_base": 25.0},
                     "B2-W2": {"slope": 30.0, "T_base": 25.0}}})
     dlg._coeffs = {"B2": {"Ke1": 0.8, "Ke2": 1.1}}
-    dlg._compensation_results = dlg._run_compensation_pipeline(sensors)
+    from ui.calibration_tab import _run_compensation_pipeline_static
+    dlg._compensation_results = _run_compensation_pipeline_static(
+        sensors, fs_map={"B2": 1000})
     dlg._render_result_table(sensors, phase_a_result.get("S_eff", {}),
                               compensation=dlg._compensation_results)
     QApplication.processEvents()
@@ -368,10 +431,16 @@ def test_render_result_table_high_hysteresis_shows_fail(qapp, sample_df, phase_a
     assert tbl.rowCount() >= 1
     found = False
     for i in range(tbl.rowCount()):
-        if tbl.item(i, 0).text() == "B2":
-            rating = tbl.item(i, 9).text()
+        sensor_item = tbl.item(i, 0)
+        assert sensor_item is not None
+        if sensor_item.text() == "B2":
+            rating_item = tbl.item(i, 11)
+            assert rating_item is not None
+            rating = rating_item.text()
             assert rating == "FAIL", f"expected FAIL, got {rating}"
-            bg = tbl.item(i, 9).background().color().name()
+            bg_item = tbl.item(i, 11)
+            assert bg_item is not None
+            bg = bg_item.background().color().name()
             assert bg == "#ffcdd2", f"expected red bg #ffcdd2, got {bg}"
             found = True
             break
@@ -399,7 +468,9 @@ def test_render_result_table_shows_real_std(qapp, sample_df, phase_a_result):
         {"S_eff": {"A1-W1": {"slope": 27.8, "T_base": 25.0},
                     "A1-W2": {"slope": 29.4, "T_base": 25.0}}})
     dlg._coeffs = {"A1": {"Ke1": 1.2, "Ke2": 1.2}}
-    dlg._compensation_results = dlg._run_compensation_pipeline(sensors)
+    from ui.calibration_tab import _run_compensation_pipeline_static
+    dlg._compensation_results = _run_compensation_pipeline_static(
+        sensors, fs_map={"A1": 1000})
     dlg._render_result_table(sensors, phase_a_result.get("S_eff", {}),
                               compensation=dlg._compensation_results)
     QApplication.processEvents()

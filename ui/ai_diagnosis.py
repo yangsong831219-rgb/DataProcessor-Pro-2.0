@@ -1119,7 +1119,7 @@ class AiDiagnosisWidget(QWidget):
     def _build_diagnosis_record(self) -> dict:
         """构建稳定 schema 的诊断记录（与 ③c 报告引擎的契约）。
 
-        schema_version 1.1: 支持 ai_diagnosis 与 multi_agent 双段。
+        schema_version 1.2: 支持 ai_diagnosis、multi_agent 与 chart_data。
         """
         from datetime import datetime
         from core.ai_client import AIClient
@@ -1160,14 +1160,19 @@ class AiDiagnosisWidget(QWidget):
             print(f"[DIAG] _build_diagnosis_record ChartBundle.from_providers: "
                   f"series={len(bundle.series)}, time_h={len(bundle.time_h)}, "
                   f"phys_series_n={len(bundle.phys_series)}, "
-                  f"series_delta_n={len(bundle.series_delta)}, "
-                  f"calib_sensors_n={len(bundle.calib_sensors)}, "
-                  f"tables(grade={bool(bundle.grade_table_md)},"
-                  f"anomaly={bool(bundle.anomaly_table_md)},"
+                   f"series_delta_n={len(bundle.series_delta)}, "
+                   f"calib_sensors_n={len(bundle.calib_sensors)}, "
+                   f"temp_regressions_n={len(bundle.temp_regressions)}, "
+                   f"phaseb_diagnostics_n={len(bundle.phaseb_diagnostics)}, "
+                   f"tables(grade={bool(bundle.grade_table_md)},"
+                   f"cleaning={bool(bundle.cleaning_table_md)},"
+                   f"anomaly={bool(bundle.anomaly_table_md)},"
                   f"ke={bool(bundle.ke_table_md)},"
                   f"dec={bool(bundle.decoupling_table_md)})")
             if (bundle.series or bundle.compare_sources or bundle.calib_sensors
                     or bundle.phys_series or bundle.series_delta
+                    or bundle.temp_regressions or bundle.phaseb_diagnostics
+                    or bundle.cleaning_table_md
                     or bundle.grade_table_md or bundle.anomaly_table_md
                     or bundle.ke_table_md or bundle.decoupling_table_md):
                 rec["chart_data"] = bundle.to_dict()
@@ -3085,7 +3090,7 @@ class AiDiagnosisWidget(QWidget):
                 self._render_markdown_blocks_to_docx(doc, advisory)
                 doc.add_paragraph()
 
-        # ── 数据汇总附表 (从 chart_data 提取四张结构化表) ──
+        # ── 数据汇总附表 (从 chart_data 提取全部结构化表) ──
         try:
             from core.chart_bundle import extract_four_tables
             cd = rec.get('chart_data', {}) or {}

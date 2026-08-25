@@ -13,11 +13,12 @@ import io
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 from .models import WordReport, WordSection, WordTable
@@ -70,6 +71,18 @@ def _is_md_table_sep_cell(cell: str) -> bool:
     return bool(re.match(r'^:?-{2,}:?$', cell.strip()))
 
 
+def _set_table_pagination(table, *, repeat_header: bool) -> None:
+    """禁止单行跨页拆分，并让表头在续页重复。"""
+    for row in table.rows:
+        tr_pr = row._tr.get_or_add_trPr()
+        if tr_pr.find(qn("w:cantSplit")) is None:
+            tr_pr.append(OxmlElement("w:cantSplit"))
+    if repeat_header and table.rows:
+        header_pr = table.rows[0]._tr.get_or_add_trPr()
+        if header_pr.find(qn("w:tblHeader")) is None:
+            header_pr.append(OxmlElement("w:tblHeader"))
+
+
 def _extract_md_tables(text: str) -> list[tuple[int, int, list[list[str]]]]:
     """提取 markdown 表格块 (start_pos, end_pos, rows)。含粗体/多列/全角标点。"""
     results = []
@@ -99,11 +112,20 @@ def _extract_md_tables(text: str) -> list[tuple[int, int, list[list[str]]]]:
     return results
 
 def _render_latex_display(doc, expr: str) -> None:
-    """渲染 display LaTeX 公式为居中图片。"""
+    """渲染 display LaTeX；复杂环境降级为可读原生文本而非源码图片。"""
+    if _requires_complex_latex_fallback(expr):
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run(_latex_complex_to_unicode(expr))
+        run.font.name = "Cambria Math"
+        run.font.size = Pt(11)
+        return
+
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import io as _io
+    fig = None
     try:
         fig, ax = plt.subplots(figsize=(6, 0.6))
         ax.text(0.5, 0.5, f'${expr}$', transform=ax.transAxes,
@@ -111,14 +133,68 @@ def _render_latex_display(doc, expr: str) -> None:
         ax.axis('off')
         buf = _io.BytesIO()
         fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
-        plt.close(fig)
         buf.seek(0)
         p = doc.add_paragraph()
         run = p.add_run()
         run.add_picture(buf, width=Inches(4))
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     except Exception:
-        doc.add_paragraph(f'[公式: {expr}]')
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run(_latex_complex_to_unicode(expr))
+        run.font.name = "Cambria Math"
+        run.font.size = Pt(11)
+    finally:
+        if fig is not None:
+            plt.close(fig)
+
+
+def _requires_complex_latex_fallback(expr: str) -> bool:
+    """Matplotlib mathtext 不支持 LaTeX 环境；预先拦截避免把源码画进 PNG。"""
+    return bool(re.search(r'\\(?:begin|end)\s*\{', expr))
+
+
+def _replace_latex_environment(expr: str, environment: str, *, cases: bool = False) -> str:
+    pattern = re.compile(
+        rf'\\begin\{{{environment}\}}(.*?)\\end\{{{environment}\}}',
+        re.DOTALL,
+    )
+
+    def _replace(match: re.Match[str]) -> str:
+        rows = [
+            row.strip()
+            for row in re.split(r'\\\\', match.group(1))
+            if row.strip()
+        ]
+        rendered_rows: list[str] = []
+        for row in rows:
+            cells = [
+                _latex_inline_to_unicode(cell.strip())
+                for cell in row.split('&')
+                if cell.strip()
+            ]
+            rendered_rows.append("，".join(cells))
+        if cases:
+            return "⎧ " + "； ".join(rendered_rows)
+        return "[" + "； ".join(rendered_rows) + "]"
+
+    return pattern.sub(_replace, expr)
+
+
+def _latex_complex_to_unicode(expr: str) -> str:
+    """把常见矩阵/cases 环境转为紧凑且无反斜杠源码的可读表达式。"""
+    result = expr.strip()
+    for environment in ("bmatrix", "pmatrix", "matrix", "vmatrix", "Vmatrix"):
+        result = _replace_latex_environment(result, environment)
+    result = _replace_latex_environment(result, "cases", cases=True)
+    result = result.replace(r'\left', '').replace(r'\right', '')
+    result = result.replace(r'^{-1}', '⁻¹').replace(r'^-1', '⁻¹')
+    result = result.replace(r'\\', '； ')
+    result = _latex_inline_to_unicode(result)
+    # 未识别命令只去掉控制反斜杠，保证不会再次暴露原始 LaTeX 源码。
+    result = re.sub(r'\\([A-Za-z]+)', r'\1', result)
+    result = result.replace('\\', '')
+    return re.sub(r'\s+', ' ', result).strip()
 
 
 def _latex_inline_to_unicode(expr: str) -> str:
@@ -138,6 +214,21 @@ def _latex_inline_to_unicode(expr: str) -> str:
         '^T': 'ᵀ', r'^\circ': '°', r'\degree': '°',
     }
     result = expr.strip()
+    # 先处理带花括号结构，再做通用花括号清理。
+    fraction_pattern = re.compile(r'\\frac\{([^{}]*)\}\{([^{}]*)\}')
+    while fraction_pattern.search(result):
+        result = fraction_pattern.sub(r'(\1)/(\2)', result)
+    result = re.sub(r'\\sqrt(?:\[[^\]]*\])?\{([^{}]*)\}', r'√(\1)', result)
+    result = re.sub(r'\\text\{([^{}]*)\}', r'\1', result)
+    result = re.sub(
+        r'_\{([0-9A-Za-z]+)\}',
+        lambda m: ''.join({
+            '0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉',
+            'a':'ₐ','e':'ₑ','i':'ᵢ','o':'ₒ','u':'ᵤ','x':'ₓ','s':'ₛ','t':'ₜ','n':'ₙ',
+            'm':'ₘ','k':'ₖ','p':'ₚ','r':'ᵣ',
+        }.get(char, char) for char in m.group(1)),
+        result,
+    )
     # 处理下标 _x → Unicode subscript
     result = re.sub(r'_(\w)', lambda m: {
         '0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉',
@@ -156,9 +247,6 @@ def _latex_inline_to_unicode(expr: str) -> str:
         result = result.replace(k, v)
     # 剥掉花括号
     result = result.replace('{', '').replace('}', '')
-    # 清理裸 \\frac... → "[分数]"
-    result = re.sub(r'\\frac\{[^}]*\}\{[^}]*\}', '[分数]', result)
-    result = re.sub(r'\\sqrt(\[.*?\])?\{([^}]*)\}', r'√(\2)', result)
     return result
 
 
@@ -223,6 +311,7 @@ def _render_md_table_as_word(doc, rows):
                 run = p.add_run(part)
                 if ri == 0 or pi % 2 == 1:
                     run.bold = True
+    _set_table_pagination(tbl, repeat_header=True)
     doc.add_paragraph()
 
 
@@ -469,6 +558,7 @@ class WordBuilder:
                 cell.text = ''  # clear
                 p = cell.paragraphs[0]
                 self._add_md_runs(p, str(val) if val is not None else '')
+        _set_table_pagination(tbl, repeat_header=bool(table.headers))
 
     # ── 段落 + 内联图片 (保留，_add_rich_paragraph 的降级路径) ──
 
@@ -562,10 +652,22 @@ class WordBuilder:
         template_path: str,
         output_path: str,
         project_dir: str = '',
+        *,
+        bridge_workspace: Path | None = None,
+        bridge_assets: tuple = (),
+        cancel_check: Callable[[], None] | None = None,
     ) -> str:
         # 1. Load template
-        doc = Document(template_path) if template_path else Document()
-        self._apply_styles(doc)
+        has_template = bool(template_path and Path(template_path).is_file())
+        doc = Document(template_path) if has_template else Document()
+        # 模板准备器已保留并标准化模板样式、页边距和页眉页脚。仅在没有模板时
+        # 应用程序默认样式，避免把用户模板重新覆盖成固定微软雅黑/2.54cm 页边距。
+        if not has_template:
+            self._apply_styles(doc)
+
+        # Cancel checkpoint: before builder
+        if cancel_check is not None:
+            cancel_check()
 
         # 2. Template placeholder replacement
         self._replace_placeholders(doc, report_data)
@@ -575,9 +677,29 @@ class WordBuilder:
 
         # 4. Sections
         for section in report_data.sections:
+            # Cancel checkpoint: before each section
+            if cancel_check is not None:
+                cancel_check()
             self._add_section(doc, section, project_dir=project_dir)
 
-        # 5. Save
+        # 5. Bridge appendix (deterministic, after LLM content, before save)
+        if bridge_workspace is not None and bridge_assets:
+            from dp_engine.report_bridge.adapters import (
+                validate_bridge_assets_for_word,
+                append_bridge_assets_to_word,
+            )
+            # Cancel checkpoint: before bridge appendix
+            if cancel_check is not None:
+                cancel_check()
+            validate_bridge_assets_for_word(bridge_workspace, bridge_assets)
+            append_bridge_assets_to_word(
+                doc,
+                bridge_workspace=bridge_workspace,
+                assets=bridge_assets,
+                cancel_check=cancel_check,
+            )
+
+        # 6. Save
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         doc.save(output_path)
         return output_path

@@ -8,6 +8,35 @@ from __future__ import annotations
 import json
 import pytest
 
+from dp_engine.multi_agent import MultiAgentState
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 测试辅助
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _make_multi_agent_state(
+    data_scientist_report: str = "DS 分析结果...",
+    audit_advisory: str = "审查意见...",
+    chief_scientist_report: str | None = None,
+    chief_truncated: bool = False,
+    current_csv_path: str = "",
+) -> MultiAgentState:
+    """构造符合 MultiAgentState 合同的测试状态。
+
+    所有字段明确提供，避免 dict→TypedDict 类型不匹配。
+    """
+    return MultiAgentState(
+        messages=[],
+        current_csv_path=current_csv_path,
+        execution_logs=[],
+        data_scientist_report=data_scientist_report,
+        audit_advisory=audit_advisory,
+        chief_scientist_report=chief_scientist_report,
+        chief_truncated=chief_truncated,
+    )
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Token 预算工具
@@ -185,15 +214,7 @@ class TestChiefTruncationDegrade:
         ds_node, adv_node, chief_node = _make_nodes()
 
         # 构造 state (DS 已运行, advisor 已运行)
-        state: dict = {
-            "messages": [],
-            "data_scientist_report": "DS 分析结果...",
-            "audit_advisory": "审查意见...",
-            "execution_logs": [],
-            "chief_scientist_report": None,
-            "chief_truncated": False,
-            "current_csv_path": "",
-        }
+        state = _make_multi_agent_state()
 
         # mock _invoke_llm 抛 AIClientTruncationError (有 partial_content)
         import dp_engine.multi_agent as ma
@@ -208,10 +229,13 @@ class TestChiefTruncationDegrade:
         try:
             result = chief_node(state)
             # 不应抛异常
-            assert result["chief_truncated"] is True
+            truncated = result.get("chief_truncated")
+            assert truncated is True
             # 应有部分内容
-            assert len(result["chief_scientist_report"]) > 0
-            assert "diagnosis_summary" in result["chief_scientist_report"]
+            report = result.get("chief_scientist_report")
+            assert isinstance(report, str)
+            assert len(report) > 0
+            assert "diagnosis_summary" in report
         finally:
             ma._invoke_llm = original
 
@@ -221,15 +245,7 @@ class TestChiefTruncationDegrade:
 
         _, _, chief_node = _make_nodes()
 
-        state: dict = {
-            "messages": [],
-            "data_scientist_report": "DS 分析结果...",
-            "audit_advisory": "审查意见...",
-            "execution_logs": [],
-            "chief_scientist_report": None,
-            "chief_truncated": False,
-            "current_csv_path": "",
-        }
+        state = _make_multi_agent_state()
 
         import dp_engine.multi_agent as ma
         original = ma._invoke_llm
@@ -240,8 +256,11 @@ class TestChiefTruncationDegrade:
         ma._invoke_llm = _mock_invoke
         try:
             result = chief_node(state)
-            assert result["chief_truncated"] is True
-            assert result["chief_scientist_report"] == ""
+            truncated = result.get("chief_truncated")
+            assert truncated is True
+            report = result.get("chief_scientist_report")
+            assert isinstance(report, str)
+            assert report == ""
         finally:
             ma._invoke_llm = original
 
@@ -251,15 +270,7 @@ class TestChiefTruncationDegrade:
 
         _, _, chief_node = _make_nodes()
 
-        state: dict = {
-            "messages": [],
-            "data_scientist_report": "DS 分析结果...",
-            "audit_advisory": "审查意见...",
-            "execution_logs": [],
-            "chief_scientist_report": None,
-            "chief_truncated": False,
-            "current_csv_path": "",
-        }
+        state = _make_multi_agent_state()
 
         import dp_engine.multi_agent as ma
         original = ma._invoke_llm
@@ -291,15 +302,10 @@ class TestChiefInputBudget:
 
         long_ds = "传感器数据分析报告\n" + "详细数据 " * 3000  # ~15000 chars
 
-        state: dict = {
-            "messages": [],
-            "data_scientist_report": long_ds,
-            "audit_advisory": "意见",
-            "execution_logs": [],
-            "chief_scientist_report": None,
-            "chief_truncated": False,
-            "current_csv_path": "",
-        }
+        state = _make_multi_agent_state(
+            data_scientist_report=long_ds,
+            audit_advisory="意见",
+        )
 
         # 不实际调 LLM — 只验证 prompt 构造逻辑 (通过 mock _invoke_llm 检查参数)
         import dp_engine.multi_agent as ma
@@ -332,15 +338,10 @@ class TestChiefInputBudget:
 
         short_ds = "短报告: 一切正常"
 
-        state: dict = {
-            "messages": [],
-            "data_scientist_report": short_ds,
-            "audit_advisory": "无",
-            "execution_logs": [],
-            "chief_scientist_report": None,
-            "chief_truncated": False,
-            "current_csv_path": "",
-        }
+        state = _make_multi_agent_state(
+            data_scientist_report=short_ds,
+            audit_advisory="无",
+        )
 
         import dp_engine.multi_agent as ma
         original = ma._invoke_llm
@@ -383,7 +384,7 @@ class TestSourceAudit:
     def test_no_old_alarm_words(self):
         from pathlib import Path as _Path
         import re
-        ma_path = _Path(__file__).parent.parent / "py" / "multi_agent.py"
+        ma_path = _Path(__file__).parent.parent / "dp_engine" / "multi_agent.py"
         src = ma_path.read_text(encoding="utf-8")
         code_only = re.sub(r'""".*?"""', '', src, flags=re.DOTALL)
         code_only = re.sub(r'#.*$', '', code_only, flags=re.MULTILINE)
@@ -398,7 +399,7 @@ class TestSourceAudit:
 
     def test_linear_progress_messages(self):
         from pathlib import Path as _Path
-        ma_path = _Path(__file__).parent.parent / "py" / "multi_agent.py"
+        ma_path = _Path(__file__).parent.parent / "dp_engine" / "multi_agent.py"
         src = ma_path.read_text(encoding="utf-8")
         assert "数据科学家" in src
         assert "审核员" in src
@@ -407,7 +408,7 @@ class TestSourceAudit:
     def test_phase6_features_present(self):
         """源码含 Phase 6 新特性。"""
         from pathlib import Path as _Path
-        ma_path = _Path(__file__).parent.parent / "py" / "multi_agent.py"
+        ma_path = _Path(__file__).parent.parent / "dp_engine" / "multi_agent.py"
         src = ma_path.read_text(encoding="utf-8")
         assert "_estimate_tokens" in src
         assert "_trim_report_for_budget" in src

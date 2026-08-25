@@ -386,6 +386,82 @@ class TestLazyRecomputeGuardsEmpty:
         assert True
 
 
+class TestDuplicateReadingsChartFallback:
+
+    def test_duplicate_readings_rebuilds_selected_sensor_saved_fit(self, qapp):
+        """A duplicated legacy reading set must not make A3 display A1's curve."""
+        from dp_engine.calibration.project_config import StrainSubConfig
+        from ui.calibration_tab import StrainCalibrationPage
+
+        duplicate_readings = [
+            {"eps_theory": 0.0, "G1_C1_load": 1540.000, "G1_C2_load": 1540.002},
+            {"eps_theory": 100.0, "G1_C1_load": 1540.120, "G1_C2_load": 1540.122},
+            {"eps_theory": 200.0, "G1_C1_load": 1540.240, "G1_C2_load": 1540.242},
+        ]
+        page = StrainCalibrationPage()
+        page._strain_configs["A1"] = StrainSubConfig(
+            sensor_name="A1",
+            sensor_mode="single",
+            readings=duplicate_readings,
+            ke_results={"Ke1": 1.2, "Ke2": 0.0},
+        )
+        page._strain_configs["A3"] = StrainSubConfig(
+            sensor_name="A3",
+            sensor_mode="single",
+            readings=duplicate_readings,
+            ke_results={"Ke1": 1.5, "Ke2": 0.0},
+            charts_meta={
+                "strain_result": {
+                    "eps_theory": [0.0, 100.0, 200.0],
+                    "gratings": [{
+                        "grating_index": 1,
+                        "k_pm_per_ue": 1.5,
+                        "R2": 0.997,
+                        "cycle_drift_slopes": [1.4, 1.6],
+                        "cycle_drift_intercepts": [0.0, 4.0],
+                    }],
+                },
+            },
+        )
+
+        page._lazy_recompute_charts("A3")
+        axis = page.curve_panel.get_figure().axes[0]
+        labels = axis.get_legend_handles_labels()[1]
+        messages = [text.get_text() for text in axis.texts]
+
+        assert len(axis.lines) == 1
+        assert any("已保存拟合结果" in label for label in labels)
+        assert all("数据归属异常" not in message for message in messages)
+        assert any("历史原始读数与" in message for message in messages)
+
+
+class TestRawReadingsPersistence:
+
+    def test_build_and_reload_preserves_real_wavelengths(self, qapp):
+        page = _make_page_with_config(
+            "dual_both", 1.23, 0.98,
+            grating_map={"G1": "A1-W1", "G2": "A1-W2"},
+        )
+        page._levels = [0.0, 0.04, 0.08]
+        page._readings = {
+            1: {1: {"load": [1550.0, 1550.6, 1551.2]}},
+            2: {1: {"load": [1552.0, 1552.5, 1553.0]}},
+        }
+
+        saved = page._build_strain_subconfig()
+
+        assert saved.readings[1]["G1_C1_load"] == pytest.approx(1550.6)
+        assert saved.readings[2]["G2_C1_load"] == pytest.approx(1553.0)
+        assert "strain_result" in saved.charts_meta
+
+        page._strain_configs["A1"] = saved
+        page._readings = {}
+        page._load_sensor_to_workspace("A1")
+
+        assert page._readings[1][1]["load"] == pytest.approx([1550.0, 1550.6, 1551.2])
+        assert page._readings[2][1]["load"] == pytest.approx([1552.0, 1552.5, 1553.0])
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Test 8: 新建标定清空工作态
 # ═══════════════════════════════════════════════════════════════════════

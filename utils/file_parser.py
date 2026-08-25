@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import re
 from typing import Any, Optional, Tuple
 
@@ -17,14 +18,37 @@ from utils.parse_validation import validate_parsed_data, ParseValidationError  #
 
 
 def _run_parse_validation(
-    df: pd.DataFrame | None,
+    df: pd.DataFrame,
     meta: dict,
     annotation: dict[str, str],
     source_path: str,
-) -> None:
+    *,
+    allow_timestamp_restarts: bool = False,
+) -> pd.DataFrame:
     """对 parse_enlight_file 各分支的解析结果做强制校验。"""
+    meta["exact_duplicate_rows_removed"] = 0
+    if "Timestamp" in df.columns and not df.empty:
+        timestamp_text = df["Timestamp"].astype("string").str.strip()
+        nonempty_timestamps = timestamp_text[
+            timestamp_text.notna() & timestamp_text.ne("")
+        ]
+        all_placeholder_zero = bool(
+            not nonempty_timestamps.empty
+            and nonempty_timestamps.str.fullmatch(r"0+(?:\.0+)?").fillna(False).all()
+        )
+        if not all_placeholder_zero:
+            exact_duplicate_mask = df.duplicated(keep="first")
+            removed_rows = int(exact_duplicate_mask.sum())
+            if removed_rows:
+                meta["exact_duplicate_rows_removed"] = removed_rows
+                meta["rows_before_exact_dedup"] = len(df)
+                df = df.loc[~exact_duplicate_mask].reset_index(drop=True)
+
     try:
-        validate_parsed_data(df, meta, annotation, source_path=source_path, strict=True)
+        validate_parsed_data(
+            df, meta, annotation, source_path=source_path, strict=True,
+            allow_timestamp_restarts=allow_timestamp_restarts,
+        )
     except ParseValidationError:
         raise
     except Exception as exc:
@@ -32,6 +56,7 @@ def _run_parse_validation(
         raise ParseValidationError(
             f"校验器内部异常: {exc} [format={meta.get('format','?')} source={source_path!r}]"
         ) from exc
+    return df
 
 
 def detect_format(
@@ -228,8 +253,11 @@ def parse_file(file_path: str, template: Any) -> tuple[pd.DataFrame, dict[str, s
         return df, {}
 
     elif template.file_format == 'enlight':
-        # 委托给新的统一 ENLIGHT/Hyperion 解析器
-        df, annotation, _meta = parse_enlight_file(file_path)
+        # ENLIGHT 标定记录可包含多个独立采集循环；仪器时间戳在每个
+        # 循环起点会重置。保留文件行序并允许该重启，仍执行其余严格校验。
+        df, annotation, _meta = parse_enlight_file(
+            file_path, allow_timestamp_restarts=True,
+        )
         return df, annotation
 
     else:
@@ -264,8 +292,9 @@ def _looks_like_annotation_row(cells: list[str]) -> bool:
             has_quoted = True
             continue
         try:
-            float(c)
-            return False  # 出现裸数值 → 不是暗号行（是数据行）
+            value = float(c)
+            if math.isfinite(value):
+                return False  # 出现有限裸数值 → 不是暗号行（是数据行）
         except ValueError:
             continue
     return has_quoted
@@ -274,6 +303,8 @@ def _looks_like_annotation_row(cells: list[str]) -> bool:
 def parse_enlight_file(
     path: str,
     encoding: str | None = None,
+    *,
+    allow_timestamp_restarts: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, str], dict]:
     """统一 ENLIGHT / Hyperion 解析器 — 内容感知格式判别。
 
@@ -332,7 +363,10 @@ def parse_enlight_file(
     if is_hyperion and _peaks_hdr is not None:
         meta["format"] = "hyperion_peaks"
         df, annotation, sub_meta = _parse_hyperion_peaks(path, probe_enc, meta, has_bom)
-        _run_parse_validation(df, meta, annotation, path)
+        df = _run_parse_validation(
+            df, meta, annotation, path,
+            allow_timestamp_restarts=allow_timestamp_restarts,
+        )
         return df, annotation, sub_meta
 
     # ── 分支 2: Hyperion Sensors ──
@@ -342,13 +376,19 @@ def parse_enlight_file(
     if has_timestamp_header:
         meta["format"] = "hyperion_sensors"
         df, annotation, sub_meta = _parse_hyperion_sensors(path, meta, has_bom)
-        _run_parse_validation(df, meta, annotation, path)
+        df = _run_parse_validation(
+            df, meta, annotation, path,
+            allow_timestamp_restarts=allow_timestamp_restarts,
+        )
         return df, annotation, sub_meta
 
     # ── 分支 3: Legacy ──
     meta["format"] = "legacy_enlight"
     df, annotation, sub_meta = _parse_legacy_enlight(path, probe_enc, meta)
-    _run_parse_validation(df, meta, annotation, path)
+    df = _run_parse_validation(
+        df, meta, annotation, path,
+        allow_timestamp_restarts=allow_timestamp_restarts,
+    )
     return df, annotation, sub_meta
 
 
@@ -525,6 +565,12 @@ def _parse_peaks_rectangular(
         if not ln.strip():
             continue
         f = ln.split("\t")
+        if _looks_like_annotation_row(f):
+            for col, cell in zip(columns, f):
+                cell = cell.strip()
+                if cell:
+                    annotation.setdefault(col, _strip_code_quotes(cell))
+            continue
         if len(f) < width:
             f = f + [""] * (width - len(f))
         f = f[:width]
@@ -602,10 +648,18 @@ def parse_enlight_sensors(
     ncol = len(header)
     ts: list[str] = []
     rows: list[list[str | None]] = []
+    mid_annotation_rows = 0
     for ln in lines[data_start:]:
         if not ln.strip():
             continue
         f = ln.split("\t")
+        if _looks_like_annotation_row(f):
+            mid_annotation_rows += 1
+            for col, cell in zip(header, f):
+                cell = cell.strip()
+                if cell:
+                    annotation.setdefault(str(col), _strip_code_quotes(cell))
+            continue
         if len(f) < ncol:
             f = f + [""] * (ncol - len(f))
         f = f[:ncol]
@@ -670,6 +724,7 @@ def parse_enlight_sensors(
         "header_idx": header_idx,
         "had_bom": had_bom,
         "annotation_row": (data_start != header_idx + 1),
+        "mid_annotation_rows": mid_annotation_rows,
         "num_data_cols": ncol - 1,
         "fbg_cols": fbg_cols,
     }

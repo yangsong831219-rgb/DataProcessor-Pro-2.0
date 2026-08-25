@@ -55,13 +55,28 @@ class MockStrainSubConfig:
     gauge_length_mm: float = 80.0
     readings: list[dict] = field(default_factory=list)
     ke_results: dict[str, float] = field(default_factory=dict)
+    sensor_mode: str = "single"
+    grating_map: dict[str, str] = field(default_factory=dict)
+    charts_meta: dict = field(default_factory=dict)
 
 
 class MockTempPage:
     """模拟温度标定子页 — 含 _phase_b_state。"""
 
-    def __init__(self, phase_b_state: dict | None = None):
+    def __init__(
+        self,
+        phase_b_state: dict | None = None,
+        phase_a_result: dict | None = None,
+        phase_b_result: dict | None = None,
+        annotation: dict | None = None,
+    ):
         self._phase_b_state: dict = phase_b_state or {}
+        self._phase_a_state: dict = (
+            {"seff_result": phase_a_result} if phase_a_result is not None else {}
+        )
+        self._last_result = phase_a_result
+        self._phase_b_result = phase_b_result
+        self._annotation_dict = annotation or {}
 
 
 class MockStrainPage:
@@ -206,13 +221,14 @@ def sample_strain_configs() -> dict:
         sensor_name="A1",
         gauge_length_mm=80.0,
         readings=[
-            {"disp_mm": 0.0},
-            {"disp_mm": 0.01},
-            {"disp_mm": 0.02},
-            {"disp_mm": 0.05},
-            {"disp_mm": 0.10},
+            {"disp_mm": 0.0, "G1_C1_load": 1550.0000, "G2_C1_load": 1552.0000},
+            {"disp_mm": 0.01, "G1_C1_load": 1550.1547, "G2_C1_load": 1552.1520},
+            {"disp_mm": 0.02, "G1_C1_load": 1550.3079, "G2_C1_load": 1552.3061},
+            {"disp_mm": 0.05, "G1_C1_load": 1550.7718, "G2_C1_load": 1552.7630},
+            {"disp_mm": 0.10, "G1_C1_load": 1551.5419, "G2_C1_load": 1553.5270},
         ],
         ke_results={"Ke1": 1.234, "Ke2": 1.221},
+        sensor_mode="dual_working",
     )
     return {"A1": cfg}
 
@@ -226,12 +242,13 @@ def sample_strain_configs_6() -> dict:
             sensor_name=name,
             gauge_length_mm=80.0,
             readings=[
-                {"disp_mm": 0.0},
-                {"disp_mm": 0.02},
-                {"disp_mm": 0.05},
-                {"disp_mm": 0.10},
+                {"disp_mm": 0.0, "G1_C1_load": 1550.0000, "G2_C1_load": 1552.0000},
+                {"disp_mm": 0.02, "G1_C1_load": 1550.3079, "G2_C1_load": 1552.3061},
+                {"disp_mm": 0.05, "G1_C1_load": 1550.7718, "G2_C1_load": 1552.7630},
+                {"disp_mm": 0.10, "G1_C1_load": 1551.5419, "G2_C1_load": 1553.5270},
             ],
             ke_results={"Ke1": 1.234, "Ke2": 1.221},
+            sensor_mode="dual_working",
         )
     return configs
 
@@ -288,6 +305,19 @@ class TestFromProvidersBasic:
         assert bundle.time_h == []
         assert bundle.series == {}
 
+    def test_time_axis_uses_real_timestamp_interval(self):
+        """4 秒采样必须显示真实历时，不能按 1 秒/行缩短为四分之一。"""
+        n = 100
+        df = pd.DataFrame({
+            "Timestamp": pd.date_range("2026-06-09 20:23:36", periods=n, freq="4s").astype(str),
+            "W1": np.linspace(1550.0, 1550.1, n),
+        })
+        mw = MockMainWindow(current_data=df, analysis_tab_widget=MockAnalysisTabWidget(df=df))
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert bundle.time_h[-1] == pytest.approx((n - 1) * 4 / 3600.0)
+
 
 class TestSensorResultsFromMainWin:
     """sensor_results 主源: main_win.sensor_results (已不再提取 metrics/dist → 表格化)"""
@@ -336,6 +366,14 @@ class TestCalibLinearity:
         assert s["unit"] == "pm"
         assert s["slope"] > 0, f"slope 应为正, 实际 {s['slope']}"
         assert "r2" in s
+        measured = np.asarray(s["measured"], dtype=float)
+        ref = np.asarray(s["ref"], dtype=float)
+        fabricated = np.mean([1.234, 1.221]) * ref
+        assert not np.allclose(measured, fabricated), "实测纵轴不得由 Ke×理论应变伪造"
+        fit = np.polyfit(ref, measured, 1)
+        pred = np.polyval(fit, ref)
+        expected_r2 = 1.0 - np.sum((measured - pred) ** 2) / np.sum((measured - measured.mean()) ** 2)
+        assert s["r2"] == pytest.approx(expected_r2)
 
     def test_calib_sensors_multiple(self, sample_df, sample_sensor_results,
                                      sample_compensation, sample_strain_configs_6):
@@ -377,6 +415,100 @@ class TestCalibLinearity:
         bundle = ChartBundle.from_providers(mw)
         assert bundle.calib_sensors == []
 
+    def test_legacy_config_without_raw_readings_is_marked_ke_fitted(self, sample_df):
+        cfg = MockStrainSubConfig(
+            sensor_name="A1",
+            gauge_length_mm=80.0,
+            readings=[{"disp_mm": 0.0}, {"disp_mm": 0.04}, {"disp_mm": 0.08}],
+            ke_results={"Ke1": 1.2},
+        )
+        ct = MockCalibrationTabWidget(
+            temp_page=MockTempPage(),
+            strain_page=MockStrainPage({"A1": cfg}),
+        )
+        mw = MockMainWindow(
+            current_data=sample_df,
+            analysis_tab_widget=MockAnalysisTabWidget(df=sample_df),
+            calibration_tab_widget=ct,
+        )
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert len(bundle.calib_sensors) == 1
+        curve = bundle.calib_sensors[0]
+        assert curve["source"] == "fitted_from_ke"
+        assert curve["ref"] == [0.0, 500.0, 1000.0]
+        assert curve["curves"]["G1"] == [0.0, 600.0, 1200.0]
+
+
+class TestTemperatureCalibrationStandardCharts:
+    def test_phase_a_and_phase_b_chart_data_extracted(self, sample_df):
+        plateaus = pd.DataFrame({
+            "T_set": [20.0, 30.0, 40.0],
+            "W1_d": [0.0, 280.0, 560.0],
+            "W2_d": [0.0, 300.0, 600.0],
+        })
+        phase_a_result = {
+            "plateaus": plateaus,
+            "S_eff": {
+                "W1": {"slope": 28.0, "intercept": -560.0, "r2": 0.9999},
+                "W2": {"slope": 30.0, "intercept": -600.0, "r2": 0.9998},
+            },
+            "wavelength_cols": ["W1", "W2"],
+        }
+        eps = np.array([0.0, 10.0, -5.0, 2.0])
+        d_temperature = np.array([0.0, 5.0, 10.0, 15.0])
+        phase_b_state = {
+            "ke_table": {"A1": {"Ke1": 1.2, "Ke2": 1.1}},
+            "sensors": {
+                "A1": {
+                    "single_grating": False,
+                    "eps_corr": eps,
+                    "dT_corr": d_temperature,
+                    "T_abs": d_temperature + 20.0,
+                    "S1": 28.0,
+                    "S2": 30.0,
+                },
+            },
+        }
+        phase_b_result = {
+            "time_h": [0.0, 0.1, 0.2, 0.3],
+            "diagnostic_series": {
+                "A1": {
+                    "eps_raw": eps,
+                    "eps_compensated": eps - 2.5,
+                },
+            },
+        }
+        tp = MockTempPage(
+            phase_b_state=phase_b_state,
+            phase_a_result=phase_a_result,
+            phase_b_result=phase_b_result,
+            annotation={"W1": "A1-W1", "W2": "A1-W2"},
+        )
+        ct = MockCalibrationTabWidget(
+            temp_page=tp,
+            strain_page=MockStrainPage({}),
+        )
+        mw = MockMainWindow(
+            current_data=sample_df,
+            analysis_tab_widget=MockAnalysisTabWidget(df=sample_df),
+            calibration_tab_widget=ct,
+        )
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert len(bundle.temp_regressions) == 2
+        assert bundle.temp_regressions[0]["display"] == "A1-W1"
+        assert len(bundle.phaseb_diagnostics) == 1
+        diagnostic = bundle.phaseb_diagnostics[0]
+        assert diagnostic["name"] == "A1"
+        assert diagnostic["time_h"] == [0.0, 0.1, 0.2, 0.3]
+        expected_dl1 = (1.2 * eps + 28.0 * d_temperature).tolist()
+        assert diagnostic["dl1_pm"] == pytest.approx(expected_dl1)
+        assert diagnostic["eps_raw"] == pytest.approx(eps)
+        assert diagnostic["eps_compensated"] == pytest.approx(eps - 2.5)
+
 
 class TestGradeTable:
     """分级表 (Batch A): grade_table_md 从 compensation 提取"""
@@ -397,6 +529,32 @@ class TestGradeTable:
         assert "B1" in bundle.grade_table_md
         assert "优" in bundle.grade_table_md
         assert "FAIL" in bundle.grade_table_md
+
+    def test_grade_table_reads_serialized_metric_and_grade_dicts(self, sample_df):
+        compensation = {
+            "A1": {
+                "metrics": {
+                    "residual_sigma_pct_fs": 0.8,
+                    "hysteresis_max_pct_fs": 1.2,
+                },
+                "grade": {
+                    "grade": "良",
+                    "passed": True,
+                    "reasons": ["满足出厂阈值"],
+                },
+            }
+        }
+        tp = MockTempPage(phase_b_state={"compensation": compensation})
+        ct = MockCalibrationTabWidget(temp_page=tp)
+        mw = MockMainWindow(
+            current_data=sample_df,
+            analysis_tab_widget=MockAnalysisTabWidget(df=sample_df),
+            calibration_tab_widget=ct,
+        )
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert "| A1 | 0.80 | 1.20 | 良 | ✓ | 满足出厂阈值 |" in bundle.grade_table_md
 
 
 class TestPhysSeriesProvider:
@@ -469,6 +627,24 @@ class TestPhysSeriesProvider:
         # 后续点 Δλ 非零 (制造了随机波动)
         assert abs(bundle.series_delta["W1"][-1]) > 0, \
             f"W1 末点 Δλ 不应全零"
+
+    def test_series_delta_excludes_anomaly_derivative_columns(self):
+        df = pd.DataFrame({
+            "Timestamp": pd.date_range("2026-01-01", periods=4, freq="4s").astype(str),
+            "W1": [1550.0, 1550.1, 1550.2, 1550.3],
+            "W1_anomaly": [False, False, True, False],
+            "W1_anomaly_anomaly": [False, False, False, True],
+            "W2": [1552.0, 1552.1, 1552.2, 1552.3],
+        })
+        mw = MockMainWindow(
+            current_data=df,
+            analysis_tab_widget=MockAnalysisTabWidget(df=df),
+            sensor_system=MockSensorSystem(reference_row=0),
+        )
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert set(bundle.series_delta) == {"W1", "W2"}
 
     def test_series_delta_empty_when_no_sensor_system(self, sample_df_with_W):
         """无 sensor_system → series_delta 留空不崩。"""
@@ -546,6 +722,101 @@ class TestHystCompareSkip:
             assert 20 < max(hs['T_abs']) < 90
             assert abs(max(hs['eps'])) < 2000
 
+    def test_hyst_prefers_finite_eps_corr_over_all_nan_eps_orig(
+        self, sample_df, sample_compensation
+    ):
+        """修正解耦序列有效时，不能被仅用于对比的全 NaN eps_orig 遮蔽。"""
+        sensors = {
+            "A1": {
+                "T_abs": [25.0, 45.0, 65.0, 85.0],
+                "eps_orig": [float("nan")] * 4,
+                "eps_corr": [0.0, 12.0, 24.0, 36.0],
+            }
+        }
+        tp = MockTempPage(phase_b_state={
+            "compensation": sample_compensation,
+            "sensors": sensors,
+        })
+        ct = MockCalibrationTabWidget(temp_page=tp)
+        mw = MockMainWindow(
+            current_data=sample_df,
+            analysis_tab_widget=MockAnalysisTabWidget(df=sample_df),
+            calibration_tab_widget=ct,
+        )
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert bundle.hyst_sensors == [{
+            "name": "A1",
+            "T_abs": [25.0, 45.0, 65.0, 85.0],
+            "eps": [0.0, 12.0, 24.0, 36.0],
+        }]
+
+    def test_hyst_falls_back_to_finite_eps_orig_when_eps_corr_invalid(
+        self, sample_df, sample_compensation
+    ):
+        """兼容旧状态：eps_corr 缺失/无有效值时，有限 eps_orig 仍可出图。"""
+        sensors = {
+            "A1": {
+                "T_abs": [25.0, 45.0, 65.0],
+                "eps_orig": [1.0, 2.0, 3.0],
+                "eps_corr": [float("nan")] * 3,
+            }
+        }
+        tp = MockTempPage(phase_b_state={
+            "compensation": sample_compensation,
+            "sensors": sensors,
+        })
+        ct = MockCalibrationTabWidget(temp_page=tp)
+        mw = MockMainWindow(
+            current_data=sample_df,
+            analysis_tab_widget=MockAnalysisTabWidget(df=sample_df),
+            calibration_tab_widget=ct,
+        )
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert bundle.hyst_sensors[0]["eps"] == [1.0, 2.0, 3.0]
+
+    def test_six_corrected_phase_b_series_produce_six_hysteresis_pngs(
+        self, sample_df, sample_compensation, tmp_path
+    ):
+        """真实缺图模式的端到端门禁：全 NaN 原始值不得阻止六张修正迟滞图落盘。"""
+        temperatures = [25.0, 45.0, 65.0, 85.0, 65.0, 45.0, 25.0]
+        sensors = {
+            name: {
+                "T_abs": temperatures,
+                "eps_orig": [float("nan")] * len(temperatures),
+                "eps_corr": [
+                    offset + 0.5 * temperature
+                    for temperature in temperatures
+                ],
+            }
+            for offset, name in enumerate(("A1", "A2", "B1", "B2", "C1", "C2"))
+        }
+        tp = MockTempPage(phase_b_state={
+            "compensation": sample_compensation,
+            "sensors": sensors,
+        })
+        ct = MockCalibrationTabWidget(temp_page=tp)
+        mw = MockMainWindow(
+            current_data=sample_df,
+            analysis_tab_widget=MockAnalysisTabWidget(df=sample_df),
+            calibration_tab_widget=ct,
+        )
+
+        bundle = ChartBundle.from_providers(mw)
+        from core.chart_store import build_chart_store
+
+        manifest = build_chart_store(bundle.to_dict(), str(tmp_path), [])
+        produced = [
+            entry for entry in manifest
+            if entry.chart_id.startswith("phaseb_hyst_") and entry.produced
+        ]
+
+        assert len(produced) == 6
+        assert all((tmp_path / entry.rel_path).is_file() for entry in produced)
+
     def test_no_compare_data_does_not_crash(self, sample_df):
         """无 _last_comparison → compare 字段全空。"""
         atw = MockAnalysisTabWidget(df=sample_df)
@@ -557,3 +828,45 @@ class TestHystCompareSkip:
         assert bundle.compare_time_h == []
         assert bundle.compare_sources == {}
         assert bundle.compare_pairs == []
+
+    def test_compare_plot_payload_produces_overlay_and_scatter(
+        self, sample_df, tmp_path
+    ):
+        """UI 留存的对齐时程必须一路进入 ChartBundle 和图仓。"""
+        comparison = {
+            "time_h": (np.arange(500, dtype=float) / 3600.0).tolist(),
+            "sources": {
+                "应变-光纤1": np.sin(np.linspace(0, 8, 500)).tolist(),
+                "应变-应变片1": np.sin(np.linspace(0, 8, 500) + 0.1).tolist(),
+            },
+            "pairs": [
+                {
+                    "device_a": "应变-光纤1",
+                    "device_b": "应变-应变片1",
+                    "corr": 0.98,
+                    "mae": 0.05,
+                    "rmse": 0.08,
+                }
+            ],
+        }
+        mw = MockMainWindow(
+            current_data=sample_df,
+            analysis_tab_widget=MockAnalysisTabWidget(df=sample_df),
+            compare_tab_widget=MockCompareTabWidget(comparison=comparison),
+        )
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert 2 <= len(bundle.compare_time_h) <= 201
+        assert set(bundle.compare_sources) == {"应变-光纤1", "应变-应变片1"}
+        assert all(
+            len(values) == len(bundle.compare_time_h)
+            for values in bundle.compare_sources.values()
+        )
+
+        from core.chart_store import build_chart_store
+
+        manifest = build_chart_store(bundle.to_dict(), str(tmp_path), [])
+        produced_ids = {entry.chart_id for entry in manifest if entry.produced}
+        assert "compare_ol" in produced_ids
+        assert "compare_corr_scatter_0" in produced_ids

@@ -112,6 +112,22 @@ class TestDiagnosisSummary:
         assert len(s) > 0
         assert "诊断数据" in s
 
+    def test_grade_enum_ground_truth_is_injected_verbatim(self):
+        from core.report_engine import _build_diagnosis_summary
+
+        rec = dict(DIAG_RECORD)
+        rec["chart_data"] = {
+            "grade_table_md": (
+                "| 传感器 | 评级 |\n|---|---|\n"
+                "| A1 | 良 |\n| A2 | FAIL |\n| C2 | 优 |"
+            )
+        }
+
+        s = _build_diagnosis_summary(rec)
+
+        assert "| A2 | FAIL |" in s
+        assert "评级/数值一律照摘要原文，不得改写" in s
+
 
 class TestBuildContextWithDiagnosis:
 
@@ -240,6 +256,24 @@ class TestSensorCountHelper:
         assert count_sensors(rec) == 4
         assert len(get_sensor_analysis(rec)) == 4
 
+    def test_multi_agent_chief_structured_takes_precedence(self):
+        """实网多智能体记录必须显示 chief_structured 中的真实传感器数。"""
+        from core.report_engine import count_sensors
+
+        rec = {
+            "ai_diagnosis": {"diagnosis_json": {"sensor_analysis": []}},
+            "multi_agent": {
+                "chief_structured": {
+                    "sensor_analysis": [
+                        {"sensor_id": sensor_id}
+                        for sensor_id in ("A1", "A2", "B1", "B2", "C1", "C2")
+                    ]
+                }
+            },
+        }
+
+        assert count_sensors(rec) == 6
+
     def test_empty_record_returns_zero(self):
         from core.report_engine import count_sensors, get_sensor_analysis
         assert count_sensors({}) == 0
@@ -346,6 +380,24 @@ class TestSectionDegradation:
         assert "## 概述" in sec["content_paragraphs"][0]
         dw = result.get("_report_warnings", [])
         assert not any("降级" in w for w in dw)
+
+    def test_word_prompt_contains_enum_passthrough_rule(self):
+        from core.report_engine import _generate_word_markdown_report
+
+        prompts: list[str] = []
+
+        def generate(prompt: str) -> str:
+            prompts.append(prompt)
+            return "正文"
+
+        _generate_word_markdown_report(
+            title="测试",
+            sections=[{"heading": "结论", "key_points": []}],
+            project_context="| A2 | FAIL |",
+            generate_fn=generate,
+        )
+
+        assert "评级/数值一律照摘要原文，不得改写" in prompts[0]
 
     def test_schema_1_1_both_sections(self):
         """schema 1.1: multi_agent 仅含废弃 report 字段 (无 chief_structured) → 降级 ai_diagnosis。"""

@@ -20,6 +20,7 @@ import pandas as pd
 import pytest
 
 from utils.file_parser import parse_enlight_file
+from utils.parse_validation import ParseValidationError
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -331,6 +332,42 @@ class TestRegression:
             os.unlink(path)
 
 
+class TestExactDuplicateRows:
+    def test_exact_duplicate_sensor_rows_are_removed_before_validation(self):
+        path = _make_sensors_file(
+            with_bom=True, with_annotation_row=False, data_rows=3,
+        )
+        try:
+            with open(path, "r", encoding="utf-8-sig") as file:
+                last_row = file.read().splitlines()[-1]
+            with open(path, "a", encoding="utf-8") as file:
+                file.write(f"\n{last_row}\n{last_row}")
+
+            df, _annotation, meta = parse_enlight_file(path)
+
+            assert len(df) == 3
+            assert not df["Timestamp"].duplicated().any()
+            assert meta["exact_duplicate_rows_removed"] == 2
+        finally:
+            os.unlink(path)
+
+    def test_same_timestamp_with_different_values_still_raises(self):
+        path = _make_sensors_file(
+            with_bom=True, with_annotation_row=False, data_rows=3,
+        )
+        try:
+            with open(path, "r", encoding="utf-8-sig") as file:
+                fields = file.read().splitlines()[-1].split("\t")
+            fields[1] = "9.99999"
+            with open(path, "a", encoding="utf-8") as file:
+                file.write("\n" + "\t".join(fields))
+
+            with pytest.raises(ParseValidationError, match="重复时间戳"):
+                parse_enlight_file(path)
+        finally:
+            os.unlink(path)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 变体A: 原始仪器导出（元数据块/无BOM/无暗号行）
 # ═══════════════════════════════════════════════════════════════════════
@@ -516,6 +553,35 @@ class TestSavedSampleWithBomAndAnnotation:
             assert meta["format"] == "hyperion_sensors"
             assert len(df) == 5
             assert annotation == {}
+        finally:
+            os.unlink(path)
+
+    def test_nan_does_not_hide_annotation_row(self):
+        from utils.file_parser import _looks_like_annotation_row
+
+        assert _looks_like_annotation_row(["'时间戳'", "'A1_应变'", "nan"])
+
+    def test_mid_file_annotation_row_is_removed_and_reported(self):
+        lines = [
+            "Timestamp\tF1\tFBG_A",
+            "2026/5/12 01:00:00.0\t-0.5\t1525.0",
+            "2026/5/12 01:00:04.0\t-0.4\t1525.1",
+            "'时间戳'\t'A1_应变'\tnan",
+            "2026/5/12 01:00:08.0\t-0.3\t1525.2",
+            "2026/5/12 01:00:12.0\t-0.2\t1525.3",
+        ]
+        fd, path = tempfile.mkstemp(suffix=".txt", prefix="test_mid_annotation_")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("\n".join(lines))
+        try:
+            from utils.file_parser import parse_enlight_sensors
+
+            df, annotation, meta = parse_enlight_sensors(path)
+            assert len(df) == 4
+            assert meta["mid_annotation_rows"] == 1
+            assert annotation["F1"] == "A1_应变"
+            assert df["Timestamp"].str.contains("时间戳").sum() == 0
         finally:
             os.unlink(path)
 

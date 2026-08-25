@@ -11,8 +11,8 @@ import pytest
 
 
 def _make_fake_metrics(**overrides):
-    from utils.compensation_metrics import CompensationMetrics
-    defaults = dict(
+    """Return plain dict matching CompensationMetrics fields (production JSON roundtrip format)."""
+    defaults: dict = dict(
         sensor="A1", residual_sigma=12.3, repeatability=5.0,
         hysteresis_max=8.0, noise_floor=1.5, temp_sensitivity_max=0.3,
         worst_case_single=4.0, low_confidence=False, fs=1000,
@@ -22,12 +22,12 @@ def _make_fake_metrics(**overrides):
         worst_case_single_pct_fs=0.4,
     )
     defaults.update(overrides)
-    return CompensationMetrics(**defaults)
+    return defaults
 
 
 def _make_fake_grade(sensor, grade, passed, reasons):
-    from utils.compensation_metrics import SensorGrade
-    return SensorGrade(sensor=sensor, grade=grade, passed=passed, reasons=reasons)
+    """Return plain dict matching SensorGrade fields (production JSON roundtrip format)."""
+    return dict(sensor=sensor, grade=grade, passed=passed, reasons=reasons)
 
 
 def _make_main_win(data=None, template=None, has_cal=True):

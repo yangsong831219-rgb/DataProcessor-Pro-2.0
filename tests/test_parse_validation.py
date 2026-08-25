@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import tempfile
 import os
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -25,6 +26,8 @@ from utils.parse_validation import (
     _WAVE_LO,
     _WAVE_HI,
 )
+from core.models import DataTemplate
+from utils.file_parser import parse_file
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -294,3 +297,48 @@ class TestMissingTimestamp:
         df["FBG_A"] = pd.to_numeric(df["FBG_A"])
         with pytest.raises(ParseValidationError, match="缺少 Timestamp"):
             validate_parsed_data(df, _make_valid_meta(), source_path="/fake.txt")
+
+
+class TestTimestampQualityGate:
+    def test_duplicate_timestamps_raise_in_strict_mode(self):
+        df = _make_valid_sensors_df(n_rows=4)
+        df.loc[2, "Timestamp"] = df.loc[1, "Timestamp"]
+
+        with pytest.raises(ParseValidationError, match="重复时间戳"):
+            validate_parsed_data(
+                df,
+                _make_valid_meta(fbg_cols=["FBG_A"]),
+                source_path="/fake.txt",
+            )
+
+    def test_calibration_import_can_keep_timestamp_restart_rows(self):
+        df = _make_valid_sensors_df(n_rows=4)
+        df.loc[2, "Timestamp"] = df.loc[1, "Timestamp"]
+        meta = _make_valid_meta(fbg_cols=["FBG_A"])
+
+        validate_parsed_data(
+            df,
+            meta,
+            source_path="/calibration.txt",
+            allow_timestamp_restarts=True,
+        )
+
+        assert meta["timestamp_restart_warning"] is True
+        assert meta["timestamp_duplicate_rows"] == 1
+
+
+def test_main_enlight_open_allows_timestamp_restart(tmp_path):
+    """The main data-file loader accepts separate ENLIGHT acquisition loops."""
+    fixture = Path(__file__).parent / "golden" / "Peaks_20260512144535_sampled_10pct.txt"
+    lines = fixture.read_text(encoding="utf-8").splitlines()
+    header_index = next(i for i, line in enumerate(lines) if line.startswith("Timestamp\t"))
+    repeated_row = lines[header_index + 1].split("\t")
+    repeated_row[-1] = "1547.9999"  # same timestamp, different acquisition data
+    restarted = tmp_path / "restarted_hyperion_peaks.txt"
+    restarted.write_text("\n".join(lines + ["\t".join(repeated_row)]), encoding="utf-8")
+
+    template = DataTemplate("enlight", "ENLIGHT", "enlight", "\t", 104, [])
+    df, _annotation = parse_file(str(restarted), template)
+
+    assert len(df) == 121
+    assert int(df["Timestamp"].duplicated().sum()) == 1

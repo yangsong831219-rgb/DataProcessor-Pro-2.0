@@ -5,9 +5,12 @@ import sys
 import os
 import json
 import re
+import tempfile
+import uuid
 import traceback
+import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -46,6 +49,32 @@ from utils.data_cleaning import clean_data, detect_anomalies, fill_missing
 # ============ Backend Module Imports ============
 from dp_engine.wiki_system import WikiFileSystem
 from dp_engine.multi_agent import run_multi_agent, MultiAgentState
+from dp_engine.report_provider import (
+    BUILTIN_PROVIDER_ID,
+    BUILTIN_PROVIDER_VERSION,
+    PPT_MASTER_PROVIDER_ID,
+    PPT_MASTER_PROVIDER_VERSION,
+    PptMasterReportRenderProvider,
+    ReportProviderController,
+    ReportProviderOption,
+    ReportRenderAsset,
+    ReportRenderOrchestrator,
+    ReportRenderRequest,
+)
+from dp_engine.ppt_master_host import (
+    ControlledToolRunner,
+    HostAIClientPlanningAdapter,
+    HostAIPptMasterAuthoringAdapter,
+    PlanningAsset,
+    PlanningAssetKind,
+    PlanningRequest,
+    PptMasterPlanningWorkflow,
+    PptMasterWorkflowError,
+    TemplateMode,
+    fingerprint_ppt_master_inputs,
+    prepare_ppt_master_template_workspace,
+    probe_expected_ppt_master_installation,
+)
 
 # ============ UI Module Imports ============
 from ui.report_workbench import ReportWorkbenchWidget
@@ -63,11 +92,24 @@ from ui.sensor_edit_dialog import SensorEditDialog
 from ui.ai_model_config_dialog import AIModelConfigDialog
 from ui.report_worker import ReportWorker
 from ui.skill_tab import AgentSkillWidget
+from ui.skill_install_controller import SkillInstallTaskOwner
 from ui.compare_tab import CompareTabWidget
 from ui.calibration_tab import CalibrationTabWidget
 
 # ============ Report Generation ============
 from core.report_engine import generate_outline, generate_structured_report
+
+
+_REPORT_LOGGER = logging.getLogger(__name__)
+
+# ============ Report Bridge (Batch 3.3.2) ============
+from dp_engine.report_bridge.coordinator import ArtifactOperationCoordinator
+from dp_engine.report_bridge.models import (
+    ReportBridgeStatus,
+    ReportBridgePublicResult,
+    ReportAssetSummary,
+    SAFE_ERROR_MESSAGES,
+)
 
 # ============ Core Data Models (SSOT) ============
 from core.models import (
@@ -84,30 +126,17 @@ from state.app_state import AppState
 # ============ Main Window ============
 
 def validate_docx_template(tmpl_path: str) -> str | None:
-    """校验 Word 模板是否可被 python-docx 打开。
+    """向后兼容入口：委托统一模板校验模块。"""
+    from utils.report_template_validation import validate_word_template
 
-    返回 None = 有效，返回字符串 = 错误描述（中文友好提示）。
-    """
-    import os as _os
-    if not tmpl_path or not _os.path.isfile(tmpl_path):
-        return None  # 无模板是可接受的
-    fname = _os.path.basename(tmpl_path)
-    ext = _os.path.splitext(fname)[1].lower()
-    if ext != '.docx':
-        return (
-            f"模板文件「{fname}」不是 .docx 格式"
-            f"（扩展名为 {ext or '无'}，可能为旧 .doc 格式或主题文件）。\n"
-            f"请选择扩展名为 .docx 的有效 Word 模板，或清空模板使用默认样式。"
-        )
-    try:
-        from docx import Document
-        Document(tmpl_path)
-    except Exception as e:
-        return (
-            f"模板文件「{fname}」无法作为 Word 模板打开：{e}\n"
-            f"请选择有效的 .docx 文件，或清空模板使用默认样式。"
-        )
-    return None
+    return validate_word_template(tmpl_path)
+
+
+def validate_pptx_template(tmpl_path: str) -> str | None:
+    """校验 PPTX 模板类型、包结构和演示页面尺寸。"""
+    from utils.report_template_validation import validate_ppt_template
+
+    return validate_ppt_template(tmpl_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -174,11 +203,66 @@ def _resolve_project_root_from_files(
     return os.path.join(lib_root, project_names.pop())
 
 
+# ── Atomic report transaction helpers (Batch 3.3.1B) ──
+
+
+def _check_cancel(worker) -> None:
+    """Raise RuntimeError if the worker has been cancelled."""
+    if getattr(worker, '_cancelled', False):
+        raise RuntimeError("报告生成已取消")
+
+
+def _cleanup_temp(temp_path: str) -> None:
+    """Best-effort delete of a temp file; never raises."""
+    try:
+        if temp_path and os.path.isfile(temp_path):
+            os.unlink(temp_path)
+    except OSError:
+        pass
+
+
+def _validate_temp_output(temp_path: str, report_type: str) -> None:
+    """Validate that a temp report file is non-empty and can be re-opened.
+
+    Raises RuntimeError on validation failure.
+    """
+    if not os.path.isfile(temp_path):
+        raise RuntimeError("报告临时文件不存在")
+    if os.path.getsize(temp_path) == 0:
+        raise RuntimeError("报告临时文件为空")
+    if report_type == 'ppt':
+        try:
+            from pptx import Presentation
+            Presentation(temp_path)
+        except Exception:
+            raise RuntimeError("PPT 临时文件验证失败：无法打开")
+    else:
+        try:
+            from docx import Document
+            Document(temp_path)
+        except Exception:
+            raise RuntimeError("Word 临时文件验证失败：无法打开")
+
+
+def _fsync_path(path: str) -> None:
+    """fsync a file to durable storage.
+
+    Opens the file in binary read/write mode, flushes, and fsyncs.
+    Raises RuntimeError on failure.
+    """
+    try:
+        with open(path, 'r+b') as f:
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        raise RuntimeError("报告临时文件持久化失败") from e
+
+
 def _inject_figures_by_reference(
     docx_path: str, manifest, warnings: list[str],
 ) -> None:
     """扫描 docx 正文中的「图N」引用，注入对应图片+图题到首次引用段落之后。
-    未被引用的图 → 追加到末尾「图表附录」节 + 警告。
+    未被引用的图优先按语义归入相关章节，无法匹配时才追加到图表附录。
     引用不存在的图N → 警告。
     """
     import re as _re
@@ -232,21 +316,95 @@ def _inject_figures_by_reference(
         except Exception as e:
             warnings.append(f"图{fig_no} 插入失败: {e}")
 
-    # 未被引用的图 → 附录
+    # 未被引用的图 → 按所属模块语义归位到最相关章节。
     unreferenced = [fn for fn in fig_map if fn not in fig_to_para]
     if unreferenced:
-        doc.add_heading('图表附录', level=1)
-        for fn in sorted(unreferenced):
-            rf = fig_map[fn]
-            try:
-                doc.add_picture(rf.png_path, width=Inches(5.0))
-                doc.add_paragraph(rf.caption)
-            except Exception as e:
-                warnings.append(f"图{fn}({rf.title}) 附录插入失败: {e}")
-        warnings.append(
-            f"图表附录: {len(unreferenced)}张图未被正文引用, 已追加到末尾 "
-            f"({' '.join(f'图{fn}' for fn in sorted(unreferenced))})"
-        )
+        from core.report_figure_planner import best_matching_section_index
+
+        chapter_blocks: list[tuple[object, str]] = []
+        heading_indexes: list[int] = []
+        for index, paragraph in enumerate(doc.paragraphs):
+            style_id = str(getattr(getattr(paragraph, "style", None), "style_id", ""))
+            if style_id == "Heading1":
+                heading_indexes.append(index)
+        for position, heading_index in enumerate(heading_indexes):
+            next_index = (
+                heading_indexes[position + 1]
+                if position + 1 < len(heading_indexes)
+                else len(doc.paragraphs)
+            )
+            block_paragraphs = doc.paragraphs[heading_index:next_index]
+            block_text = " ".join(
+                paragraph.text for paragraph in block_paragraphs if paragraph.text
+            )
+            anchor = (
+                block_paragraphs[-1]
+                if block_paragraphs
+                else doc.paragraphs[heading_index]
+            )
+            chapter_blocks.append((anchor, block_text))
+
+        matched: dict[int, list[int]] = {}
+        still_unmatched: list[int] = []
+        section_texts = [block_text for _, block_text in chapter_blocks]
+        for fig_no in sorted(unreferenced):
+            figure = fig_map[fig_no]
+            planned = {
+                "module": str(getattr(figure, "section", "") or ""),
+                "title": str(getattr(figure, "title", "") or ""),
+            }
+            target_index = best_matching_section_index(section_texts, planned)
+            if target_index is None:
+                still_unmatched.append(fig_no)
+            else:
+                matched.setdefault(target_index, []).append(fig_no)
+
+        for target_index in sorted(matched, reverse=True):
+            anchor: Any = chapter_blocks[target_index][0]._element  # type: ignore[reportAttributeAccessIssue]
+            for fig_no in matched[target_index]:
+                figure: Any = fig_map[fig_no]  # type: ignore[reportAttributeAccessIssue]
+                try:
+                    img_para = doc.add_paragraph()
+                    img_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    img_para.add_run().add_picture(
+                        figure.png_path, width=Inches(5.0)
+                    )
+                    cap_para = doc.add_paragraph(figure.caption)
+                    cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    anchor.addnext(img_para._element)
+                    img_para._element.addnext(cap_para._element)
+                    anchor = cap_para._element
+                except Exception as e:
+                    warnings.append(
+                        f"图{fig_no}({figure.title}) 章节归位插入失败: {e}"
+                    )
+
+        if matched:
+            matched_count = sum(len(figures) for figures in matched.values())
+            warnings.append(
+                f"{matched_count}张图未被模型正文显式引用，已按所属章节自动归位。"
+            )
+
+        if still_unmatched:
+            doc.add_heading('图表附录', level=1)
+            for fig_no in still_unmatched:
+                figure: Any = fig_map[fig_no]  # type: ignore[reportAttributeAccessIssue]
+                try:
+                    img_para = doc.add_paragraph()
+                    img_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    img_para.add_run().add_picture(
+                        figure.png_path, width=Inches(5.0)
+                    )
+                    cap_para = doc.add_paragraph(figure.caption)
+                    cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                except Exception as e:
+                    warnings.append(
+                        f"图{fig_no}({figure.title}) 附录插入失败: {e}"
+                    )
+            warnings.append(
+                f"图表附录: {len(still_unmatched)}张图无法匹配正文章节，已追加到末尾 "
+                f"({' '.join(f'图{fn}' for fn in still_unmatched)})"
+            )
 
     try:
         doc.save(docx_path)
@@ -254,14 +412,51 @@ def _inject_figures_by_reference(
         warnings.append(f"图注入后保存失败: {e}")
 
 
-def _inject_figures_to_pptx(
-    pptx_path: str, manifest, warnings: list[str],
-) -> None:
-    """将 manifest 中所有图表追加为 PPT 附录 slide（一图一 slide，16:9）。
+def _audit_chart_manifest(
+    chart_manifest: list[Any],
+    charts_dir: str,
+) -> list[str]:
+    """把“诊断记录有图条目但实际不可用于报告”的情况显式反馈给用户。"""
+    warnings: list[str] = []
+    missing_files: list[str] = []
+    skipped_phase_b: list[str] = []
+    for entry in chart_manifest:
+        if bool(getattr(entry, "produced", False)):
+            rel_path = str(getattr(entry, "rel_path", "") or "")
+            full_path = os.path.join(charts_dir, rel_path) if rel_path else ""
+            if not rel_path or not os.path.isfile(full_path):
+                missing_files.append(
+                    str(getattr(entry, "chart_id", "") or getattr(entry, "title", "未知图"))
+                )
+            continue
+        if str(getattr(entry, "module", "")) == "phaseb":
+            title = str(getattr(entry, "title", "") or getattr(entry, "chart_id", "迟滞图"))
+            reason = str(getattr(entry, "skip_reason", "") or "无有效绘图数据")
+            skipped_phase_b.append(f"{title}（{reason}）")
 
-    使用 manifest 的 png_path（已落盘的绝对路径），不依赖 LLM 写引用。
-    空 manifest → 不追加、不崩。
-    """
+    if missing_files:
+        warnings.append(
+            "诊断图文件缺失: "
+            + "、".join(missing_files)
+            + "。报告未插入这些图片，请重新保存诊断记录。"
+        )
+    if skipped_phase_b:
+        warnings.append(
+            f"诊断记录中的 {len(skipped_phase_b)} 张阶段B迟滞图没有有效数据，"
+            "报告不会虚构图片；请重新运行阶段B并保存新的诊断记录。详情: "
+            + "；".join(skipped_phase_b)
+        )
+    return warnings
+
+
+def _inject_figures_to_pptx(
+    pptx_path: str,
+    manifest,
+    warnings: list[str],
+    assigned_filenames: set[str] | None = None,
+    template_used: bool = False,
+) -> None:
+    """把模型未选中的图表编排为章节内证据页，而不是末尾附件堆叠。"""
     if manifest is None or manifest.count == 0:
         return
 
@@ -272,33 +467,280 @@ def _inject_figures_to_pptx(
         warnings.append(f"PPT图表注入失败(无法打开pptx): {e}")
         return
 
-    from pptx.util import Inches as _Inches, Pt as _Pt
+    from collections import defaultdict
+    from pathlib import Path as _Path
 
-    # 空白版式 (index 6 = blank)
-    blank_layout = prs.slide_layouts[6]
+    from pptx.dml.color import RGBColor as _RGBColor
+    from pptx.enum.shapes import MSO_SHAPE as _MSO_SHAPE
+    from pptx.util import Emu as _Emu, Pt as _Pt
+    from pptx.enum.text import PP_ALIGN as _PP_ALIGN
+    from pptx.enum.shapes import PP_PLACEHOLDER as _PP_PLACEHOLDER
+    from core.report_figure_planner import (
+        build_figure_catalog,
+        figure_relevance_score,
+    )
 
-    for rf in manifest:
-        try:
-            slide = prs.slides.add_slide(blank_layout)
+    layouts = list(prs.slide_layouts)
+    if not layouts:
+        warnings.append("PPT图表注入失败: 演示文稿不含可用版式")
+        return
 
-            # 图放中上部，底边留给图题
-            slide.shapes.add_picture(
-                rf.png_path,
-                _Inches(0.8), _Inches(0.6),
-                width=_Inches(11.7), height=_Inches(5.8),
+    def _layout_score(layout) -> tuple[int, int]:
+        name = str(getattr(layout, "name", "")).strip().lower()
+        blank_rank = 0 if name in {"blank", "空白", "blanc"} else 1
+        return blank_rank, len(layout.placeholders)
+
+    evidence_layout = min(layouts, key=_layout_score)
+    slide_w = int(prs.slide_width or 9144000)
+    slide_h = int(prs.slide_height or 5143500)
+    assigned = {
+        _Path(filename).name
+        for filename in (assigned_filenames or set())
+        if filename
+    }
+    figures = [
+        figure
+        for figure in manifest
+        if _Path(str(figure.png_path)).name not in assigned
+    ]
+    if not figures:
+        return
+
+    original_slides = list(prs.slides)
+    slide_titles: list[str] = []
+    section_texts: list[str] = []
+    for slide in original_slides:
+        title_shape = slide.shapes.title
+        slide_titles.append(
+            title_shape.text.strip()
+            if title_shape is not None and title_shape.has_text_frame
+            else ""
+        )
+        texts = [
+            getattr(shape, "text", "").strip()
+            for shape in slide.shapes
+            if getattr(shape, "has_text_frame", False) and getattr(shape, "text", "").strip()
+        ]
+        section_texts.append(" ".join(texts))
+
+    def _evidence_group_key(figure) -> str:
+        module = str(getattr(figure, "section", "") or "other")
+        title = str(getattr(figure, "title", "") or "").lower()
+        fig_id = str(getattr(figure, "fig_id", "") or "").lower()
+        if module == "temperature_calib":
+            if "阶段 a" in title or "回归" in title or "tempa" in fig_id:
+                return "temperature_calib_a"
+            sensor_name = str(getattr(figure, "title", "") or "").split(
+                "阶段 B",
+                1,
+            )[0].strip()
+            return f"temperature_calib_b::{sensor_name or '未命名传感器'}"
+        if module == "compare":
+            if "scatter" in fig_id or "散点" in title:
+                return "compare_scatter"
+            return "compare_timeseries"
+        return module
+
+    grouped: dict[str, list[object]] = defaultdict(list)
+    for figure in figures:
+        grouped[_evidence_group_key(figure)].append(figure)
+
+    group_titles = {
+        "data_analysis": "数据分析｜时程证据",
+        "data_cleaning": "数据清洗｜质量证据",
+        "compare_timeseries": "多源对比｜时程证据",
+        "compare_scatter": "多源对比｜相关性证据",
+        "temperature_calib_a": "温度标定｜阶段 A 回归证据",
+        "temperature_calib_b": "温度标定｜阶段 B 诊断证据",
+        "strain_calib": "应变标定｜曲线证据",
+    }
+
+    def _best_target(figure: dict[str, object]) -> int | None:
+        # 第 1 页是报告封面；其标题常含“应变/诊断”等宽泛词，不能因此
+        # 把证据页插到正文论点之前。正文用“全文分 + 标题分”显式加权：
+        # 保留标题优先级，同时允许正文中的明确异常/评级证据胜过泛化标题。
+        content_start = 1 if len(original_slides) > 1 else 0
+        scores = [
+            figure_relevance_score(figure, section_texts[index])
+            + figure_relevance_score(figure, slide_titles[index])
+            for index in range(content_start, len(original_slides))
+        ]
+        if not scores or max(scores) <= 0:
+            return None
+        return content_start + scores.index(max(scores))
+
+    def _evidence_group_priority(group_key: str) -> int:
+        """同一正文页后的证据顺序：清洗/分析→对比→温标A/B→应变标定。"""
+        fixed = {
+            "data_cleaning": 10,
+            "data_analysis": 20,
+            "compare_timeseries": 30,
+            "compare_scatter": 31,
+            "temperature_calib_a": 40,
+            "strain_calib": 60,
+        }
+        if group_key in fixed:
+            return fixed[group_key]
+        if group_key.startswith("temperature_calib_b::"):
+            sensor_name = group_key.split("::", 1)[1].upper()
+            sensor_order = {
+                "A1": 0,
+                "A2": 1,
+                "B1": 2,
+                "B2": 3,
+                "C1": 4,
+                "C2": 5,
+            }
+            return 50 + sensor_order.get(sensor_name, 9)
+        return 90
+
+    insertion_plans: list[tuple[int, int, str, list[object]]] = []
+    for module, module_figures in grouped.items():
+        catalog = build_figure_catalog(module_figures)
+        target_candidates = [_best_target(figure) for figure in catalog]
+        target_index = next(
+            (index for index in target_candidates if index is not None),
+            max(0, len(original_slides) - 1),
+        )
+        group_title = group_titles.get(module)
+        if group_title is None and module.startswith("temperature_calib_b::"):
+            sensor_name = module.split("::", 1)[1]
+            group_title = f"温度标定｜{sensor_name} 阶段 B 补偿前后对比"
+        insertion_plans.append((
+            target_index,
+            _evidence_group_priority(module),
+            group_title or "分析证据",
+            module_figures,
+        ))
+
+    def _remove_content_placeholders(slide) -> None:
+        removable_types = {
+            _PP_PLACEHOLDER.TITLE,
+            _PP_PLACEHOLDER.CENTER_TITLE,
+            _PP_PLACEHOLDER.VERTICAL_TITLE,
+            _PP_PLACEHOLDER.SUBTITLE,
+            _PP_PLACEHOLDER.BODY,
+            _PP_PLACEHOLDER.OBJECT,
+            _PP_PLACEHOLDER.VERTICAL_BODY,
+            _PP_PLACEHOLDER.VERTICAL_OBJECT,
+            _PP_PLACEHOLDER.PICTURE,
+            _PP_PLACEHOLDER.BITMAP,
+        }
+        for placeholder in list(slide.placeholders):
+            if placeholder.placeholder_format.type in removable_types:
+                placeholder._element.getparent().remove(placeholder._element)
+
+    def _move_last_slide_to(index: int) -> None:
+        slide_ids = prs.slides._sldIdLst
+        new_slide_id = slide_ids[-1]
+        slide_ids.remove(new_slide_id)
+        slide_ids.insert(index, new_slide_id)
+
+    def _add_evidence_slide(
+        title: str,
+        chunk: list[object],
+        chunk_index: int,
+        chunk_total: int,
+    ) -> None:
+        slide = prs.slides.add_slide(evidence_layout)
+        _remove_content_placeholders(slide)
+        if not template_used:
+            background = slide.background.fill
+            background.solid()
+            background.fore_color.rgb = _RGBColor(0xF7, 0xF9, 0xFC)
+            accent = slide.shapes.add_shape(
+                _MSO_SHAPE.RECTANGLE,
+                _Emu(0),
+                _Emu(0),
+                _Emu(slide_w),
+                _Emu(int(slide_h * 0.025)),
             )
+            accent.fill.solid()
+            accent.fill.fore_color.rgb = _RGBColor(0x1D, 0xA7, 0xA1)
+            accent.line.fill.background()
 
-            # 图题文本框
-            txBox = slide.shapes.add_textbox(
-                _Inches(0.8), _Inches(6.6), _Inches(11.7), _Inches(0.5),
+        display_title = (
+            f"{title}（{chunk_index}/{chunk_total}）"
+            if chunk_total > 1
+            else title
+        )
+        title_box = slide.shapes.add_textbox(
+            _Emu(int(slide_w * 0.06)),
+            _Emu(int(slide_h * 0.06)),
+            _Emu(int(slide_w * 0.88)),
+            _Emu(int(slide_h * 0.11)),
+        )
+        title_p = title_box.text_frame.paragraphs[0]
+        title_p.text = display_title
+        title_p.font.size = _Pt(30)
+        title_p.font.bold = True
+        if not template_used:
+            title_p.font.color.rgb = _RGBColor(0x0B, 0x1F, 0x33)
+
+        count = len(chunk)
+        if count == 1:
+            slots = [(0.08, 0.20, 0.84, 0.62)]
+        else:
+            slots = [
+                (0.055, 0.22, 0.43, 0.56),
+                (0.515, 0.22, 0.43, 0.56),
+            ]
+        for figure, (left_f, top_f, width_f, height_f) in zip(chunk, slots):
+            fig: Any = figure  # type: ignore[reportAttributeAccessIssue]
+            try:
+                max_width = int(slide_w * width_f)
+                max_height = int(slide_h * height_f)
+                from PIL import Image as _Image
+
+                with _Image.open(fig.png_path) as image:
+                    image_width, image_height = image.size
+                scale = min(max_width / image_width, max_height / image_height)
+                width = int(image_width * scale)
+                height = int(image_height * scale)
+                left = int(slide_w * left_f) + max(0, (max_width - width) // 2)
+                top = int(slide_h * top_f) + max(0, (max_height - height) // 2)
+                slide.shapes.add_picture(
+                    fig.png_path,
+                    _Emu(left),
+                    _Emu(top),
+                    width=_Emu(width),
+                    height=_Emu(height),
+                )
+                caption_box = slide.shapes.add_textbox(
+                    _Emu(int(slide_w * left_f)),
+                    _Emu(int(slide_h * 0.82)),
+                    _Emu(max_width),
+                    _Emu(int(slide_h * 0.08)),
+                )
+                caption_p = caption_box.text_frame.paragraphs[0]
+                caption_p.text = fig.caption
+                caption_p.font.size = _Pt(14)
+                caption_p.alignment = _PP_ALIGN.CENTER
+                if not template_used:
+                    caption_p.font.color.rgb = _RGBColor(0x42, 0x52, 0x66)
+            except Exception as e:
+                warnings.append(
+                    f"图{fig.fig_no}({fig.title}) PPT插入失败: {e}"
+                )
+
+    # 从后向前插入，保证原内容页索引在处理过程中保持有效。
+    for target_index, _priority, group_title, module_figures in sorted(
+        insertion_plans,
+        key=lambda item: (item[0], item[1]),
+        reverse=True,
+    ):
+        chunks = [
+            module_figures[index:index + 2]
+            for index in range(0, len(module_figures), 2)
+        ]
+        for reverse_index in range(len(chunks) - 1, -1, -1):
+            _add_evidence_slide(
+                group_title,
+                chunks[reverse_index],
+                reverse_index + 1,
+                len(chunks),
             )
-            tf = txBox.text_frame
-            tf.word_wrap = True
-            p = tf.paragraphs[0]
-            p.text = rf.caption
-            p.font.size = _Pt(14)
-        except Exception as e:
-            warnings.append(f"图{rf.fig_no}({rf.title}) PPT插入失败: {e}")
+            _move_last_slide_to(target_index + 1)
 
     try:
         prs.save(pptx_path)
@@ -306,8 +748,439 @@ def _inject_figures_to_pptx(
         warnings.append(f"PPT图表注入后保存失败: {e}")
 
 
+def _build_report_render_assets(
+    manifest,
+    *,
+    bridge_workspace=None,
+    bridge_assets=(),
+) -> tuple[tuple[ReportRenderAsset, ...], tuple[str, ...]]:
+    """Build the path-minimal semantic image snapshot for one Provider call."""
+    assets: list[ReportRenderAsset] = []
+    required_ids: list[str] = []
+
+    if manifest is not None:
+        for figure in manifest:
+            source = Path(str(getattr(figure, 'png_path', '') or ''))
+            if not source.is_absolute():
+                raise RuntimeError('报告图表路径必须为绝对路径。')
+            suffix = source.suffix.lower()
+            if suffix not in {'.png', '.jpg', '.jpeg'}:
+                raise RuntimeError('报告图表必须为 PNG 或 JPEG。')
+            fig_id = str(getattr(figure, 'fig_id', '') or '').strip()
+            title = str(getattr(figure, 'title', '') or '').strip()
+            key_stat = str(getattr(figure, 'key_stat', '') or '').strip()
+            section = str(getattr(figure, 'section', '') or '').strip()
+            semantic_label = title or fig_id
+            if key_stat:
+                semantic_label = f'{semantic_label}；{key_stat}'
+            assets.append(ReportRenderAsset(
+                host_id=fig_id,
+                source_path=source.resolve(strict=False),
+                media_type=(
+                    'image/png' if suffix == '.png' else 'image/jpeg'
+                ),
+                semantic_label=semantic_label,
+                target=section or '报告正文',
+            ))
+            required_ids.append(fig_id)
+
+    if bridge_workspace is not None:
+        workspace = Path(bridge_workspace).resolve(strict=False)
+        for asset in bridge_assets:
+            role = getattr(getattr(asset, 'role', None), 'value', '')
+            if role != 'image':
+                continue
+            order = int(getattr(asset, 'order', 0))
+            filename = str(getattr(asset, 'managed_filename', '') or '')
+            source = (workspace / filename).resolve(strict=False)
+            suffix = source.suffix.lower()
+            if suffix not in {'.png', '.jpg', '.jpeg'}:
+                continue
+            host_id = f'bridge_{order:03d}'
+            authoritative = getattr(asset, 'authoritative_artifact', None)
+            display_name = str(
+                getattr(authoritative, 'display_name', '') or '技能图片素材'
+            ).strip()
+            assets.append(ReportRenderAsset(
+                host_id=host_id,
+                source_path=source,
+                media_type=(
+                    'image/png' if suffix == '.png' else 'image/jpeg'
+                ),
+                semantic_label=display_name,
+                target='技能输出素材',
+            ))
+            required_ids.append(host_id)
+
+    return tuple(assets), tuple(required_ids)
+
+
+def _execute_report_build_transaction(
+    config: dict,
+    outline: str,
+    report_type: str,
+    generate_fn,
+    template_path: str,
+    final_output_path: str,
+    report_dir: str,
+    project_dir: str,
+    candidate: str,
+    *,
+    worker=None,
+    bridge_workspace=None,
+    bridge_assets=(),
+    _provider=None,
+    render_orchestrator=None,
+    structured_report_override=None,
+):
+    """报告构建事务 — 原子 no-clobber 提交 (Batch 3.3.1B-R2: 机械提取).
+
+    所有构建、后处理和提交操作在临时文件上执行。
+    os.link 是唯一提交点。任何步骤失败 → 回滚删除 temp，
+    final 不变或不存在。
+    """
+    ext = '.pptx' if report_type == 'ppt' else '.docx'
+    _report_warnings: list[str] = []
+    diagnosis_loaded: bool = False
+    manifest = None
+    provider_provenance: dict[str, str] | None = None
+    effective_template_path = template_path
+    temp_output_path: str | None = None
+    temp_fd: int = -1
+    try:
+        # 0. 预检
+        from core.ai_client import AIClient
+        ai = AIClient.get_instance()
+        if not ai.is_available():
+            raise RuntimeError(
+                "AI 模型未配置。\n\n"
+                "请在「报告生成工作台」左侧点击「AI 模型配置」，\n"
+                "完成在线模型配置并点击「连接」。"
+            )
+        # 0.5 模板预校验
+        if template_path:
+            from utils.report_template_preparation import (
+                load_prepared_template_profile,
+                prepare_report_template,
+            )
+
+            prepared_profile = load_prepared_template_profile(template_path)
+            if (
+                prepared_profile is None
+                or prepared_profile.get('report_type') != report_type
+            ):
+                template_result = prepare_report_template(
+                    template_path,
+                    report_type,
+                )
+                if not template_result.accepted or not template_result.usable_path:
+                    raise RuntimeError(
+                        '\n'.join(template_result.reasons)
+                        or '模板未通过准入检查。'
+                    )
+                effective_template_path = template_result.usable_path
+                if template_result.status == 'normalized':
+                    _report_warnings.append(
+                        '模板已在生成前自动标准化：'
+                        + '；'.join(template_result.reasons)
+                    )
+
+        # ═══════════════════════════════════════════════
+        # 1. 图表 — 优先读已存 manifest (母本B: 诊断保存时已产图落盘)
+        # ═══════════════════════════════════════════════
+        from core.chart_store import (
+            build_chart_store, chart_manifest_to_figure_manifest,
+            chart_manifest_from_dict,
+        )
+        diag_rec = config.get('_diagnosis_record')
+        chart_data = (diag_rec or {}).get('chart_data', {}) or {}
+
+        # record_id 优先取保存时写入的持久化字段 (母本B P1/P2 对齐)
+        record_id = (diag_rec or {}).get('record_id')
+        if not record_id:
+            # 降级: 旧记录无 record_id → 从 timestamp 推导 (向后兼容)
+            ts = (diag_rec or {}).get('timestamp',
+                                      datetime.now().strftime('%Y%m%d_%H%M%S'))
+            record_id = ts.replace(' ', '_').replace(':', '')
+            print(f"[图表诊断] 旧记录降级推导 record_id={record_id}")
+
+        stored_manifest = (diag_rec or {}).get('chart_manifest')
+        if stored_manifest:
+            # 读取路径: 图已在诊断保存时落盘到记录目录, 报告直接引用
+            charts_dir = os.path.join(candidate, '数据', '诊断记录',
+                                      record_id, 'charts')
+            _chart_manifest = chart_manifest_from_dict(stored_manifest)
+            print(f"[图表诊断] 从已存 manifest 读取 (非重产), "
+                  f"record_id={record_id}, "
+                  f"produced={sum(1 for e in _chart_manifest if e.produced)}")
+        else:
+            # 降级: 旧记录无 manifest, 重新产图到记录目录 (向后兼容)
+            charts_dir = os.path.join(candidate, '数据', '诊断记录',
+                                      record_id, 'charts')
+            os.makedirs(charts_dir, exist_ok=True)
+            print(f"[图表诊断] 旧记录降级产图, record_id={record_id}")
+            _chart_manifest = build_chart_store(
+                chart_data, charts_dir, _report_warnings)
+
+        for manifest_warning in _audit_chart_manifest(
+            _chart_manifest, charts_dir
+        ):
+            if manifest_warning not in _report_warnings:
+                _report_warnings.append(manifest_warning)
+
+        manifest = chart_manifest_to_figure_manifest(
+            _chart_manifest, charts_dir)
+        from core.report_figure_planner import build_figure_catalog
+        figure_catalog = build_figure_catalog(manifest)
+
+        print(f"[图表诊断] manifest 图数: {manifest.count}")
+        pngs = (
+            [f for f in os.listdir(charts_dir) if f.endswith('.png')]
+            if os.path.isdir(charts_dir) else []
+        )
+        print(f"[图表诊断] charts/ 落盘 PNG 数: {len(pngs)} "
+              f"({', '.join(pngs[:8])}{'…' if len(pngs) > 8 else ''})")
+        charts_context = manifest.to_llm_context(max_chars=600)
+
+        render_assets, required_figure_ids = _build_report_render_assets(
+            manifest,
+            bridge_workspace=bridge_workspace,
+            bridge_assets=bridge_assets,
+        )
+
+        # 2. 结构化数据。PPT Master consumes the confirmed Planning Snapshot
+        # payload; all other Providers retain the legacy section-generation path.
+        if structured_report_override is None:
+            builder_data = generate_structured_report(
+                config, outline, report_type, generate_fn,
+                charts_context=charts_context,
+                chart_catalog=figure_catalog,
+                progress_callback=(
+                    lambda d: worker.progress.emit(d) if worker else None
+                ),
+                cancel_check=(
+                    lambda: getattr(worker, '_cancelled', False) if worker else False
+                ),
+            )
+            _report_warnings.extend(builder_data.pop('_report_warnings', []))
+            diagnosis_loaded = builder_data.pop('_diagnosis_loaded', False)
+        else:
+            try:
+                builder_data = json.loads(json.dumps(
+                    structured_report_override,
+                    ensure_ascii=False,
+                ))
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    '已确认的 PPT Master 结构化方案不可序列化。'
+                ) from error
+            diagnosis_loaded = isinstance(
+                config.get('_diagnosis_record'),
+                dict,
+            )
+
+        # 2b. 注入标定/异常表格 (优先 from chart_data, 降级 from_providers)
+        try:
+            from core.chart_bundle import ChartBundle, extract_four_tables, _rows_to_md_table
+            cd = (diag_rec or {}).get('chart_data', {}) or {}
+            if not cd and _provider is not None:
+                bundle = ChartBundle.from_providers(_provider)
+                cd = bundle.to_dict()
+            four_tables = extract_four_tables(cd)
+            if four_tables:
+                # 等价重建 markdown — 与 gen_markdown_tables_from_bundle 同输出格式
+                # 等价性: extract_four_tables 解析原 md 字符串 → _rows_to_md_table 重生成
+                #         cell 内容不变（strip→rejoin），分隔行格式一致，heading 前缀一致
+                md_parts: list[str] = []
+                for tbl in four_tables:
+                    md = _rows_to_md_table([tbl.headers] + tbl.rows)
+                    md_parts.append(f"\n### {tbl.heading}\n\n{md}\n")
+                tables_md = "\n".join(md_parts)
+                builder_data.setdefault("sections", []).append({
+                    "heading": "数据汇总附表",
+                    "content_paragraphs": [tables_md],
+                    "image_anchors": [],
+                    "tables": [],
+                })
+                print(f"[报告] 已注入数据汇总附表 (表数={len(four_tables)}, "
+                      f"标题={[t.heading for t in four_tables]})")
+            else:
+                print("[报告] 数据汇总附表为空 — 跳过")
+        except Exception as e:
+            import traceback as _tb
+            _report_warnings.append(
+                f"数据汇总附表注入阶段异常：{type(e).__name__}: {e}")
+            print(f"[报告] 数据汇总附表注入阶段异常: {_tb.format_exc()}")
+
+        # ── 3. 创建临时输出文件（同目录、同文件系统） ──
+        try:
+            temp_fd, temp_output_path = tempfile.mkstemp(
+                dir=report_dir,
+                prefix=".dp-report-",
+                suffix=ext,
+            )
+            os.close(temp_fd)
+            temp_fd = -1
+        except OSError:
+            raise RuntimeError(
+                "无法创建报告临时文件，请检查磁盘空间和目录权限。"
+            )
+
+        # 3b. Provider 渲染 docx/pptx — 写入 temp_output_path
+        try:
+            render_request = ReportRenderRequest(
+                report_type=report_type,
+                structured_report=builder_data,
+                template_path=effective_template_path,
+                output_path=temp_output_path,
+                project_dir=(charts_dir if report_type == 'ppt' else project_dir),
+                bridge_workspace=bridge_workspace,
+                bridge_assets=tuple(bridge_assets),
+                assets=render_assets,
+                required_figure_ids=required_figure_ids,
+                inclusion_summary={
+                    'diagnosis_loaded': diagnosis_loaded,
+                    'figure_count': len(required_figure_ids),
+                    'project_source_count': len(
+                        config.get('project_files', []) or []
+                    ),
+                    'bridge_asset_count': len(tuple(bridge_assets)),
+                },
+                cancel_check=(
+                    lambda: _check_cancel(worker)
+                    if worker else None
+                ),
+            )
+            orchestrator = render_orchestrator or ReportRenderOrchestrator()
+            render_result = orchestrator.render(render_request)
+            provider_provenance = render_result.provenance.to_dict()
+            provider_label = (
+                f"{render_result.provenance.provider_id}@"
+                f"{render_result.provenance.provider_version}"
+            )
+            _REPORT_LOGGER.info(
+                "Report rendered by provider=%s",
+                provider_label,
+            )
+            print(f"[报告] 实际生成后端: {provider_label}")
+            _report_warnings.extend(render_result.warnings)
+            for img in render_result.missing_images:
+                _report_warnings.append(f"图片缺失: {img}")
+        except Exception:
+            # Provider render failed → cleanup temp, no final
+            _cleanup_temp(temp_output_path)
+            raise
+
+        # 4. 图N 引用驱动放置 (构建时后处理: 扫描正文→注入图+图题) — 作用于 temp
+        if (
+            render_result.requires_host_postprocessing
+            and manifest
+            and manifest.count > 0
+        ):
+            try:
+                if report_type == 'ppt':
+                    assigned_filenames: set[str] = set()
+                    for slide in builder_data.get("slides", []):
+                        anchor = str(slide.get("image_anchor") or "")
+                        match = re.search(
+                            r"\[INSERT_IMAGE:\s*([^\]]+)\]",
+                            anchor,
+                        )
+                        if match:
+                            assigned_filenames.add(
+                                os.path.basename(match.group(1).strip())
+                            )
+                    _inject_figures_to_pptx(
+                        temp_output_path,
+                        manifest,
+                        _report_warnings,
+                        assigned_filenames=assigned_filenames,
+                        template_used=bool(effective_template_path),
+                    )
+                else:
+                    _inject_figures_by_reference(
+                        temp_output_path, manifest, _report_warnings,
+                    )
+            except Exception:
+                # Figure injection failed → cleanup temp, no final
+                _cleanup_temp(temp_output_path)
+                raise
+
+        # 5. 「资料纳入情况」段 — 作用于 temp
+        if render_result.requires_host_postprocessing:
+            try:
+                DataProcessorWindow._append_inclusion_footer(
+                    temp_output_path, report_type,
+                    _report_warnings, diagnosis_loaded,
+                )
+            except Exception:
+                _cleanup_temp(temp_output_path)
+                raise
+
+        # ── 6. 验证临时文件可打开 ──
+        try:
+            _validate_temp_output(temp_output_path, report_type)
+        except Exception:
+            _cleanup_temp(temp_output_path)
+            raise
+
+        # ── 7. fsync temp ──
+        try:
+            _fsync_path(temp_output_path)
+        except Exception:
+            _cleanup_temp(temp_output_path)
+            raise
+
+        # ── 8. 最后一次 cancel 检查 ──
+        if worker is not None and getattr(worker, '_cancelled', False):
+            _cleanup_temp(temp_output_path)
+            raise RuntimeError("报告生成已取消")
+
+        # ── 9. os.link 原子 no-clobber 提交 ──
+        try:
+            os.link(temp_output_path, final_output_path)
+        except FileExistsError:
+            _cleanup_temp(temp_output_path)
+            raise RuntimeError(
+                "报告提交冲突：目标文件已被外部创建，请重试。"
+            )
+        except OSError:
+            _cleanup_temp(temp_output_path)
+            raise RuntimeError(
+                "报告提交失败：当前文件系统不支持原子提交。"
+            )
+
+        # ── 10. 提交后清理 temp ──
+        try:
+            os.unlink(temp_output_path)
+        except OSError:
+            # temp cleanup failed, final is still valid
+            _report_warnings.append(
+                "报告已成功保存，临时文件清理失败（不影响报告完整性）。"
+            )
+
+        return {
+            'path': final_output_path,
+            'warnings': _report_warnings,
+            'diagnosis_loaded': diagnosis_loaded,
+            'provider_provenance': provider_provenance,
+        }
+    except Exception as e:
+        # ── 回滚：确保 temp 已删除 ──
+        if temp_output_path is not None:
+            _cleanup_temp(temp_output_path)
+        import traceback as _tb
+        msg = f'{e}'
+        if _report_warnings:
+            msg += '\n\n已收集的警告/降级信息:'
+            for w in _report_warnings:
+                msg += f'\n  - {w}'
+        msg += f'\n{_tb.format_exc()}'
+        raise RuntimeError(msg) from e
+
+
 class DataProcessorWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, skill_task_owner: "SkillInstallTaskOwner | None" = None):
         super().__init__()
         self.current_data = None
         self._annotation_orig_dtypes: dict[str, Any] | None = None
@@ -343,9 +1216,146 @@ class DataProcessorWindow(QMainWindow):
 
         # 传感器系统
 
+        # ── Skill install task owner (Batch 2.4) ──
+        # Application-level owner for in-flight install/uninstall workers.
+        # Owned by QApplication (not DataProcessorWindow) so workers survive
+        # main window close. DataProcessorWindow holds a reference only.
+        # Workers are transferred here when the skill tab widget closes,
+        # ensuring they complete naturally even after UI destruction.
+        self._skill_task_owner = skill_task_owner  # May be None in tests
+
+        from utils.app_paths import get_skills_paths
+        skill_paths = get_skills_paths()
+        self._report_provider_controller = ReportProviderController(
+            skill_paths.registry_file,
+            skill_paths.installed_dir,
+        )
+        self._ppt_master_workflow: PptMasterPlanningWorkflow | None = None
+
+        # ── Report Bridge: singleton coordinator + controller (Batch 3.3.2) ──
+        self._bridge_coordinator = ArtifactOperationCoordinator()
+        from ui.report_bridge_controller import ReportBridgeController
+        self._bridge_controller = ReportBridgeController(
+            artifact_store=None,  # Will be lazily resolved by service
+            coordinator=self._bridge_coordinator,
+            parent=self,
+        )
+        self._bridge_controller.result_ready.connect(
+            self._on_bridge_result_ready
+        )
+        self._bridge_closing = False
+
         self.init_ui()
 
         # AI诊断Widget延迟加载模型配置
+
+    def closeEvent(self, event) -> None:  # pyright: ignore[reportIncompatibleMethodOverride]
+        """Handle main window close: cancel active skill operations.
+
+        Batch 2.5: Tasks survive window close — TaskOwner keeps QApplication alive.
+        1. Source inspection: cancel QNetworkReply via source controller
+        2. Download: cancel QNetworkReply → delete .part → no InstallWorker started
+        3. InstallWorker/UninstallWorker: cancel token set → controller transferred
+           to TaskOwner → worker completes naturally
+        4. If tasks are still running: keep QApplication alive via TaskOwner,
+           schedule app.quit() when safe
+        5. Original cleanup (super().closeEvent) still runs
+
+        TaskOwner lives on QApplication, so workers survive window close.
+        Controller cleanup exceptions are logged, not silenced.
+        """
+        import logging
+        _close_logger = logging.getLogger(__name__)
+
+        # ── Path 1: Cancel skill source inspection ──
+        try:
+            if hasattr(self, 'skill_tab_widget'):
+                widget = self.skill_tab_widget
+                if widget is not None and hasattr(widget, '_source_controller'):
+                    widget._source_controller.cancel()
+        except Exception:
+            _close_logger.exception("Error cancelling source controller during close")
+
+        # ── Path 2-4: Cancel install/download, transfer workers to TaskOwner ──
+        try:
+            if hasattr(self, 'skill_tab_widget'):
+                widget = self.skill_tab_widget
+                if widget is not None and hasattr(widget, '_install_controller'):
+                    ctrl = widget._install_controller
+                    # Disconnect UI signals to prevent callbacks after widget destruction
+                    for sig_name in ('result_ready', 'error_occurred', 'progress_changed',
+                                     'stage_changed', 'running_changed'):
+                        try:
+                            getattr(ctrl, sig_name).disconnect()
+                        except (TypeError, RuntimeError):
+                            pass
+                    # Transfer controller ownership to app-level TaskOwner
+                    if self._skill_task_owner is not None:
+                        self._skill_task_owner.add_controller(ctrl)
+                    # Cancel active operations (sets cancel token, aborts downloads)
+                    ctrl.cancel()
+        except Exception:
+            _close_logger.exception("Error cancelling install controller during close")
+
+        # ── Path 2b: Cancel runtime healthcheck, transfer RuntimeWorker (Batch 3.0) ──
+        try:
+            if hasattr(self, 'skill_tab_widget'):
+                widget = self.skill_tab_widget
+                if widget is not None and hasattr(widget, '_runtime_controller'):
+                    rctrl = widget._runtime_controller
+                    for sig_name in ('result_ready', 'error_occurred', 'running_changed'):
+                        try:
+                            getattr(rctrl, sig_name).disconnect()
+                        except (TypeError, RuntimeError):
+                            pass
+                    if self._skill_task_owner is not None:
+                        self._skill_task_owner.add_controller(rctrl)  # type: ignore[reportArgumentType]
+                    rctrl.cancel()
+                    rctrl.close()
+        except Exception:
+            _close_logger.exception("Error cancelling runtime controller during close")
+
+        # ── Path 3: Bridge controller shutdown (Batch 3.3.2) ──
+        self._bridge_closing = True
+        try:
+            # Cancel bridge preparation if active
+            self._bridge_controller.cancel()
+            # Close bridge controller (handles thread lifecycle)
+            self._bridge_controller.close()
+        except Exception:
+            _close_logger.exception("Error shutting down bridge controller")
+
+        # ── Path 3.5: Cancel active report worker (Batch 3.3.2-R5) ──
+        if hasattr(self, '_report_worker') and self._report_worker is not None:
+            try:
+                active_provider = getattr(
+                    self,
+                    '_active_report_provider',
+                    None,
+                )
+                cancel_provider = getattr(active_provider, 'cancel', None)
+                if callable(cancel_provider):
+                    cancel_provider()
+            except Exception:
+                _close_logger.exception(
+                    "Error cancelling report Provider during close"
+                )
+            try:
+                if self._report_worker.isRunning():
+                    self._report_worker.cancel()
+            except Exception:
+                _close_logger.exception("Error cancelling report worker during close")
+
+        # ── Path 4: Keep QApplication alive if tasks are still running ──
+        if self._skill_task_owner is not None and self._skill_task_owner.has_running_tasks():
+            _close_logger.info(
+                "Skill tasks still running — QApplication stays alive until safe"
+            )
+            self._skill_task_owner.begin_application_shutdown()
+            self._skill_task_owner.schedule_app_quit_when_safe()
+
+        # ── Allow Qt to clean up child widgets and their resources ──
+        super().closeEvent(event)
 
     # ── AI诊断兼容性代理 (AiDiagnosisWidget 独立管理模型配置) ──
 
@@ -919,8 +1929,20 @@ class DataProcessorWindow(QMainWindow):
         self.report_content_stack.addWidget(self.wiki_tab_widget)
 
         # 技能插件中心页面
-        self.skill_tab_widget = AgentSkillWidget()
+        self.skill_tab_widget = AgentSkillWidget(
+            task_owner=self._skill_task_owner,
+        )
+        # Batch 3.3.2: Wire bridge coordinator + send-to-report signal
+        self.skill_tab_widget.set_bridge_coordinator(self._bridge_coordinator)
+        self.skill_tab_widget.send_to_report_requested.connect(
+            self._handle_bridge_send
+        )
+        self.skill_tab_widget.registry_changed.connect(
+            self._refresh_report_provider_options
+        )
         self.report_content_stack.addWidget(self.skill_tab_widget)
+
+        self._refresh_report_provider_options()
 
         self.report_tab.setLayout(main_layout)
 
@@ -951,7 +1973,84 @@ class DataProcessorWindow(QMainWindow):
         self.report_workbench_widget.load_diagnosis_requested.connect(
             self._handle_load_diagnosis
         )
+        self.report_workbench_widget.report_provider_filter_changed.connect(
+            self._refresh_report_provider_options
+        )
+        self.report_workbench_widget.report_inputs_changed.connect(
+            self._handle_report_inputs_changed
+        )
+        self.report_workbench_widget.ppt_master_planning_requested.connect(
+            self._handle_ppt_master_planning_action
+        )
+        # Batch 3.3.2: Bridge signals
+        self.report_workbench_widget.bridge_clear_requested.connect(
+            self._handle_bridge_clear
+        )
+        self.report_workbench_widget.bridge_cancel_prepare_requested.connect(
+            self._handle_bridge_cancel_prepare
+        )
         return self.report_workbench_widget
+
+    def _refresh_report_provider_options(
+        self,
+        artifact_type: str | None = None,
+        template_mode: str | None = None,
+    ) -> None:
+        """Refresh only Providers compatible with the current report inputs."""
+        if artifact_type is None or template_mode is None:
+            artifact_type, template_mode = (
+                self.report_workbench_widget.current_report_provider_filter()
+            )
+        report_type = 'ppt' if artifact_type == 'pptx' else 'word'
+        try:
+            options = self._report_provider_controller.list_options(
+                report_type=report_type,
+                template_mode=template_mode,
+            )
+        except Exception as error:
+            _REPORT_LOGGER.warning(
+                "Report provider catalog refresh failed: %s",
+                type(error).__name__,
+            )
+            options = (ReportProviderOption(
+                provider_id=BUILTIN_PROVIDER_ID,
+                provider_version=BUILTIN_PROVIDER_VERSION,
+                display_name='内置标准生成器',
+                is_builtin=True,
+            ),)
+        if report_type == 'ppt' and probe_expected_ppt_master_installation():
+            host_option = ReportProviderOption(
+                provider_id=PPT_MASTER_PROVIDER_ID,
+                provider_version=PPT_MASTER_PROVIDER_VERSION,
+                display_name='PPT Master 专业演示生成器',
+                is_builtin=False,
+            )
+            if not any(
+                option.provider_id == PPT_MASTER_PROVIDER_ID
+                for option in options
+            ):
+                options = (*options, host_option)
+        self.report_workbench_widget.set_report_provider_options(options)
+
+    def _handle_report_inputs_changed(self) -> None:
+        """Invalidate Host confirmation fingerprints after any UI input change."""
+        workflow = self._ppt_master_workflow
+        if workflow is None or not workflow.snapshot:
+            return
+        reason = '需求、资料、诊断、模板、后端或技能素材发生变化'
+        workflow.invalidate(reason)
+        self.report_workbench_widget.invalidate_ppt_master_workflow(reason)
+
+    def _disconnect_report_cancel_handler(self) -> None:
+        """Remove the per-generation cancel closure after terminal state."""
+        handler = getattr(self, '_report_cancel_handler', None)
+        if handler is None:
+            return
+        try:
+            self.report_workbench_widget.cancel_requested.disconnect(handler)
+        except (TypeError, RuntimeError):
+            pass
+        self._report_cancel_handler = None
 
     # ═══════════════════════════════════════════════
     # 后台 Worker (QThread)
@@ -995,6 +2094,10 @@ class DataProcessorWindow(QMainWindow):
 
     def _handle_outline_generation(self, config: dict):
         """后台生成大纲，完成后填入编辑器."""
+        provider = config.get('report_provider') or {}
+        if provider.get('provider_id') == PPT_MASTER_PROVIDER_ID:
+            self._start_ppt_master_planning(config)
+            return
         generate_fn = self._get_generate_fn()
         self.report_workbench_widget.outline_btn.setEnabled(False)
         self.report_workbench_widget.outline_btn.setText('⏳ 正在生成大纲...')
@@ -1019,6 +2122,258 @@ class DataProcessorWindow(QMainWindow):
         self._outline_worker.finished.connect(_on_outline_done)
         self._outline_worker.error.connect(_on_outline_error)
         self._outline_worker.start()
+
+    def _start_ppt_master_planning(self, config: dict) -> None:
+        """Build a fresh Host workflow and generate its unconfirmed outline."""
+        self.report_workbench_widget.outline_btn.setEnabled(False)
+        self.report_workbench_widget.outline_btn.setText(
+            '⏳ 正在生成 PPT Master 叙事大纲...'
+        )
+        self.report_workbench_widget.ppt_master_confirm_btn.setEnabled(False)
+        self.report_workbench_widget.full_report_btn.setEnabled(False)
+        self.status_bar.showMessage('正在生成 PPT Master 叙事大纲...')
+
+        def _build_workflow(worker=None):
+            return self._create_ppt_master_workflow(config, worker=worker)
+
+        def _done(workflow: PptMasterPlanningWorkflow):
+            self._ppt_master_workflow = workflow
+            self._apply_ppt_master_workflow_view(workflow)
+            self.report_workbench_widget.outline_btn.setEnabled(True)
+            self.report_workbench_widget.outline_btn.setText(
+                '🧭 生成/重新生成 PPT Master 方案'
+            )
+            self.status_bar.showMessage('PPT Master 大纲待确认')
+
+        def _error(message: str):
+            self.report_workbench_widget.outline_btn.setEnabled(True)
+            self.report_workbench_widget.outline_btn.setText(
+                '🧭 生成/重新生成 PPT Master 方案'
+            )
+            self.status_bar.showMessage('PPT Master 规划失败')
+            friendly = message.split('\nTraceback', 1)[0].strip()
+            QMessageBox.warning(
+                self,
+                'PPT Master 规划失败',
+                friendly
+                + '\n\n系统不会自动回退；你可修正输入后重试，或明确选择内置后端。',
+            )
+
+        self._outline_worker = ReportWorker(_build_workflow)
+        self._outline_worker.finished.connect(_done)
+        self._outline_worker.error.connect(_error)
+        self._outline_worker.start()
+
+    def _create_ppt_master_workflow(
+        self,
+        config: dict,
+        *,
+        worker=None,
+    ) -> PptMasterPlanningWorkflow:
+        from core.ai_client import AIClient
+        from core.chart_store import (
+            chart_manifest_from_dict,
+            chart_manifest_to_figure_manifest,
+        )
+        from core.report_engine import build_report_source_context
+
+        ai = AIClient.get_instance()
+        if not ai.is_available():
+            raise RuntimeError(
+                'PPT Master 需要已连接的真实 AI 模型；模拟降级不能用于专业报告。'
+            )
+        if getattr(worker, '_cancelled', False):
+            raise RuntimeError('PPT Master 规划已取消')
+        bridge_info = self.report_workbench_widget.get_bridge_claim_info()
+        if bridge_info:
+            raise RuntimeError(
+                'PPT Master 当前批次尚未接纳技能桥接素材。请先清除“技能输出素材”，'
+                '或明确选择内置后端；系统不会遗漏后继续。'
+            )
+
+        project_files = list(config.get('project_files') or [])
+        req_file = str(config.get('req_file') or '')
+        all_files = [path for path in (*project_files, req_file) if path]
+        candidate = _resolve_project_root_from_files(
+            all_files,
+            library_root=self.get_project_library_dir(),
+        )
+        diagnosis = config.get('_diagnosis_record')
+        if not isinstance(diagnosis, dict):
+            raise RuntimeError('请先加载诊断记录。')
+        stored_manifest = diagnosis.get('chart_manifest')
+        record_id = str(diagnosis.get('record_id') or '').strip()
+        if not stored_manifest or not record_id:
+            raise RuntimeError(
+                'PPT Master 需要带 record_id 和已存 chart_manifest 的诊断记录；'
+                '请重新保存诊断后加载。'
+            )
+        charts_dir = os.path.join(
+            candidate,
+            '数据',
+            '诊断记录',
+            record_id,
+            'charts',
+        )
+        chart_manifest = chart_manifest_from_dict(stored_manifest)
+        figure_manifest = chart_manifest_to_figure_manifest(
+            chart_manifest,
+            charts_dir,
+        )
+        render_assets, required_ids = _build_report_render_assets(
+            figure_manifest
+        )
+        if len(render_assets) > 76:
+            raise RuntimeError(
+                'PPT Master 每页最多接纳 2 张诊断图片；当前图片超过 76 张，'
+                '无法在 40 页上限内保留叙事页。'
+            )
+        missing = [
+            asset.host_id for asset in render_assets
+            if not asset.source_path.is_file()
+        ]
+        if missing:
+            raise RuntimeError(
+                '诊断图片路径缺失，无法建立确认指纹：'
+                + '、'.join(missing[:8])
+            )
+        required_set = set(required_ids)
+        planning_assets = tuple(
+            PlanningAsset(
+                asset_id=asset.host_id,
+                kind=PlanningAssetKind.CHART,
+                semantic_label=asset.semantic_label,
+                summary=f'目标章节：{asset.target}',
+                required=asset.host_id in required_set,
+            )
+            for asset in render_assets
+        )
+
+        template_path = str(config.get('template_file') or '')
+        template_workspace = None
+        template_mode = TemplateMode.FREE_DESIGN
+        template_summary = ''
+        if template_path:
+            template_workspace = prepare_ppt_master_template_workspace(
+                template_path
+            )
+            template_mode = TemplateMode.VALIDATED_WORKSPACE
+            template_summary = template_workspace.style_summary
+
+        source_context, context_warnings = build_report_source_context(config)
+        if context_warnings:
+            source_context += (
+                '\n\n## 资料读取警告\n'
+                + '\n'.join(f'- {warning}' for warning in context_warnings)
+            )
+        report_title = (
+            f'{Path(req_file).stem} — 专业诊断汇报'
+            if req_file else '传感器数据专业诊断汇报'
+        )
+        slide_count = max(10, (len(planning_assets) + 1) // 2 + 2)
+        input_fingerprint = fingerprint_ppt_master_inputs(
+            config,
+            bridge_claim_info=bridge_info,
+        )
+        workflow = PptMasterPlanningWorkflow(
+            HostAIClientPlanningAdapter(ai),
+            input_fingerprint=input_fingerprint,
+            template_workspace=template_workspace,
+        )
+        request = PlanningRequest(
+            request_id=f'ppt-{uuid.uuid4().hex[:24]}',
+            report_title=report_title,
+            objective='基于已加载的诊断事实形成可审核、可决策的专业技术汇报。',
+            audience='项目技术负责人、试验人员与质量审核人员',
+            source_context=source_context,
+            requested_slide_count=slide_count,
+            template_mode=template_mode,
+            template_summary=template_summary,
+            assets=planning_assets,
+        )
+        workflow.generate_outline(request)
+        return workflow
+
+    def _handle_ppt_master_planning_action(
+        self,
+        action: str,
+        config: dict,
+    ) -> None:
+        workflow = self._ppt_master_workflow
+        if workflow is None:
+            QMessageBox.warning(
+                self,
+                'PPT Master 规划不存在',
+                '请先生成 PPT Master 方案。',
+            )
+            return
+        bridge_info = self.report_workbench_widget.get_bridge_claim_info()
+        fingerprint = fingerprint_ppt_master_inputs(
+            config,
+            bridge_claim_info=bridge_info,
+        )
+        self.report_workbench_widget.ppt_master_confirm_btn.setEnabled(False)
+        self.report_workbench_widget.outline_btn.setEnabled(False)
+        self.status_bar.showMessage('正在推进 PPT Master 确认流程...')
+
+        def _advance():
+            workflow.advance(
+                action,  # type: ignore[arg-type]
+                current_input_fingerprint=fingerprint,
+            )
+            return workflow
+
+        def _done(updated: PptMasterPlanningWorkflow):
+            self._apply_ppt_master_workflow_view(updated)
+            self.report_workbench_widget.outline_btn.setEnabled(True)
+            self.status_bar.showMessage(updated.view().status_text)
+            # TEMPORARY BATCH 3.6.6 ACCEPTANCE CAPTURE — diagnostic trace
+            # Real capture now happens inside workflow.advance() at each phase.
+            _capture_diag = Path(__file__).resolve().parent / "tests" / ".artifacts" / "batch-3.6.6" / "diag.txt"
+            try:
+                _capture_diag.parent.mkdir(parents=True, exist_ok=True)
+                _phase = updated.snapshot.phase.value if updated.snapshot else "NO_SNAPSHOT"
+                _flag = os.environ.get("DPP_BATCH_366_CAPTURE_PLAN", "UNSET")
+                _capture_diag.write_text(
+                    f"hook_reached=1\nenv_flag={_flag}\nphase={_phase}\n"
+                    f"snapshot_exists={updated.snapshot is not None}\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            # END TEMPORARY CAPTURE
+
+        def _error(message: str):
+            self.report_workbench_widget.outline_btn.setEnabled(True)
+            try:
+                self._apply_ppt_master_workflow_view(workflow)
+            except Exception:
+                pass
+            self.status_bar.showMessage('PPT Master 确认流程失败')
+            QMessageBox.warning(
+                self,
+                'PPT Master 确认失败',
+                message.split('\nTraceback', 1)[0].strip(),
+            )
+
+        self._ppt_master_planning_worker = ReportWorker(_advance)
+        self._ppt_master_planning_worker.finished.connect(_done)
+        self._ppt_master_planning_worker.error.connect(_error)
+        self._ppt_master_planning_worker.start()
+
+    def _apply_ppt_master_workflow_view(
+        self,
+        workflow: PptMasterPlanningWorkflow,
+    ) -> None:
+        view = workflow.view()
+        self.report_workbench_widget.set_ppt_master_workflow_view(
+            status_text=view.status_text,
+            preview_markdown=view.preview_markdown,
+            next_action=view.next_action or '',
+            next_action_label=view.next_action_label,
+            ready_for_authoring=view.ready_for_authoring,
+            valid_for_current_inputs=view.valid_for_current_inputs,
+        )
 
     # ═══════════════════════════════════════════════
     # 从已存诊断加载 — 浏览 diagnoses/ 目录
@@ -1184,13 +2539,102 @@ class DataProcessorWindow(QMainWindow):
 
     def _handle_full_report_generation(self, config: dict, outline: str):
         """后台生成结构化报告 + 渲染保存 + 自动打开输出目录."""
-        generate_fn = self._get_generate_fn()
-        self.report_workbench_widget.set_generation_running(True)
-        self.status_bar.showMessage('正在生成完整报告...')
-
         report_type = config.get('report_type', 'word')
         ext = '.pptx' if report_type == 'ppt' else '.docx'
         type_label = 'PPT演示' if report_type == 'ppt' else 'Word报告'
+        provider_selection = config.get('report_provider') or {}
+        provider_id = str(
+            provider_selection.get('provider_id') or BUILTIN_PROVIDER_ID
+        )
+        provider_version = str(
+            provider_selection.get('provider_version')
+            or BUILTIN_PROVIDER_VERSION
+        )
+        if provider_id == PPT_MASTER_PROVIDER_ID:
+            from core.ai_client import AIClient
+
+            ai = AIClient.get_instance()
+            if not ai.is_available():
+                QMessageBox.warning(
+                    self,
+                    'PPT Master AI 模型不可用',
+                    'PPT Master 不使用模拟降级。请先连接在线或本地模型后重试。',
+                )
+                return
+            generate_fn = ai.get_generate_fn(enable_thinking=False)
+        else:
+            generate_fn = self._get_generate_fn()
+        template_mode = (
+            'normalized' if config.get('template_file') else 'none'
+        )
+        structured_report_override: dict[str, object] | None = None
+        try:
+            if provider_id == PPT_MASTER_PROVIDER_ID:
+                if report_type != 'ppt':
+                    raise PptMasterWorkflowError(
+                        'report_type_unsupported',
+                        'PPT Master 仅支持 PPT 演示汇报。',
+                    )
+                workflow = self._ppt_master_workflow
+                if workflow is None:
+                    raise PptMasterWorkflowError(
+                        'workflow_not_started',
+                        '请先生成并确认 PPT Master 方案。',
+                    )
+                bridge_info = self.report_workbench_widget.get_bridge_claim_info()
+                workflow.require_current_inputs(
+                    fingerprint_ppt_master_inputs(
+                        config,
+                        bridge_claim_info=bridge_info,
+                    )
+                )
+                if not workflow.ready_for_authoring or workflow.snapshot is None:
+                    raise PptMasterWorkflowError(
+                        'plan_not_confirmed',
+                        '请依次确认大纲、设计和逐页计划。',
+                    )
+                from utils.app_paths import get_app_data_root
+
+                runner = ControlledToolRunner(
+                    get_app_data_root()
+                    / 'toolchains'
+                    / 'ppt-master'
+                    / 'runs'
+                )
+                selected_provider = PptMasterReportRenderProvider(
+                    planning_snapshot=workflow.snapshot,
+                    runner=runner,
+                    authoring_adapter=HostAIPptMasterAuthoringAdapter(),
+                    template_workspace=workflow.template_workspace,
+                )
+                structured_report_override = workflow.structured_report()
+            else:
+                selected_provider = self._report_provider_controller.create_provider(
+                    provider_id=provider_id,
+                    provider_version=provider_version,
+                    report_type=report_type,
+                    template_mode=template_mode,
+                )
+            render_orchestrator = ReportRenderOrchestrator(
+                providers=(selected_provider,),
+                default_provider_id=provider_id,
+            )
+        except Exception as error:
+            QMessageBox.warning(
+                self,
+                '报告后端不可用',
+                str(error),
+            )
+            self.status_bar.showMessage(
+                f'报告生成取消: 后端 {provider_id}@{provider_version} 不可用'
+            )
+            self._refresh_report_provider_options()
+            return
+
+        self.report_workbench_widget.set_generation_running(True)
+        self.status_bar.showMessage(
+            f'正在生成完整报告... 后端 {provider_id}@{provider_version}'
+        )
 
         # 构建输出路径：项目根/报告 (与数据/方案同级的一级目录)
         project_files: list[str] = config.get('project_files', [])
@@ -1218,10 +2662,27 @@ class DataProcessorWindow(QMainWindow):
         report_dir = os.path.join(candidate, '报告')
 
         os.makedirs(report_dir, exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # ── Batch 3.3.2: Bridge claim for report ──
+        bridge_claim = self._claim_bridge_for_report()
+        bridge_workspace = None
+        bridge_assets = ()
+        bridge_req_id = ""
+        bridge_gen = 0
+        if bridge_claim is not None:
+            bridge_workspace = bridge_claim.get("workspace_path")
+            bridge_assets = bridge_claim.get("bridge_assets", ())
+            bridge_req_id = bridge_claim.get("request_id", "")
+            bridge_gen = bridge_claim.get("generation", 0)
+
+        # ── Safe unique final filename (Batch 3.3.1B: atomic no-clobber) ──
+        utc_ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        uid = uuid.uuid4().hex
         project_name = os.path.splitext(os.path.basename(req_file))[0] if req_file else '数据分析报告'
-        filename = f'{project_name}_{type_label}_{timestamp}{ext}'
-        output_path = os.path.join(report_dir, filename)
+        # Sanitize project_name: no path separators, no reserved device names
+        safe_base = re.sub(r'[\\/:*?"<>|]', '_', project_name)
+        final_filename = f'{safe_base}_{utc_ts}_{uid}{ext}'
+        final_output_path = os.path.join(report_dir, final_filename)
 
         template_path = config.get('template_file', '')
 
@@ -1229,179 +2690,59 @@ class DataProcessorWindow(QMainWindow):
         project_dir = os.path.dirname(os.path.abspath(req_file)) if req_file else ''
 
         def _build_and_save(worker=None):
-            _report_warnings: list[str] = []
-            diagnosis_loaded: bool = False
-            manifest = None
-            try:
-                # 0. 预检
-                from core.ai_client import AIClient
-                ai = AIClient.get_instance()
-                if not ai.is_available():
-                    raise RuntimeError(
-                        "AI 模型未配置。\n\n"
-                        "请在「报告生成工作台」左侧点击「AI 模型配置」，\n"
-                        "完成在线模型配置并点击「连接」。"
-                    )
-                # 0.5 模板预校验
-                if template_path:
-                    _tmpl_warn = validate_docx_template(template_path)
-                    if _tmpl_warn:
-                        raise RuntimeError(_tmpl_warn)
-
-                # ═══════════════════════════════════════════════
-                # 1. 图表 — 优先读已存 manifest (母本B: 诊断保存时已产图落盘)
-                # ═══════════════════════════════════════════════
-                from core.chart_store import (
-                    build_chart_store, chart_manifest_to_figure_manifest,
-                    chart_manifest_from_dict,
-                )
-                diag_rec = config.get('_diagnosis_record')
-                chart_data = (diag_rec or {}).get('chart_data', {}) or {}
-
-                # record_id 优先取保存时写入的持久化字段 (母本B P1/P2 对齐)
-                record_id = (diag_rec or {}).get('record_id')
-                if not record_id:
-                    # 降级: 旧记录无 record_id → 从 timestamp 推导 (向后兼容)
-                    ts = (diag_rec or {}).get('timestamp',
-                                              datetime.now().strftime('%Y%m%d_%H%M%S'))
-                    record_id = ts.replace(' ', '_').replace(':', '')
-                    print(f"[图表诊断] 旧记录降级推导 record_id={record_id}")
-
-                stored_manifest = (diag_rec or {}).get('chart_manifest')
-                if stored_manifest:
-                    # 读取路径: 图已在诊断保存时落盘到记录目录, 报告直接引用
-                    charts_dir = os.path.join(candidate, '数据', '诊断记录',
-                                              record_id, 'charts')
-                    _chart_manifest = chart_manifest_from_dict(stored_manifest)
-                    print(f"[图表诊断] 从已存 manifest 读取 (非重产), "
-                          f"record_id={record_id}, "
-                          f"produced={sum(1 for e in _chart_manifest if e.produced)}")
-                else:
-                    # 降级: 旧记录无 manifest, 重新产图到记录目录 (向后兼容)
-                    charts_dir = os.path.join(candidate, '数据', '诊断记录',
-                                              record_id, 'charts')
-                    os.makedirs(charts_dir, exist_ok=True)
-                    print(f"[图表诊断] 旧记录降级产图, record_id={record_id}")
-                    _chart_manifest = build_chart_store(
-                        chart_data, charts_dir, _report_warnings)
-
-                manifest = chart_manifest_to_figure_manifest(
-                    _chart_manifest, charts_dir)
-
-                print(f"[图表诊断] manifest 图数: {manifest.count}")
-                pngs = (
-                    [f for f in os.listdir(charts_dir) if f.endswith('.png')]
-                    if os.path.isdir(charts_dir) else []
-                )
-                print(f"[图表诊断] charts/ 落盘 PNG 数: {len(pngs)} "
-                      f"({', '.join(pngs[:8])}{'…' if len(pngs) > 8 else ''})")
-                charts_context = manifest.to_llm_context(max_chars=600)
-
-                # 2. AI 生成结构化数据 (markdown, 无 JSON, 无工具)
-                builder_data = generate_structured_report(
-                    config, outline, report_type, generate_fn,
-                    charts_context=charts_context,
-                    progress_callback=(
-                        lambda d: worker.progress.emit(d) if worker else None
-                    ),
-                    cancel_check=(
-                        lambda: getattr(worker, '_cancelled', False) if worker else False
-                    ),
-                )
-                _report_warnings.extend(builder_data.pop('_report_warnings', []))
-                diagnosis_loaded = builder_data.pop('_diagnosis_loaded', False)
-
-                # 2b. 注入标定/异常表格 (优先 from chart_data, 降级 from_providers)
-                try:
-                    from core.chart_bundle import ChartBundle, extract_four_tables, _rows_to_md_table
-                    cd = (diag_rec or {}).get('chart_data', {}) or {}
-                    if not cd:
-                        bundle = ChartBundle.from_providers(self)
-                        cd = bundle.to_dict()
-                    four_tables = extract_four_tables(cd)
-                    if four_tables:
-                        # 等价重建 markdown — 与 gen_markdown_tables_from_bundle 同输出格式
-                        # 等价性: extract_four_tables 解析原 md 字符串 → _rows_to_md_table 重生成
-                        #         cell 内容不变（strip→rejoin），分隔行格式一致，heading 前缀一致
-                        md_parts: list[str] = []
-                        for tbl in four_tables:
-                            md = _rows_to_md_table([tbl.headers] + tbl.rows)
-                            md_parts.append(f"\n### {tbl.heading}\n\n{md}\n")
-                        tables_md = "\n".join(md_parts)
-                        builder_data.setdefault("sections", []).append({
-                            "heading": "数据汇总附表",
-                            "content_paragraphs": [tables_md],
-                            "image_anchors": [],
-                            "tables": [],
-                        })
-                        print(f"[报告] 已注入数据汇总附表 (表数={len(four_tables)}, "
-                              f"标题={[t.heading for t in four_tables]})")
-                    else:
-                        print("[报告] 数据汇总附表为空 — 跳过")
-                except Exception as e:
-                    import traceback as _tb
-                    _report_warnings.append(
-                        f"数据汇总附表注入阶段异常：{type(e).__name__}: {e}")
-                    print(f"[报告] 数据汇总附表注入阶段异常: {_tb.format_exc()}")
-
-                # 3. 构建 docx
-                if report_type == 'ppt':
-                    from dp_engine.report_builder.ppt_builder import PPTBuilder
-                    from dp_engine.report_builder.models import PPTReport
-                    report = PPTReport.from_dict(builder_data)
-                    builder = PPTBuilder()
-                    builder.build_ppt_report(report, template_path, output_path, project_dir=project_dir)
-                else:
-                    from dp_engine.report_builder.word_builder import WordBuilder
-                    from dp_engine.report_builder.models import WordReport
-                    report = WordReport.from_dict(builder_data)
-                    builder = WordBuilder()
-                    builder.build_word_report(report, template_path, output_path, project_dir=project_dir)
-                    if builder.missing_images:
-                        for img in builder.missing_images:
-                            _report_warnings.append(f"图片缺失: {img}")
-
-                # 4. 图N 引用驱动放置 (构建时后处理: 扫描正文→注入图+图题)
-                if manifest and manifest.count > 0:
-                    if report_type == 'ppt':
-                        _inject_figures_to_pptx(
-                            output_path, manifest, _report_warnings,
-                        )
-                    else:
-                        _inject_figures_by_reference(
-                            output_path, manifest, _report_warnings,
-                        )
-
-                # 5. 「资料纳入情况」段
-                self._append_inclusion_footer(
-                    output_path, report_type, _report_warnings, diagnosis_loaded,
-                )
-
-                return {
-                    'path': output_path,
-                    'warnings': _report_warnings,
-                    'diagnosis_loaded': diagnosis_loaded,
-                }
-            except Exception as e:
-                import traceback as _tb
-                msg = f'{e}'
-                if _report_warnings:
-                    msg += '\n\n已收集的警告/降级信息:'
-                    for w in _report_warnings:
-                        msg += f'\n  - {w}'
-                msg += f'\n{_tb.format_exc()}'
-                raise RuntimeError(msg) from e
+            return _execute_report_build_transaction(
+                config=config,
+                outline=outline,
+                report_type=report_type,
+                generate_fn=generate_fn,
+                template_path=template_path,
+                final_output_path=final_output_path,
+                report_dir=report_dir,
+                project_dir=project_dir,
+                candidate=candidate,
+                worker=worker,
+                bridge_workspace=bridge_workspace,
+                bridge_assets=bridge_assets,
+                _provider=self,
+                render_orchestrator=render_orchestrator,
+                structured_report_override=structured_report_override,
+            )
 
         def _on_report_done(result: dict):
+            self._disconnect_report_cancel_handler()
+            self._active_report_provider = None
             path: str = result['path']
             warnings: list[str] = result.get('warnings', [])
             diagnosis_loaded: bool = result.get('diagnosis_loaded', False)
+            provenance = result.get('provider_provenance') or {}
+            actual_provider = (
+                f"{provenance.get('provider_id', provider_id)}@"
+                f"{provenance.get('provider_version', provider_version)}"
+            )
+
+            # Batch 3.3.2: Finish bridge generation as SUCCEEDED
+            if bridge_req_id and bridge_gen:
+                self._finish_bridge_generation(bridge_req_id, bridge_gen, "succeeded")
 
             self.report_workbench_widget.set_generation_running(False)
-            self.status_bar.showMessage(f'报告已保存: {os.path.basename(path)}')
+            self.status_bar.showMessage(
+                f'报告已保存: {os.path.basename(path)} '
+                f'(后端 {actual_provider})'
+            )
+            _REPORT_LOGGER.info(
+                "Report committed: provider=%s output=%s",
+                actual_provider,
+                os.path.basename(path),
+            )
 
             # 组装模态对话框文案
-            lines = [f'报告已保存至:', path, '']
+            lines = [
+                '报告已保存至:',
+                path,
+                '',
+                f'实际生成后端: {actual_provider}',
+                '',
+            ]
             if not diagnosis_loaded:
                 lines.append(
                     '诊断数据: 未加载 — 本报告不含诊断结论。'
@@ -1422,8 +2763,29 @@ class DataProcessorWindow(QMainWindow):
                 pass
 
         def _on_report_error(msg: str):
+            self._disconnect_report_cancel_handler()
+            self._active_report_provider = None
+            cancelled = (
+                '报告生成已取消' in msg
+                or 'status=cancelled' in msg
+            )
+            # Batch 3.3.2: Finish bridge generation as FAILED
+            if bridge_req_id and bridge_gen:
+                self._finish_bridge_generation(
+                    bridge_req_id,
+                    bridge_gen,
+                    "cancelled" if cancelled else "failed",
+                )
+
             self.report_workbench_widget.set_generation_running(False)
-            self.status_bar.showMessage('报告生成失败')
+            if cancelled:
+                self.status_bar.showMessage(
+                    f'报告生成已取消: 后端 {provider_id}@{provider_version}'
+                )
+                return
+            self.status_bar.showMessage(
+                f'报告生成失败: 后端 {provider_id}@{provider_version}'
+            )
 
             if "RuntimeError:" in msg:
                 # 安全错误 (含已收集 warnings) — 友好展示, 不甩栈
@@ -1441,14 +2803,178 @@ class DataProcessorWindow(QMainWindow):
                 msg = f'⏳ 生成中… 第{cur}/{tot}节: {heading}'
                 self.status_bar.showMessage(msg)
 
+        # Custom cancel wrapper that also finishes bridge as CANCELLED
+        def _cancel_with_bridge():
+            if bridge_req_id and bridge_gen:
+                self._finish_bridge_generation(bridge_req_id, bridge_gen, "cancelled")
+            cancel_provider = getattr(selected_provider, 'cancel', None)
+            if callable(cancel_provider):
+                cancel_provider()
+            self._report_worker.cancel()
+
+        self._disconnect_report_cancel_handler()
+        self._active_report_provider = selected_provider
         self._report_worker = ReportWorker(_build_and_save)
         self._report_worker.finished.connect(_on_report_done)
         self._report_worker.error.connect(_on_report_error)
         self._report_worker.progress.connect(_on_report_progress)
+        self._report_cancel_handler = _cancel_with_bridge
         self.report_workbench_widget.cancel_requested.connect(
-            self._report_worker.cancel
+            self._report_cancel_handler
         )
         self._report_worker.start()
+
+    # ═══════════════════════════════════════════════════════════
+    # Report Bridge handlers (Batch 3.3.2)
+    # ═══════════════════════════════════════════════════════════
+
+    def _handle_bridge_send(self, selections: list) -> None:
+        """Handle send-to-report from Skill Tab.
+
+        Checks current bridge state and either starts a new prepare
+        or prompts for READY replacement.
+        """
+        if self._bridge_closing:
+            return
+
+        state = self._bridge_controller.state
+        # IDLE/RELEASED/FAILED/CANCELLED/SUCCEEDED → start new prepare
+        state_str = state.value if hasattr(state, 'value') else str(state)
+
+        if state_str in ("idle", "released", "failed", "cancelled", "succeeded"):
+            self._bridge_controller.start_preparation(selections)
+            return
+
+        # PREPARING → reject duplicate
+        if state_str == "preparing":
+            QMessageBox.information(
+                self, '素材准备中',
+                '正在准备素材，请等待完成后再发送新的素材。'
+            )
+            return
+
+        # GENERATING → reject
+        if state_str == "generating":
+            QMessageBox.information(
+                self, '报告生成中',
+                '报告正在生成，无法替换素材。'
+            )
+            return
+
+        # READY → confirm replacement
+        if state_str == "ready":
+            reply = QMessageBox.question(
+                self, '替换确认',
+                '当前已有准备完成的报告素材。\n替换后旧素材将被释放。是否继续？',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return  # User cancelled — old READY lease stays
+
+            # Explicit discard before new prepare
+            req_id = self._bridge_controller.request_id or ""
+            gen = self._bridge_controller.generation
+            discarded = self._bridge_controller.discard_ready_generation(req_id, gen)
+            if not discarded:
+                QMessageBox.warning(
+                    self, '操作失败',
+                    '释放旧素材失败，请稍后重试。'
+                )
+                return
+
+            # Start new preparation
+            self._bridge_controller.start_preparation(selections)
+
+    def _on_bridge_result_ready(self, result: ReportBridgePublicResult) -> None:
+        """Receive bridge result from controller — update Workbench."""
+        if self._bridge_closing:
+            return
+
+        status = result.status.value if hasattr(result.status, 'value') else str(result.status)
+        safe_error = result.safe_error_message or ""
+        assets = result.assets
+
+        self.report_workbench_widget.set_bridge_status(
+            status=status,
+            assets=assets,
+            safe_error=safe_error,
+            request_id=result.request_id,
+            generation=result.generation,
+        )
+
+    def _handle_bridge_clear(self) -> None:
+        """Handle 'clear assets' button — discard READY generation."""
+        info = self.report_workbench_widget.get_bridge_claim_info()
+        if not info:
+            return
+        req_id = info.get("request_id", "")
+        gen = info.get("generation", 0)
+        if not req_id or not gen:
+            return
+
+        discarded = self._bridge_controller.discard_ready_generation(req_id, gen)
+        if discarded:
+            self.report_workbench_widget.set_bridge_status(status="released")
+        else:
+            QMessageBox.warning(
+                self, '操作失败',
+                '清除素材失败，素材可能已用于报告生成。'
+            )
+
+    def _handle_bridge_cancel_prepare(self) -> None:
+        """Handle 'cancel prepare' button — set cancel on controller."""
+        self._bridge_controller.cancel()
+
+    # ═══════════════════════════════════════════════════════════
+    # Bridge-aware report generation (Batch 3.3.2)
+    # ═══════════════════════════════════════════════════════════
+
+    def _claim_bridge_for_report(self) -> dict | None:
+        """Claim READY bridge generation for report.
+
+        Returns dict with workspace_path, bridge_assets if claim succeeds.
+        Returns None if no READY assets or claim fails.
+        """
+        info = self.report_workbench_widget.get_bridge_claim_info()
+        if not info:
+            return None
+
+        req_id = info.get("request_id", "")
+        gen = info.get("generation", 0)
+        if not req_id or not gen:
+            return None
+
+        generation_input = self._bridge_controller.claim_ready_generation(req_id, gen)
+        if generation_input is None:
+            QMessageBox.warning(
+                self, '素材已失效',
+                '报告素材已失效或已被使用，请重新选择素材。'
+            )
+            self.report_workbench_widget.set_bridge_status(status="released")
+            return None
+
+        return {
+            "request_id": req_id,
+            "generation": gen,
+            "workspace_path": str(generation_input.workspace_path),
+            "bridge_assets": generation_input.assets,
+        }
+
+    def _finish_bridge_generation(self, request_id: str, generation: int,
+                                   status_str: str) -> None:
+        """Finish bridge generation with terminal status."""
+        status_map = {
+            "succeeded": ReportBridgeStatus.SUCCEEDED,
+            "failed": ReportBridgeStatus.FAILED,
+            "cancelled": ReportBridgeStatus.CANCELLED,
+        }
+        status = status_map.get(status_str)
+        if status is None:
+            return
+        self._bridge_controller.finish_generation(
+            request_id, generation, status=status,
+        )
 
     def create_ai_diagnosis_page(self):
         """AI诊断页面"""
@@ -2858,7 +4384,7 @@ class DataProcessorWindow(QMainWindow):
         """公开 getter：判定当前数据是否为光纤光栅数据。
 
         消除 ai_diagnosis 与 analysis_tab 的重复判定逻辑。
-        列名匹配 FBG/ENLIGHT/光纤传感/W\d+ 或模板名含"光纤"/"ENLIGHT"。
+        列名匹配 FBG/ENLIGHT/光纤传感/W\\d+ 或模板名含"光纤"/"ENLIGHT"。
         """
         import re as _re
         if self.current_data is None:
@@ -3029,13 +4555,49 @@ class DataProcessorWindow(QMainWindow):
 # ============ Application Entry ============
 
 def main():
+    import logging
+    _main_logger = logging.getLogger(__name__)
+
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+
+    # ── Application-level SkillInstallTaskOwner (Batch 2.4) ──
+    # Owned by QApplication — outlives all windows and widgets.
+    # Workers register here and complete naturally; terminate() is never called.
+    from ui.skill_install_controller import get_skill_install_task_owner
+    task_owner = get_skill_install_task_owner(app)
+
+    # ── Application exit protocol (Batch 2.5) ──
+    # Safety net only: aboutToQuit MUST NOT be the primary shutdown path.
+    # All actual exits go through TaskOwner.begin_application_shutdown() first.
+    # If we reach aboutToQuit with active workers, something went wrong —
+    # log CRITICAL and let the OS clean up as last resort (the safety net
+    # fired — we already exhausted all proper shutdown paths).
+    def _on_about_to_quit() -> None:
+        if task_owner.has_running_tasks():
+            _main_logger.critical(
+                "Application reached aboutToQuit with active skill workers — "
+                "this is a bug: begin_application_shutdown() was not called "
+                "or did not complete before app.quit(). "
+                "Remaining workers will be cleaned up by OS."
+            )
+
+    app.aboutToQuit.connect(_on_about_to_quit)
+
+    # ── TEMPORARY BATCH 3.6.6: acceptance capture arm signal ──
+    # Must fire early so operator can verify capture is ARMED before
+    # beginning Scenario A.  DELETE after Scenario A/B stable.
+    try:
+        from dp_engine.ppt_master_host.acceptance_capture import startup_signal
+        _signal = startup_signal()
+        print(_signal, file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
     # 加载自定义模板
     DataProcessorWindow.load_custom_templates()
 
-    window = DataProcessorWindow()
+    window = DataProcessorWindow(skill_task_owner=task_owner)
     window.show()
 
     sys.exit(app.exec())

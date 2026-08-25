@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os as _os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
@@ -16,6 +16,8 @@ from core.chart_registry import (
     CHART_ID_TO_OLD_FIG_ID,
     get_all_producers,
     ensure_draw_fns,
+    select_delta_series,
+    select_physical_series,
 )
 
 
@@ -36,6 +38,7 @@ class ChartManifestEntry:
     skip_reason: str = ""       # 跳过原因 (不成功时)
     key_stat: str = ""          # 关键统计简述
     data_fingerprint: str = ""  # 留位: 数据指纹
+    report_include: bool = True  # False = 仅诊断补充，不注入 Word/PPT
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -45,38 +48,51 @@ class ChartManifestEntry:
 
 def _produce_calib_lin(cd: dict, charts_dir: str, entries: list[ChartManifestEntry],
                        warnings: list[str]) -> None:
-    """产 strain_calib_lin — 每传感器一张。one producer → N entries。Phase 2 列表类改造。"""
-    import numpy as np
-    from core.report_charts import make_calibration_linearity, save_figure
+    """产 strain_calib_lin — 每传感器一张应变标定曲线。"""
+    from core.tools.calibration_chart_tool import render_strain_calibration_curves
 
     calib_sensors = cd.get('calib_sensors', []) or []
     for s in calib_sensors:
         try:
-            ref = np.array(s.get('ref', []) or [], dtype=float)
-            measured = np.array(s.get('measured', []) or [], dtype=float)
+            ref = [float(value) for value in (s.get('ref', []) or [])]
+            measured = [float(value) for value in (s.get('measured', []) or [])]
             name = s.get('sensor', '?')
-            unit = s.get('unit', 'με')
             if len(ref) < 3 or len(measured) < 3:
                 reason = f"calib({name}: ref={len(ref)}<3 or measured={len(measured)}<3)"
                 entries.append(ChartManifestEntry(
                     chart_id=f"strain_calib_lin_{name}",
                     module="strain_calib",
-                    title=f"{name} 标定线性度",
+                    title=f"{name} 应变标定曲线",
                     produced=False,
                     skip_reason=reason,
                 ))
                 warnings.append(f"标定图[{name}]跳过: 数据点={min(len(ref), len(measured))}, 合格门槛=3")
                 continue
-            fig = make_calibration_linearity(
-                ref, measured, sensor=name, unit=unit,
+            raw_curves = s.get("curves")
+            curves = (
+                {
+                    str(label): [float(value) for value in values]
+                    for label, values in raw_curves.items()
+                }
+                if isinstance(raw_curves, dict) and raw_curves
+                else {"G1": measured}
             )
+            png_bytes = render_strain_calibration_curves(
+                ref,
+                curves,
+                sensor=str(name),
+                source=str(s.get("source") or "measured"),
+            )
+            if not png_bytes:
+                raise ValueError("无可绘制的有限标定点")
             png_name = f"calib_linearity_{name}.png"
             png_path = _os.path.join(charts_dir, png_name)
-            save_figure(fig, png_path)
+            with open(png_path, "wb") as file:
+                file.write(png_bytes)
             entries.append(ChartManifestEntry(
                 chart_id=f"strain_calib_lin_{name}",
                 module="strain_calib",
-                title=f"{name} 标定线性度",
+                title=f"{name} 应变标定曲线",
                 rel_path=png_name,
                 produced=True,
                 key_stat="",  # 由注册表 key_stat_fn 覆盖
@@ -86,7 +102,7 @@ def _produce_calib_lin(cd: dict, charts_dir: str, entries: list[ChartManifestEnt
             entries.append(ChartManifestEntry(
                 chart_id=f"strain_calib_lin_{s.get('sensor', '?')}",
                 module="strain_calib",
-                title=f"{s.get('sensor', '?')} 标定线性度",
+                title=f"{s.get('sensor', '?')} 应变标定曲线",
                 produced=False,
                 skip_reason=reason,
             ))
@@ -112,6 +128,170 @@ def _produce_ts_cleaning(cd: dict, charts_dir: str, entry: ChartManifestEntry) -
     entry.rel_path = "ts_cleaning.png"
     entry.produced = True
     entry.key_stat = f"{len(s)}通道"
+
+
+def _produce_t2_timeseries(
+    cd: dict,
+    charts_dir: str,
+    entry: ChartManifestEntry,
+    *,
+    series: dict[str, Any],
+    y_label: str,
+    png_name: str,
+) -> None:
+    """复用 make_timeseries 产一张 T2 时程图。"""
+    from core.report_charts import make_timeseries, save_figure
+
+    raw_time_h = cd.get("time_h")
+    time_h = [] if raw_time_h is None else raw_time_h
+    t = np.array(time_h, dtype=float)
+    values: dict[str, Sequence[float]] = {
+        name: [float(value) for value in np.asarray(data, dtype=float).reshape(-1)]
+        for name, data in series.items()
+    }
+    fig = make_timeseries(t, values, y_label=y_label)
+    if fig.axes:
+        fig.axes[0].set_title(entry.title)
+    png_path = _os.path.join(charts_dir, png_name)
+    save_figure(fig, png_path)
+    entry.rel_path = png_name
+    entry.produced = True
+    entry.key_stat = f"{len(values)}通道"
+
+
+def _produce_ts_dlambda(cd: dict, charts_dir: str, entry: ChartManifestEntry) -> None:
+    _produce_t2_timeseries(
+        cd,
+        charts_dir,
+        entry,
+        series=select_delta_series(cd),
+        y_label="波长差 Δλ (nm)",
+        png_name="ts_dlambda.png",
+    )
+
+
+def _produce_ts_strain(cd: dict, charts_dir: str, entry: ChartManifestEntry) -> None:
+    _produce_t2_timeseries(
+        cd,
+        charts_dir,
+        entry,
+        series=select_physical_series(cd, "strain"),
+        y_label="应变 (με)",
+        png_name="ts_strain.png",
+    )
+
+
+def _produce_ts_temperature(cd: dict, charts_dir: str, entry: ChartManifestEntry) -> None:
+    _produce_t2_timeseries(
+        cd,
+        charts_dir,
+        entry,
+        series=select_physical_series(cd, "temperature"),
+        y_label="温度 (°C)",
+        png_name="ts_temperature.png",
+    )
+
+
+def _produce_ts_formula(cd: dict, charts_dir: str, entry: ChartManifestEntry) -> None:
+    _produce_t2_timeseries(
+        cd,
+        charts_dir,
+        entry,
+        series=select_physical_series(cd, "formula"),
+        y_label="值",
+        png_name="ts_formula.png",
+    )
+
+
+def _produce_tempa_regression(
+    cd: dict,
+    charts_dir: str,
+    entry: ChartManifestEntry,
+) -> None:
+    """产阶段 A 温度系数回归网格图。"""
+    from core.tools.calibration_chart_tool import render_temp_regression_grid
+
+    png_bytes = render_temp_regression_grid(cd.get("temp_regressions") or [])
+    if not png_bytes:
+        raise ValueError("阶段 A 回归数据不可绘制")
+    png_name = "temp_phase_a_regression.png"
+    with open(_os.path.join(charts_dir, png_name), "wb") as file:
+        file.write(png_bytes)
+    entry.rel_path = png_name
+    entry.produced = True
+
+
+def _produce_phaseb_diagnostic(
+    cd: dict,
+    charts_dir: str,
+    entries: list[ChartManifestEntry],
+    warnings: list[str],
+) -> None:
+    """产阶段 B 诊断四联图 — 每双栅传感器补偿前/后各一张。"""
+    from core.tools.calibration_chart_tool import render_phase_b_diagnostic
+
+    diagnostics = cd.get("phaseb_diagnostics") or []
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict):
+            continue
+        sensor_name = str(diagnostic.get("name", "?"))
+        variants = (
+            ("raw", "原始（补偿前）", "eps_raw"),
+            ("compensated", "补偿后", "eps_compensated"),
+        )
+        for variant, variant_title, series_key in variants:
+            chart_id = f"phaseb_diagnostic_{sensor_name}_{variant}"
+            title = f"{sensor_name} 阶段 B {variant_title}诊断四联图"
+            series = diagnostic.get(series_key)
+            if series is None and variant == "raw":
+                series = diagnostic.get("eps_corr")
+            try:
+                series_count = len(series) if series is not None else 0
+            except TypeError:
+                series_count = 0
+            if series_count < 3:
+                reason = f"{series_key}有效数据点不足"
+                entries.append(ChartManifestEntry(
+                    chart_id=chart_id,
+                    module="temperature_calib",
+                    title=title,
+                    produced=False,
+                    skip_reason=f"phaseb_diagnostic({reason})",
+                ))
+                warnings.append(
+                    f"阶段 B {variant_title}四联图[{sensor_name}]失败: {reason}"
+                )
+                continue
+
+            try:
+                variant_diagnostic = dict(diagnostic)
+                variant_diagnostic["variant"] = variant
+                png_bytes = render_phase_b_diagnostic(variant_diagnostic)
+                if not png_bytes:
+                    raise ValueError("有效数据点不足")
+                png_name = (
+                    f"temp_phase_b_diagnostic_{sensor_name}_{variant}.png"
+                )
+                with open(_os.path.join(charts_dir, png_name), "wb") as file:
+                    file.write(png_bytes)
+                entries.append(ChartManifestEntry(
+                    chart_id=chart_id,
+                    module="temperature_calib",
+                    title=title,
+                    rel_path=png_name,
+                    produced=True,
+                ))
+            except Exception as exc:
+                entries.append(ChartManifestEntry(
+                    chart_id=chart_id,
+                    module="temperature_calib",
+                    title=title,
+                    produced=False,
+                    skip_reason=f"phaseb_diagnostic({exc})",
+                ))
+                warnings.append(
+                    f"阶段 B {variant_title}四联图[{sensor_name}]失败: {exc}"
+                )
 
 
 def _produce_compare_ol(cd: dict, charts_dir: str, entry: ChartManifestEntry) -> None:
@@ -235,13 +415,24 @@ def _produce_hyst(cd: dict, charts_dir: str, entries: list[ChartManifestEntry],
 _PRODUCER_FN: dict[str, Callable] = {
     "strain_calib_lin": _produce_calib_lin,
     "data_ts_cleaning": _produce_ts_cleaning,
+    "data_ts_dlambda": _produce_ts_dlambda,
+    "data_ts_strain": _produce_ts_strain,
+    "data_ts_temperature": _produce_ts_temperature,
+    "data_ts_formula": _produce_ts_formula,
+    "tempa_regression": _produce_tempa_regression,
+    "phaseb_diagnostic": _produce_phaseb_diagnostic,
     "compare_ol": _produce_compare_ol,
     "compare_corr_scatter": _produce_corr_scatter,
     "phaseb_hyst": _produce_hyst,
 }
 
 # chart_id 为"列表类"（one producer → N entries）的集合
-_LIST_PRODUCER_IDS: set[str] = {"strain_calib_lin", "compare_corr_scatter", "phaseb_hyst"}
+_LIST_PRODUCER_IDS: set[str] = {
+    "strain_calib_lin",
+    "phaseb_diagnostic",
+    "compare_corr_scatter",
+    "phaseb_hyst",
+}
 
 
 def build_chart_store(
@@ -279,6 +470,7 @@ def build_chart_store(
             result.append(ChartManifestEntry(
                 chart_id=chart_id, module=producer.module, title=producer.title,
                 produced=False, skip_reason=reason,
+                report_include=producer.report_include,
             ))
             continue
 
@@ -289,6 +481,7 @@ def build_chart_store(
             result.append(ChartManifestEntry(
                 chart_id=chart_id, module=producer.module, title=producer.title,
                 produced=False, skip_reason=reason,
+                report_include=producer.report_include,
             ))
             continue
 
@@ -304,9 +497,12 @@ def build_chart_store(
                 result.append(ChartManifestEntry(
                     chart_id=chart_id, module=producer.module, title=producer.title,
                     produced=False, skip_reason=reason,
+                    report_include=producer.report_include,
                 ))
                 warnings.append(f"图表[{chart_id}]异常: {e}\n{traceback.format_exc()}")
                 continue
+            for index in range(n_before, len(result)):
+                result[index].report_include = producer.report_include
             # ★ key_stat 收敛: 列表类产完后从 key_stat_fn 取 per-item 覆盖
             if producer.key_stat_fn is not None:
                 try:
@@ -325,7 +521,11 @@ def build_chart_store(
 
         # ── 单图类 ──
         entry = ChartManifestEntry(
-            chart_id=chart_id, module=producer.module, title=producer.title)
+            chart_id=chart_id,
+            module=producer.module,
+            title=producer.title,
+            report_include=producer.report_include,
+        )
         produce_fn = _PRODUCER_FN[chart_id]
         try:
             produce_fn(chart_data, charts_dir, entry)
@@ -344,7 +544,16 @@ def build_chart_store(
                 warnings.append(f"key_stat_fn[{chart_id}]异常: {e}")
         result.append(entry)
 
-    return sorted(result, key=lambda e: e.chart_id)
+    def _manifest_sort_key(entry: ChartManifestEntry) -> str:
+        chart_id = entry.chart_id
+        if chart_id.startswith("phaseb_diagnostic_"):
+            if chart_id.endswith("_raw"):
+                return chart_id[:-4] + "_0_raw"
+            if chart_id.endswith("_compensated"):
+                return chart_id[:-12] + "_1_compensated"
+        return chart_id
+
+    return sorted(result, key=_manifest_sort_key)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -391,20 +600,29 @@ def chart_manifest_to_figure_manifest(
 
     fm = FigureManifest()
     for entry in chart_manifest:
-        if not entry.produced or not entry.rel_path:
+        if not entry.produced or not entry.rel_path or not entry.report_include:
             continue
         fig_id = entry.chart_id
         # 若 type-level chart_id 在映射表，用映射后 id
         base_cid = entry.chart_id
-        # 剥离 per-item 后缀 (如 _A1) 以匹配注册表 chart_id
+        stripped = False
+        # 剥离 per-item 后缀 (如 _A1, _0, _1) 以匹配注册表 chart_id
         if "_" in base_cid:
             for prefix in ("phaseb_hyst_", "compare_corr_scatter_"):
                 if base_cid.startswith(prefix):
                     base_cid = prefix.rstrip("_")
+                    stripped = True
                     break
-        mapped = CHART_ID_TO_OLD_FIG_ID.get(base_cid, fig_id)
+        if stripped:
+            # Per-item 实例：保留原始唯一 chart_id 作为 fig_id，
+            # 禁止合并到旧 aggregate fig_id（会破坏 PlanningRequest 唯一性验证）。
+            pass  # fig_id already equals entry.chart_id
+        else:
+            mapped = CHART_ID_TO_OLD_FIG_ID.get(base_cid, fig_id)
+            if mapped != base_cid:
+                fig_id = mapped
         fm.add(
-            mapped if mapped != base_cid else fig_id,
+            fig_id,
             entry.module,
             entry.title,
             entry.key_stat,
@@ -429,6 +647,7 @@ def chart_manifest_to_dict(manifest: list[ChartManifestEntry]) -> list[dict]:
             "produced": e.produced,
             "skip_reason": e.skip_reason,
             "key_stat": e.key_stat,
+            "report_include": e.report_include,
         }
         for e in manifest
     ]
@@ -445,6 +664,7 @@ def chart_manifest_from_dict(data: list[dict]) -> list[ChartManifestEntry]:
             produced=d.get("produced", False),
             skip_reason=d.get("skip_reason", ""),
             key_stat=d.get("key_stat", ""),
+            report_include=bool(d.get("report_include", True)),
         )
         for d in data
     ]

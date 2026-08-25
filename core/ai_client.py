@@ -15,7 +15,8 @@ from __future__ import annotations
 import json
 import os
 import time as _time
-from typing import Any, Callable, Dict, Generator, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, Optional, Tuple, TypedDict
+from urllib.parse import urlparse
 
 import requests as _requests  # 仅用于 health check（轻量 GET，不依赖 openai SDK）
 from pydantic import BaseModel
@@ -85,6 +86,23 @@ def build_schema_prompt(models: list[type[BaseModel]]) -> str:
             parts.append(desc)
         parts.append(f'```json\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n```')
     return '\n\n'.join(parts)
+
+
+class AIToolCall(TypedDict):
+    """模型返回的单个原始工具调用。"""
+
+    id: str
+    name: str
+    arguments: str
+
+
+class AIToolStep(TypedDict):
+    """一次模型步骤的结构化结果；不在 AIClient 内执行工具。"""
+
+    content: str
+    finish_reason: str
+    tool_calls: list[AIToolCall]
+    tool_calling_unavailable: bool
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -200,6 +218,7 @@ class AIClient:
         self.temperature: float = 0.3
 
         self.api_key = api_key or _default_key
+        self._api_key_backend = _backend
         self.base_url = base_url or _default_url
         self.model_name = model_name or _default_model
         self._client = None
@@ -231,6 +250,7 @@ class AIClient:
             return  # 静默退 — 调用方已验证非空
         self._backend = 'online'
         self.api_key = api_key
+        self._api_key_backend = 'online'
         if base_url:
             self.base_url = base_url
         if model_name:
@@ -249,7 +269,8 @@ class AIClient:
         _be = getattr(self, '_backend', 'online')  # 兼容旧测试绕 __init__ 的场景
         if _be == 'local':
             return bool(self.base_url)
-        return bool(self.api_key)
+        key_backend = getattr(self, '_api_key_backend', _be)
+        return bool(self.api_key) and key_backend == 'online'
 
     def _is_local_qwen(self) -> bool:
         """本地方 Qwen3.5 模型（需要非思考模式注入）。"""
@@ -258,6 +279,27 @@ class AIClient:
             return False
         mn = (self.model_name or '').lower()
         return 'qwen' in mn or 'qwq' in mn
+
+    def _is_official_deepseek(self) -> bool:
+        """Return whether the active endpoint is DeepSeek's official API."""
+        if getattr(self, '_backend', 'online') != 'online':
+            return False
+        hostname = (urlparse(self.base_url or '').hostname or '').lower()
+        return hostname == 'api.deepseek.com'
+
+    def _thinking_extra_body(self, enable_thinking: bool) -> dict[str, Any] | None:
+        """Build the vendor-specific thinking-mode switch for one request."""
+        if self._is_local_qwen():
+            return {
+                'chat_template_kwargs': {'enable_thinking': enable_thinking},
+            }
+        if self._is_official_deepseek():
+            return {
+                'thinking': {
+                    'type': 'enabled' if enable_thinking else 'disabled',
+                },
+            }
+        return None
 
     # ═══════════════════════════════════════════════════════════════
     # 健康检查
@@ -514,29 +556,20 @@ class AIClient:
                     'max_tokens': _max_tokens,
                 }
 
-                if self._is_local_qwen():
-                    extra_body: dict[str, Any] = {
-                        'chat_template_kwargs': {'enable_thinking': enable_thinking},
-                    }
+                extra_body = self._thinking_extra_body(enable_thinking)
+                if extra_body is not None:
                     create_kwargs['extra_body'] = extra_body
-                    if not enable_thinking:
+                    if self._is_local_qwen() and not enable_thinking:
                         create_kwargs.setdefault('temperature', self.QWEN_TEMPERATURE)
                         create_kwargs['top_p'] = self.QWEN_TOP_P
                         extra_body.update({
                             'top_k': self.QWEN_TOP_K,
                             'presence_penalty': self.QWEN_PRESENCE_PENALTY,
                         })
-                    print(f"[DIAG] generate extra_body: is_qwen={self._is_local_qwen()}, "
-                          f"enable_thinking_arg={enable_thinking}, extra_body={extra_body!r}")
-
                 response = client.chat.completions.create(**create_kwargs)
                 content = (response.choices[0].message.content or '').strip()
                 finish = getattr(response.choices[0], 'finish_reason', 'stop')
                 reasoning_content = getattr(response.choices[0].message, 'reasoning_content', '') or ''
-                print(f"[DIAG] generate response: finish={finish}, content_len={len(content)}, "
-                      f"reasoning_len={len(reasoning_content)}, "
-                      f"has_think_tag={'<think>' in (content or '')}, "
-                      f"content_head={content[:120]!r}")
 
                 if finish == 'length':
                     _ctx = self._get_context_size()
@@ -567,7 +600,10 @@ class AIClient:
                         f"AI 返回空 content（finish_reason={finish}"
                         + (f", reasoning_len={reasoning_len}" if reasoning_len else "")
                         + f", max_tokens={_max_tokens}）"
-                        + ("。请确认 enable_thinking=false 已生效" if not enable_thinking else "")
+                        + (
+                            "。已请求非思考模式，但服务仍未返回最终答案，请重试"
+                            if not enable_thinking else ""
+                        )
                     )
                 return content
 
@@ -658,21 +694,16 @@ class AIClient:
                 }
 
                 # ── 本地 Qwen3.5：chat_template_kwargs 控制思考开关 ──
-                if self._is_local_qwen():
-                    _eb: dict[str, Any] = {
-                        'chat_template_kwargs': {'enable_thinking': enable_thinking},
-                    }
+                _eb = self._thinking_extra_body(enable_thinking)
+                if _eb is not None:
                     create_kwargs['extra_body'] = _eb
-                    if not enable_thinking:
+                    if self._is_local_qwen() and not enable_thinking:
                         create_kwargs.setdefault('temperature', self.QWEN_TEMPERATURE)
                         create_kwargs['top_p'] = self.QWEN_TOP_P
                         _eb.update({
                             'top_k': self.QWEN_TOP_K,
                             'presence_penalty': self.QWEN_PRESENCE_PENALTY,
                         })
-                    print(f"[DIAG] generate_stream extra_body: is_qwen={self._is_local_qwen()}, "
-                          f"enable_thinking_arg={enable_thinking}, extra_body={_eb!r}")
-
                 self._stream_response = None
                 yielded_any = False
                 last_finish = 'stop'
@@ -742,6 +773,113 @@ class AIClient:
         except Exception as e:
             raise classify_openai_error(e) from e
 
+    # ── 单步结构化工具请求（工具执行由上层安全适配器负责） ──
+
+    def generate_tool_step(
+        self,
+        messages: list[Dict[str, Any]],
+        tools: list[Dict[str, Any]],
+        temperature: float = 0.0,
+        max_tokens: int = 0,
+        *,
+        enable_thinking: bool = False,
+    ) -> AIToolStep:
+        """执行一次 OpenAI-compatible chat step，但不执行任何工具。
+
+        当请求携带工具且端点以 HTTP 400/422 拒绝时，返回显式
+        ``tool_calling_unavailable``，供多智能体图只降级一次纯文本调用。
+        """
+        if not self.is_available():
+            raise AIClientNotConfiguredError("AI API Key 未配置，请在设置中配置 AI 模型")
+
+        requested = max_tokens if max_tokens > 0 else self.max_tokens
+        prompt_text = json.dumps(messages, ensure_ascii=False, default=str)
+        safe_max_tokens = self._safe_max_tokens("", prompt_text, requested)
+        request_temperature = temperature if temperature > 0 else self.temperature
+
+        from openai import OpenAI  # pyright: ignore[reportImplicitRelativeImport]
+
+        try:
+            kwargs_openai = self._make_openai_kwargs()
+            try:
+                client = OpenAI(**kwargs_openai)  # pyright: ignore[reportArgumentType]
+            except TypeError:
+                kwargs_openai.pop('http_client', None)
+                kwargs_openai.pop('timeout', None)
+                client = OpenAI(**kwargs_openai)  # pyright: ignore[reportArgumentType]
+
+            create_kwargs: dict[str, Any] = {
+                'model': self.model_name,
+                'messages': messages,
+                'temperature': request_temperature,
+                'max_tokens': safe_max_tokens,
+            }
+            if tools:
+                create_kwargs['tools'] = tools
+
+            extra_body = self._thinking_extra_body(enable_thinking)
+            if extra_body is not None:
+                create_kwargs['extra_body'] = extra_body
+                if self._is_local_qwen() and not enable_thinking:
+                    create_kwargs.setdefault('temperature', self.QWEN_TEMPERATURE)
+                    create_kwargs['top_p'] = self.QWEN_TOP_P
+                    extra_body.update({
+                        'top_k': self.QWEN_TOP_K,
+                        'presence_penalty': self.QWEN_PRESENCE_PENALTY,
+                    })
+
+            response = client.chat.completions.create(**create_kwargs)
+            choice = response.choices[0]
+            message = choice.message
+            finish_reason = str(choice.finish_reason or '')
+
+            if finish_reason == 'length':
+                partial = (message.content or '').strip()
+                raise AIClientTruncationError(
+                    f"AI 工具步骤在 {safe_max_tokens} token 处被截断",
+                    partial_content=partial,
+                )
+
+            tool_calls: list[AIToolCall] = []
+            for call in message.tool_calls or []:
+                tool_calls.append({
+                    'id': str(call.id or ''),
+                    'name': str(call.function.name or ''),
+                    'arguments': str(call.function.arguments or ''),
+                })
+
+            if finish_reason == 'tool_calls' and tool_calls:
+                return {
+                    'content': (message.content or '').strip(),
+                    'finish_reason': finish_reason,
+                    'tool_calls': tool_calls,
+                    'tool_calling_unavailable': False,
+                }
+
+            content = (message.content or '').strip()
+            if not content:
+                raise AIClientEmptyResponseError(
+                    f"AI 工具步骤返回空响应（finish_reason={finish_reason}）"
+                )
+            return {
+                'content': content,
+                'finish_reason': finish_reason,
+                'tool_calls': [],
+                'tool_calling_unavailable': False,
+            }
+        except AIClientError:
+            raise
+        except Exception as e:
+            status_code = getattr(e, 'status_code', None)
+            if tools and status_code in (400, 422):
+                return {
+                    'content': '',
+                    'finish_reason': 'tool_calling_unavailable',
+                    'tool_calls': [],
+                    'tool_calling_unavailable': True,
+                }
+            raise classify_openai_error(e) from e
+
     # ── 多轮工具调用 (Function Calling / Agent Loop) ──
 
     def generate_with_tools(
@@ -791,12 +929,10 @@ class AIClient:
                 'temperature': _temperature,
                 'max_tokens': mt,
             }
-            if self._is_local_qwen():
-                _eb: dict[str, Any] = {
-                    'chat_template_kwargs': {'enable_thinking': enable_thinking},
-                }
+            _eb = self._thinking_extra_body(enable_thinking)
+            if _eb is not None:
                 kw['extra_body'] = _eb
-                if not enable_thinking:
+                if self._is_local_qwen() and not enable_thinking:
                     kw.setdefault('temperature', self.QWEN_TEMPERATURE)
                     kw['top_p'] = self.QWEN_TOP_P
                     _eb.update({
@@ -919,6 +1055,7 @@ class AIClient:
         """重置配置（允许运行时切换模型）."""
         if api_key:
             self.api_key = api_key
+            self._api_key_backend = self._backend
         if base_url:
             self.base_url = base_url
         if model_name:
@@ -1024,24 +1161,54 @@ class AIClient:
         schema_json = schema.model_json_schema()
         schema_name = schema_json.get("title", schema.__name__)
 
+        # ── 将 JSON Schema 嵌入 system prompt，确保模型知晓期望的字段类型 ──
+        # ★ 不用 markdown fence 包装 schema — 否则模型会模仿 fence 输出。
+        _schema_text = json.dumps(schema_json, ensure_ascii=False, indent=2)
+        _schema_instruction = (
+            "\n\n---\n"
+            "CRITICAL OUTPUT CONTRACT:\n"
+            "1. Respond with RAW JSON only — NO markdown fences (```), "
+            "NO code blocks, NO prose before or after.\n"
+            "2. Your entire response MUST start with {{ and end with }}.\n"
+            "3. Every required field in the schema below MUST be present.\n"
+            "4. Pay close attention to field TYPES — e.g. 'string' means "
+            "a text value, not an object or array.\n"
+            "\n"
+            "EXPECTED JSON SCHEMA (read carefully, output raw JSON matching this):\n"
+            f"{_schema_text}"
+        )
+        _augmented_system = system_prompt + _schema_instruction
+
         for attempt in range(max_schema_retries + 1):
             raw = self.generate(
                 prompt=prompt,
-                system_prompt=system_prompt,
+                system_prompt=_augmented_system,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 enable_thinking=False,  # 报告 JSON 必须纯答案，不能混入思维链
             )
 
-            # 提取 JSON 块
+            # ── 确定性 JSON 提取 ──
             import re as _re
-            m = _re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', raw)
-            json_str = m.group(1).strip() if m else raw.strip()
-            # 若首尾不是 { 或 [, 尝试提取
+            json_str = raw.strip()
+
+            # Step 1: 去除完整 markdown fence（如有）
+            m_fence = _re.match(
+                r'```(?:json)?\s*\n?(.*?)\n?\s*```\s*$', json_str, _re.DOTALL
+            )
+            if m_fence:
+                json_str = m_fence.group(1).strip()
+            else:
+                # Step 2: 去除开头不完整的 opening fence（```json 或 ```）
+                # 模型可能输出了 opening fence 但忘记 closing fence
+                _opening = _re.match(r'```(?:json)?\s*\n?', json_str)
+                if _opening:
+                    json_str = json_str[_opening.end():].strip()
+
+            # Step 3: 如果清理后不以 {{ 或 [ 开头，拒绝猜测
             if not json_str.startswith(("{", "[")):
-                m2 = _re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', json_str)
-                if m2:
-                    json_str = m2.group(1)
+                # 不做启发式 JSON 片段搜寻 — 直接让本轮失败进入 corrective retry
+                pass  # json_str 保持原样，json.loads / model_validate_json 会失败
 
             try:
                 # ── JSON 转义清洗（修复 LLM 输出的 LaTeX 反斜杠等非法转义）──
@@ -1049,6 +1216,24 @@ class AIClient:
                 validated = schema.model_validate_json(json_str)
                 return validated.model_dump()
             except Exception as e:
+                # Collect structured error info for ReportSchemaError
+                _json_parse_ok = False
+                _json_error_detail = ""
+                try:
+                    _parsed = json.loads(json_str)
+                    _json_parse_ok = True
+                except json.JSONDecodeError as _jde:
+                    _json_error_detail = f"JSONDecodeError at line {_jde.lineno}, col {_jde.colno}, pos {_jde.pos}: {str(_jde)[:300]}"
+                except Exception as _je:
+                    _json_error_detail = f"JSON parse error: {type(_je).__name__}: {str(_je)[:300]}"
+
+                # If Pydantic ValidationError, get structured detail
+                if hasattr(e, 'errors'):
+                    try:
+                        _errs = e.errors()
+                    except Exception:
+                        pass
+
                 if attempt < max_schema_retries:
                     fix_hint = (
                         f"\n\n[系统提示：上次输出 JSON 格式校验失败，错误为: {e}。"
@@ -1058,10 +1243,26 @@ class AIClient:
                 else:
                     missing: list[str] = []
                     type_errs: list[str] = []
+                    validation_errors: list[dict[str, object]] = []
                     if hasattr(e, "errors"):
                         for err in e.errors():
                             err_type = err.get("type", "")
                             loc = err.get("loc", ("?",))
+                            # ── Structured validation error (no raw input_value) ──
+                            _ve: dict[str, object] = {
+                                "loc": ".".join(str(x) for x in loc),
+                                "type": err_type,
+                                "msg": str(err.get("msg", ""))[:200],
+                            }
+                            # Parse ctx for bounds info (e.g. max_length, actual_length)
+                            ctx = err.get("ctx")
+                            if isinstance(ctx, dict):
+                                _ve["ctx"] = {
+                                    k: v for k, v in ctx.items()
+                                    if k in ("max_length", "min_length", "actual_length", "gt", "ge", "lt", "le")
+                                }
+                            validation_errors.append(_ve)
+                            # Legacy fields for backward compat
                             if err_type == "missing":
                                 missing.append(str(loc[0]))
                             else:
@@ -1075,6 +1276,7 @@ class AIClient:
                         raw_text=raw,
                         missing_fields=missing,
                         type_errors=type_errs,
+                        validation_errors=validation_errors,
                     ) from e
 
         # 理论上不会到达这里（所有路径均 return 或 raise）

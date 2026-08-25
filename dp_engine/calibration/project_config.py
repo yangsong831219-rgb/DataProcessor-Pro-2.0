@@ -355,7 +355,9 @@ class ProjectConfigManager:
             if src_path and os.path.isfile(src_path):
                 from utils.file_parser import parse_enlight_file
                 try:
-                    df, file_annot, meta = parse_enlight_file(src_path)
+                    df, file_annot, meta = parse_enlight_file(
+                        src_path, allow_timestamp_restarts=True,
+                    )
                     tp._loaded_df = df
                     tp._annotation_meta = meta
                     tp._time_col_idx = 0
@@ -517,6 +519,9 @@ class ProjectConfigManager:
                 sp._config["grating_kind"] = kind_map.get(sub.sensor_mode, "single")
                 sp._levels = sp._generate_default_levels()
                 sp.config_btn.setText(f"⚙ 标定参数: {sp._config_label()}")
+                sp._current_sensor = active
+                if hasattr(sp, '_lazy_recompute_charts'):
+                    sp._lazy_recompute_charts(active)
 
     @staticmethod
     def save(project_config: ProjectConfig, dir_path: str | None = None) -> str:

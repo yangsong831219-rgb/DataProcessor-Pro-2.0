@@ -75,9 +75,12 @@ class MockAnalysisTabWidget:
 
 
 class MockCleaningTabWidget:
-    def __init__(self, anomaly_info=None):
+    def __init__(self, anomaly_info=None, has_run: bool | None = None):
         self._anomaly_info = anomaly_info or {}
-        self._cleaning_has_run = bool(anomaly_info)
+        self._cleaning_has_run = bool(anomaly_info) if has_run is None else has_run
+
+    def get_config(self):
+        return {"fill_method": "linear"}
 
 
 class MockTempPage:
@@ -296,6 +299,50 @@ class TestAnomalyTable:
 
         bundle = ChartBundle.from_providers(mw)
         assert bundle.anomaly_table_md == ""
+
+    def test_cleaning_statistics_table_exists_when_zero_anomalies(self, sample_df):
+        atw = MockAnalysisTabWidget(df=sample_df)
+        clw = MockCleaningTabWidget(anomaly_info={}, has_run=True)
+        mw = MockMainWindow(
+            current_data=sample_df,
+            analysis_tab_widget=atw,
+            cleaning_tab_widget=clw,
+        )
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert bundle.anomaly_table_md == ""
+        assert bundle.cleaning_table_md
+        assert "有效数" in bundle.cleaning_table_md
+        assert "缺失数" in bundle.cleaning_table_md
+        assert "异常点数" in bundle.cleaning_table_md
+        assert "填充方式" in bundle.cleaning_table_md
+
+    def test_cleaning_statistics_accepts_object_columns_with_annotation_row(
+        self, sample_df
+    ):
+        """主表含暗号行时 dtype 会整体变 object，统计表仍必须识别数值通道。"""
+        annotated = sample_df.astype(object)
+        annotation = {
+            column: ("时间" if column == "Timestamp" else "波长")
+            for column in annotated.columns
+        }
+        annotated = pd.concat(
+            [pd.DataFrame([annotation]), annotated],
+            ignore_index=True,
+        )
+        atw = MockAnalysisTabWidget(df=sample_df)
+        clw = MockCleaningTabWidget(anomaly_info={}, has_run=True)
+        mw = MockMainWindow(
+            current_data=annotated,
+            analysis_tab_widget=atw,
+            cleaning_tab_widget=clw,
+        )
+
+        bundle = ChartBundle.from_providers(mw)
+
+        assert bundle.cleaning_table_md
+        assert "A1_应变(με)" in bundle.cleaning_table_md
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -123,11 +123,13 @@ class ReportSchemaError(AIClientError):
         raw_text: str = "",
         missing_fields: list[str] | None = None,
         type_errors: list[str] | None = None,
+        validation_errors: list[dict[str, object]] | None = None,
     ) -> None:
         super().__init__(message)
         self.raw_text = raw_text[:500] if raw_text else ""
         self.missing_fields = missing_fields or []
         self.type_errors = type_errors or []
+        self.validation_errors = validation_errors or []
 
     @property
     def retryable(self) -> bool:

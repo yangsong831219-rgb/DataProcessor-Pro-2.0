@@ -137,7 +137,7 @@ def widget(qapp):
 class TestDiagnosisRecord:
 
     def test_build_record_has_all_fields(self, widget):
-        """_build_diagnosis_record 生成完整字段 (schema 1.1)。"""
+        """_build_diagnosis_record 生成完整字段 (schema 1.2)。"""
         diag_json = {
             "diagnosis_summary": {"data_type": "fiber_optic",
                                   "overall_assessment": "test"},
@@ -151,7 +151,7 @@ class TestDiagnosisRecord:
         rec = widget._build_diagnosis_record()
 
         # Required fields
-        assert rec["schema_version"] == "1.1"
+        assert rec["schema_version"] == "1.2"
         assert "timestamp" in rec
         assert rec["backend"] in ("online", "local")
         assert isinstance(rec["selected_sources"], list)
@@ -162,7 +162,7 @@ class TestDiagnosisRecord:
         # KB hits
         assert isinstance(rec["kb_hits"], list)
 
-        # AI diagnosis segment (schema 1.1)
+        # AI diagnosis segment (schema 1.2)
         assert rec["ai_diagnosis"]["diagnosis_json"] == diag_json
         assert rec["ai_diagnosis"]["diagnosis_raw"] == "test raw"
 

@@ -49,6 +49,7 @@ def validate_parsed_data(
     source_path: str = "",
     strict: bool = True,
     min_rows: int = 1,
+    allow_timestamp_restarts: bool = False,
 ) -> None:
     """对解析结果做强制校验，不通过则 raise ParseValidationError。
 
@@ -99,6 +100,26 @@ def validate_parsed_data(
             raise ParseValidationError(
                 f"缺少 Timestamp 列 {diag} 实际列={list(df.columns)[:6]!r}"
             )
+        timestamp_text = df["Timestamp"].astype("string").str.strip()
+        timestamp_text = timestamp_text[timestamp_text.notna() & timestamp_text.ne("")]
+        duplicate_mask = timestamp_text.duplicated(keep=False)
+        all_placeholder_zero = bool(
+            not timestamp_text.empty
+            and timestamp_text.str.fullmatch(r"0+(?:\.0+)?").fillna(False).all()
+        )
+        if bool(duplicate_mask.any()) and not all_placeholder_zero:
+            duplicate_rows = int(timestamp_text.duplicated(keep="first").sum())
+            duplicate_values = timestamp_text[duplicate_mask].drop_duplicates().head(3).tolist()
+            if allow_timestamp_restarts:
+                if meta is not None:
+                    meta["timestamp_duplicate_rows"] = duplicate_rows
+                    meta["timestamp_restart_warning"] = True
+            else:
+                raise ParseValidationError(
+                    f"检测到冲突重复时间戳（同一时间戳对应不同数据）："
+                    f"重复行={duplicate_rows}，示例={duplicate_values!r}；"
+                    f"请核对冲突采集片段后重试 {diag}"
+                )
 
     from typing import cast as _cast
 

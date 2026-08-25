@@ -1,14 +1,20 @@
-"""Tests for TemplateEngine."""
+"""Tests for TemplateEngine — updated to current dp_engine.report_builder API."""
+
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pytest
 import tempfile
-import os
 
-from report_builder.models import ReportSpec, Section, ContentBlock
-from report_builder.template_engine import TemplateEngine
+from dp_engine.report_builder.models import (
+    ReportSpec, Section, ContentBlock, WordReport, WordSection,
+)
+from dp_engine.report_builder.template_engine import TemplateEngine
 
 
 class TestTemplateEngine:
-    """Test suite for TemplateEngine."""
+    """Test suite for TemplateEngine — placeholder substitution + template filling."""
 
     def test_substitute_placeholders_basic(self):
         """Test basic placeholder substitution."""
@@ -39,47 +45,29 @@ class TestTemplateEngine:
         result = engine.substitute_placeholders('', {'key': 'value'})
         assert result == ''
 
-    def test_render_nonexistent_template(self):
-        """Test rendering a non-existent template returns spec unchanged."""
+    def test_fill_word_template_basic(self):
+        """Test fill_word_template builds correct placeholder map from WordReport."""
         engine = TemplateEngine()
 
-        spec = ReportSpec(
-            title='Test',
-            author='Author',
-            date='2024-01-01',
-            sections=[]
-        )
-
-        result = engine.render('/nonexistent/path/template.docx', spec)
-
-        assert result.title == spec.title
-        assert result.author == spec.author
-
-    def test_build_replacement_map(self):
-        """Test building replacement map from spec."""
-        engine = TemplateEngine()
-
-        spec = ReportSpec(
+        report = WordReport(
             title='My Report',
             author='John',
             date='2024-01-01',
             sections=[
-                Section(
-                    title='Overview',
-                    blocks=[
-                        ContentBlock(type='text', data='Some text content')
-                    ]
-                )
-            ]
+                WordSection(
+                    heading='Overview',
+                    content_paragraphs=['Some text content'],
+                ),
+            ],
         )
 
-        replacements = engine._build_replacement_map(spec)
+        replacements = engine.fill_word_template('', report)
 
         assert replacements['title'] == 'My Report'
         assert replacements['author'] == 'John'
         assert replacements['date'] == '2024-01-01'
-        assert replacements['section_1_title'] == 'Overview'
-        assert replacements['section_1_block_1'] == 'Some text content'
+        assert replacements['section_1_heading'] == 'Overview'
+        assert replacements['section_1_para_1'] == 'Some text content'
 
     def test_substitute_multiple_placeholders(self):
         """Test substituting multiple placeholders at once."""
@@ -103,22 +91,20 @@ class TestTemplateEngine:
 
         assert result == 'No placeholders here'
 
-    def test_render_with_actual_docx_template(self):
-        """Test rendering with an actual docx template if available."""
+    def test_fill_word_template_with_docx(self):
+        """Test fill_word_template with an actual docx template."""
         engine = TemplateEngine()
 
-        spec = ReportSpec(
+        report = WordReport(
             title='Template Test',
             author='Tester',
             date='2024-06-01',
             sections=[
-                Section(
-                    title='Introduction',
-                    blocks=[
-                        ContentBlock(type='text', data='Welcome to the report')
-                    ]
-                )
-            ]
+                WordSection(
+                    heading='Introduction',
+                    content_paragraphs=['Welcome to the report'],
+                ),
+            ],
         )
 
         # Create a minimal docx for testing
@@ -140,10 +126,9 @@ class TestTemplateEngine:
             temp_path = f.name
 
         try:
-            result = engine.render(temp_path, spec)
-            # The result should be a valid spec with same values
-            assert result.title == 'Template Test'
-            assert result.author == 'Tester'
+            replacements = engine.fill_word_template(temp_path, report)
+            assert replacements['title'] == 'Template Test'
+            assert replacements['author'] == 'Tester'
         finally:
             os.unlink(temp_path)
 

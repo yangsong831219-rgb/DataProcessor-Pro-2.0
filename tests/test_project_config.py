@@ -53,6 +53,7 @@ def _make_sample_temperature() -> dict:
         },
         "ke_table": {"A1": {"Ke1": 0.7, "Ke2": 1.1}},
         "decoupling_results": {"A1": {"e_mean": 3.0, "e_std": 43.5, "e_range": 100.0, "rating": "良"}},
+        "compensation": {},
     }
 
 

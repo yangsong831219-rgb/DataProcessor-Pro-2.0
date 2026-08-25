@@ -136,6 +136,53 @@ def test_detection_params_hold_time_signal(qapp, sample_df):
     dlg.close()
 
 
+def test_cycle_program_expects_15_platforms_for_0_to_70_to_0(qapp, sample_df):
+    """The range UI must expose the physical cycle program, not only 8 levels."""
+    from ui.calibration_tab import PhaseADialog
+
+    annotation = {"A1-W1": "A1-W1", "A1-W2": "A1-W2"}
+    groups = {"A1": [
+        {"name": "A1-W1", "col_name": "A1-W1"},
+        {"name": "A1-W2", "col_name": "A1-W2"},
+    ]}
+    dlg = PhaseADialog(
+        sample_df, annotation, groups,
+        {"temperature_program_mode": "cycle", "temperature_cycle_count": 1},
+        None,
+    )
+    dlg.tmin.setValue(0.0)
+    dlg.tmax.setValue(70.0)
+    dlg.tstep.setValue(10.0)
+    dlg.program_mode_combo.setCurrentIndex(dlg.program_mode_combo.findData("cycle"))
+
+    assert dlg._expected_platform_count() == 15
+    assert dlg.temperature_cycle_spin.isEnabled()
+    assert dlg._params["temperature_program_mode"] == "cycle"
+    assert dlg._params["temperature_cycle_count"] == 1
+    dlg.close()
+
+
+def test_detection_message_distinguishes_candidate_fragments_from_platforms():
+    """A split dwell should not be presented as an extra temperature level."""
+    from ui.calibration_tab import DetectionParamsDialog
+
+    message = DetectionParamsDialog._format_match_info(
+        45,
+        43,
+        {
+            "normalized_segments": 43,
+            "complete_cycles": 3,
+            "required_cycles": 3,
+            "expected_platforms_per_cycle": 15,
+            "is_complete": True,
+        },
+    )
+
+    assert "45" in message
+    assert "43" in message
+    assert "逻辑平台" in message
+
+
 def test_phase_b_gated_by_phase_a(qapp):
     from ui.calibration_tab import TemperatureCalibrationPage
     page = TemperatureCalibrationPage()

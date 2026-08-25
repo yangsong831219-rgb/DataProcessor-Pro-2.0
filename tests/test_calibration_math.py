@@ -28,13 +28,12 @@ from .golden.golden_data import (
     STRAIN_HY_TOL,
 )
 
-# FBG.py 原始温度循环数据文件路径
+# 温度循环数据文件路径 — 仓库内小型确定性黄金fixture
 import os as _os
 _TEMP_DATA_FILE = _os.path.join(
     _os.path.dirname(_os.path.abspath(__file__)),
     "golden", "温度循环数据.txt",
 )
-_TEMP_DATA_FALLBACK = "D:/桌面文件/222/4次温度循环温度系数修订/温度循环数据.txt"
 from dp_engine.calibration.step_extractor import detect_plateaus
 from dp_engine.calibration.temperature_calibration import (
     load_continuous,
@@ -273,22 +272,18 @@ class TestStrainCalibrationGolden:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestTemperatureCalibrationGolden:
-    """温度标定引擎复现 FBG.py 黄金输出
+    """温度标定引擎复现黄金输出
 
-    使用 FBG.py 的同一份原始数据文件，用相同参数运行标定流程，
-    断言 S_eff / T_base / R² 与 FBG.py 原始输出一致。
-
-    数据文件查找顺序:
-      1. tests/golden/温度循环数据.txt
-      2. D:/桌面文件/222/4次温度循环温度系数修订/温度循环数据.txt
+    使用仓库内小型确定性黄金fixture: tests/golden/温度循环数据.txt，
+    运行标定流程并断言 S_eff / T_base / R² 与预期一致。
     """
 
     @pytest.fixture(scope="class")
     def temp_data(self):
         """加载温度循环数据，整个类共享一次"""
-        data_path = _TEMP_DATA_FILE if _os.path.isfile(_TEMP_DATA_FILE) else _TEMP_DATA_FALLBACK
+        data_path = _TEMP_DATA_FILE
         if not _os.path.isfile(data_path):
-            pytest.skip(f"温度循环数据文件未找到: {_TEMP_DATA_FILE} (或 {_TEMP_DATA_FALLBACK})")
+            pytest.fail(f"温度循环数据文件未找到: {data_path}")
         df, base = load_continuous(
             data_path,
             wavelength_cols=["A1-W1", "A1-W2", "A2-W1", "A2-W2"],
@@ -332,7 +327,7 @@ class TestTemperatureCalibrationGolden:
         }
         for dc, grating in key_map.items():
             if dc not in temp_S_eff:
-                pytest.skip(f"S_eff 未计算: {dc}")
+                pytest.fail(f"S_eff 未计算: {dc} — fixture数据应覆盖全部4个grating")
             actual = temp_S_eff[dc]["slope"]
             expected = TEMP_GOLDEN_S_EFF[grating]
             assert actual == pytest.approx(expected, abs=TEMP_REGRESSION_ATOL), (
@@ -340,14 +335,14 @@ class TestTemperatureCalibrationGolden:
             )
 
     def test_T_base_golden(self, temp_S_eff):
-        """推断基准温度复现 FBG.py 输出"""
+        """推断基准温度复现golden值"""
         key_map = {
             "A1-W1_d": "A1-W1", "A1-W2_d": "A1-W2",
             "A2-W1_d": "A2-W1", "A2-W2_d": "A2-W2",
         }
         for dc, grating in key_map.items():
             if dc not in temp_S_eff:
-                pytest.skip(f"T_base 未计算: {dc}")
+                pytest.fail(f"T_base 未计算: {dc} — fixture数据应覆盖全部4个grating")
             actual = temp_S_eff[dc]["T_base"]
             expected = TEMP_GOLDEN_T_BASE[grating]
             assert actual == pytest.approx(expected, abs=TEMP_TBASE_ATOL), (
@@ -355,14 +350,14 @@ class TestTemperatureCalibrationGolden:
             )
 
     def test_R2_golden(self, temp_S_eff):
-        """决定系数 R² 复现 FBG.py 输出"""
+        """决定系数 R² 复现golden值"""
         key_map = {
             "A1-W1_d": "A1-W1", "A1-W2_d": "A1-W2",
             "A2-W1_d": "A2-W1", "A2-W2_d": "A2-W2",
         }
         for dc, grating in key_map.items():
             if dc not in temp_S_eff:
-                pytest.skip(f"R² 未计算: {dc}")
+                pytest.fail(f"R² 未计算: {dc} — fixture数据应覆盖全部4个grating")
             actual = temp_S_eff[dc]["r2"]
             expected = TEMP_GOLDEN_R2[grating]
             assert actual == pytest.approx(expected, abs=TEMP_R2_ATOL), (

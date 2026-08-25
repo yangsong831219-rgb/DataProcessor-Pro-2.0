@@ -145,6 +145,9 @@ class PhaseAChartsDialog(BaseChartsDialog):
                 import traceback; traceback.print_exc()
                 P = pd.DataFrame()
 
+        if not isinstance(P, pd.DataFrame):
+            P = pd.DataFrame()
+
         fig = self._chart.get_figure()
         fig.clear()
         n = len(wcols)
@@ -165,8 +168,16 @@ class PhaseAChartsDialog(BaseChartsDialog):
             s = S_eff.get(wcol, {})
             display = self._annotation.get(wcol, wcol)
             if not P.empty and "T_set" in P.columns and dc in P.columns:
-                ax.scatter(P["T_set"], P[dc], s=25, alpha=0.6,
-                           color=colors[i % len(colors)], zorder=3)
+                excluded = set(s.get("excluded_plateau_positions", []) or [])
+                positions = np.arange(len(P))
+                keep_mask = np.array([pos not in excluded for pos in positions])
+                ax.scatter(P.loc[keep_mask, "T_set"], P.loc[keep_mask, dc],
+                           s=25, alpha=0.6, color=colors[i % len(colors)],
+                           zorder=3, label="用于拟合")
+                if excluded:
+                    ax.scatter(P.loc[~keep_mask, "T_set"], P.loc[~keep_mask, dc],
+                               s=36, marker="x", color="#d62728", zorder=4,
+                               label="剔除的异常平台")
                 if not np.isnan(s.get("slope", float("nan"))):
                     xs = np.linspace(P["T_set"].min(), P["T_set"].max(), 100)
                     intercept = s.get("intercept")
@@ -176,8 +187,10 @@ class PhaseAChartsDialog(BaseChartsDialog):
                     if intercept is not None:
                         ax.plot(xs, s["slope"] * xs + intercept, "-", lw=2,
                                 color="red", label=f'灵敏度={s["slope"]:.2f} pm/°C')
+            used = s.get("used_plateaus", len(P))
+            total = s.get("total_plateaus", len(P))
             ax.set_title(f"{display}: 灵敏度={s.get('slope',0):.2f} pm/°C  "
-                         f"R²={s.get('r2',0):.5f}", fontsize=9)
+                         f"R²={s.get('r2',0):.5f}  使用={used}/{total}", fontsize=9)
             ax.set_xlabel("设定温度 (°C)", fontsize=8)
             ax.set_ylabel("波长漂移 (pm)", fontsize=8)
             ax.legend(fontsize=7)

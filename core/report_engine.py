@@ -18,9 +18,13 @@ from typing import Any, Callable, Dict, List, Optional
 from pydantic import ValidationError
 
 from core.report_models import PPTReport, PPTSlide, WordReport, WordSection
+from core.report_figure_planner import (
+    format_figures_for_prompt,
+    plan_figures_for_sections,
+)
 from core.ai_errors import (
-    AIClientError, AIClientNotConfiguredError, AIClientTruncationError,
-    ReportSchemaError,
+    AIClientEmptyResponseError, AIClientError, AIClientNotConfiguredError,
+    AIClientTruncationError, ReportSchemaError,
 )
 
 # Schema 注入 — 运行时构建
@@ -28,6 +32,8 @@ from core.ai_client import build_schema_prompt
 
 _WORD_SCHEMA_CACHE: str = ''
 _PPT_SCHEMA_CACHE: str = ''
+
+_ENUM_PASSTHROUGH_RULE = "评级/数值一律照摘要原文，不得改写"
 
 
 def _get_word_schema() -> str:
@@ -52,7 +58,8 @@ def _get_ppt_schema() -> str:
 SECTION_TOOLS_SYSTEM_PROMPT = (
     "你是一个报告写作专家。在撰写报告时，你可以调用以下工具来获取数据图表：\n"
     "- generate_sensor_plot: 生成传感器趋势图或分布直方图。\n\n"
-    "图表将由代码自动注入到报告中，不要在 JSON 中输出 image_anchors 字段。\n\n"
+    "图表由代码提供候选目录。只有用户提示明确给出候选锚点时，"
+    "才可在 image_anchor 中原样选择其中一个；不得编造文件名。\n\n"
     "你必须严格按照指定的 JSON Schema 格式输出，不要包含任何额外文字说明。"
 )
 
@@ -68,7 +75,8 @@ OUTLINE_PROMPT = """你是一个专业的技术报告写作专家。请根据以
 - 后续每行为章节标题：## 章节名
 - 每个章节下列出 2-4 个关键论点，用 - 开头
 - Word 报告：5-8 章，每章可详述
-- PPT 报告：8-10 页，每页 2-4 个要点
+- PPT 报告：8-10 页，每页只承担一个叙事任务，按“背景与问题→证据→诊断→决策”推进
+- PPT 标题必须表达该页结论或关键发现，避免只写“数据分析”“结果汇总”等目录式标题
 - 语言：中文
 - 只输出大纲，不要额外说明"""
 
@@ -84,11 +92,15 @@ SECTION_PROMPT_WORD = """你是一位工程技术报告撰写专家。请根据�
 
 {charts_context}
 
+本节图表计划:
+{section_figures}
+
 正文用 Markdown 格式输出本节的完整内容。要求：
 - 本节的章标题已由代码生成，你不需要再输出章标题
 - 子标题从 ## 起（不要用 # 开头——# 是章标题级，你的是子节）
 - 可用 **加粗**、- 列表、1. 编号列表
 - 可输出 Markdown 表格（| 列1 | 列2 |），需有 |---|---| 分隔行
+- 评级等枚举字段必须逐字引用项目资料；评级/数值一律照摘要原文，不得改写
 - {chart_instruction}
 - 语言：中文。只输出 Markdown 正文，不要 JSON、不要额外说明、不要代码围栏。"""
 
@@ -110,12 +122,20 @@ SECTION_PROMPT_PPT = """你是一位技术汇报演示专家。请根据以下�
 项目资料上下文:
 {project_context}
 
+本页候选图表:
+{section_figures}
+
 你必须输出一个合法的 JSON 对象，对应一个 SlideContent：
 {ppt_schema}
 
 要求：
 - 要点**最多 4 条**，每条**不超过 20 字**
 - speaker_notes 可写 50-200 字详细论述
+- slide_title 必须是可直接讲述的结论式标题，不要机械重复大纲章节名
+- 候选图表非空时，必须选择最能支撑本页主张的一张，image_anchor 原样填写候选锚点
+- 候选图表为空时，image_anchor 必须为 null；禁止编造图片文件名
+- bullet_points 必须解释图表意味着什么及其决策影响，不能只罗列图名或指标
+- 评级等枚举字段必须逐字引用项目资料；评级/数值一律照摘要原文，不得改写
 - 语言：中文
 - 只输出 JSON 对象，不要额外文字"""
 
@@ -258,6 +278,17 @@ def _build_context(config: dict) -> tuple[str, list[str]]:
     return '\n\n---\n\n'.join(parts), warnings
 
 
+def build_report_source_context(config: dict) -> tuple[str, list[str]]:
+    """Public Host-planning Interface for the canonical report context.
+
+    The returned text and warnings are identical to the legacy report engine's
+    internal context.  Exposing this narrow Interface prevents the PPT Master
+    workflow from duplicating file-routing and diagnosis-summary rules.
+    """
+
+    return _build_context(config)
+
+
 def get_sensor_analysis(rec: dict) -> list[dict]:
     """从诊断记录中提取 sensor_analysis 列表。
 
@@ -282,8 +313,9 @@ def _get_diagnosis_json(rec: dict) -> dict:
 
 
 def count_sensors(rec: dict) -> int:
-    """从诊断记录中计算传感器数 (兼容 v1.0/v1.1)。"""
-    return len(get_sensor_analysis(rec))
+    """从诊断记录 SSOT 计算传感器数（兼容单专家与多智能体记录）。"""
+    sensor_count = summarize_diagnosis_record(rec).get('sensor_count', 0)
+    return sensor_count if isinstance(sensor_count, int) else 0
 
 
 def summarize_diagnosis_record(rec: dict) -> dict:
@@ -367,6 +399,15 @@ def _build_diagnosis_summary(rec: dict, max_chars: int = 2500) -> str:
         advisory = ''
 
     lines = [f'# 传感器诊断数据（来源: {source_label}）']
+
+    chart_data = rec.get("chart_data") or {}
+    grade_table_md = chart_data.get("grade_table_md", "") if isinstance(chart_data, dict) else ""
+    if isinstance(grade_table_md, str) and grade_table_md.strip():
+        lines.extend([
+            "\n## 评级枚举事实（逐字引用）",
+            _ENUM_PASSTHROUGH_RULE,
+            grade_table_md.strip(),
+        ])
 
     # ── 数据质量概览（多智能体特有）──
     if ds:
@@ -656,6 +697,7 @@ def generate_structured_report(
     progress_callback: Callable[[dict], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
     charts_context: str = "",
+    chart_catalog: Optional[List[Dict[str, Any]]] = None,
 ) -> dict:
     """基于大纲分块生成结构化报告。
 
@@ -681,6 +723,7 @@ def generate_structured_report(
     report_title = title_line.replace('# ', '').strip() if title_line.startswith('# ') else '数据分析报告'
 
     project_context, report_warnings = _build_context(config)
+    figure_plan = plan_figures_for_sections(sections, chart_catalog or [])
 
     # 空诊断 → 记录供产物品展示
     diag_rec = config.get('_diagnosis_record')
@@ -690,12 +733,14 @@ def generate_structured_report(
         result = _generate_word_markdown_report(
             report_title, sections, project_context,
             generate_fn, charts_context,
+            figure_plan=figure_plan,
             progress_callback=progress_callback,
             cancel_check=cancel_check,
         )
     else:
         result = _generate_ppt_report(report_title, sections, project_context,
-                                       generate_fn, tools_config)
+                                       generate_fn, tools_config,
+                                       figure_plan=figure_plan)
 
     # 合并: _build_context 的 warns + 段降级的 warns (from _generate_word_report)
     gen_warnings = result.pop('_report_warnings', [])
@@ -710,6 +755,7 @@ def _generate_word_markdown_report(
     project_context: str,
     generate_fn: Callable[..., str],
     charts_context: str = "",
+    figure_plan: Optional[Dict[int, List[Dict[str, Any]]]] = None,
     progress_callback: Callable[[dict], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
@@ -727,12 +773,6 @@ def _generate_word_markdown_report(
 
     has_charts = bool(charts_context and charts_context.strip()
                      and charts_context != '(无图表)')
-    chart_instruction = (
-        _CHART_INSTRUCTION_HAS.format(charts_context=charts_context)
-        if has_charts
-        else _CHART_INSTRUCTION_NONE
-    )
-
     total = len(sections)
     for i, sec in enumerate(sections):
         if cancel_check and cancel_check():
@@ -746,6 +786,26 @@ def _generate_word_markdown_report(
                 'total': total, 'heading': heading,
             })
         key_points = sec.get('key_points', [])
+        section_figures = (figure_plan or {}).get(i, [])
+        section_figures_text = format_figures_for_prompt(
+            section_figures,
+            include_filename=False,
+        )
+        if section_figures:
+            required_figures = "、".join(
+                f"图{figure.get('fig_no')}" for figure in section_figures
+            )
+            chart_instruction = (
+                f"本节必须使用 {required_figures}。请在每张图所支撑的具体结论句中"
+                "分别写出“如图N所示”，逐一引用且不得遗漏；不要把全部图引用集中到段尾。"
+                "只使用上方本节图表计划中的图号，不输出图片文件名。"
+            )
+        elif has_charts:
+            chart_instruction = (
+                "本节没有分配图表，不要引用任何图N，也不要把其他章节图表挪到本节。"
+            )
+        else:
+            chart_instruction = _CHART_INSTRUCTION_NONE
 
         prompt = SECTION_PROMPT_WORD.format(
             report_title=title,
@@ -753,6 +813,7 @@ def _generate_word_markdown_report(
             key_points='\n'.join(f'- {p}' for p in key_points) if key_points else '（无明确论点）',
             project_context=project_context,
             charts_context=charts_context if charts_context else '',
+            section_figures=section_figures_text,
             chart_instruction=chart_instruction,
         )
 
@@ -807,45 +868,76 @@ def _generate_ppt_report(
     project_context: str,
     generate_fn: Callable[..., str],
     tools_config: Optional[dict] = None,
+    figure_plan: Optional[Dict[int, List[Dict[str, Any]]]] = None,
 ) -> dict:
     """逐页生成 PPT 报告（支持 Agentic 工具调用）。
 
     每页输出由 Pydantic PPTSlide 校验；校验失败抛 ReportSchemaError，绝不静默降级。
     """
+    import logging as _logging
+
+    _log = _logging.getLogger(__name__)
     slides: List[PPTSlide] = []
+    figure_warnings: list[str] = []
 
     for i, sec in enumerate(sections):
         heading = sec['heading']
         key_points = sec.get('key_points', [])
+        section_figures = (figure_plan or {}).get(i, [])
+        section_figures_text = format_figures_for_prompt(
+            section_figures,
+            include_filename=True,
+        )
 
         prompt = SECTION_PROMPT_PPT.format(
             report_title=title,
             section_heading=heading,
             key_points='\n'.join(f'- {p}' for p in key_points) if key_points else '（无明确论点）',
             project_context=project_context,
+            section_figures=section_figures_text,
             ppt_schema=_get_ppt_schema(),
         )
 
-        if tools_config:
-            from core.ai_client import AIClient
-            ai = AIClient.get_instance()
-            if not ai.is_available():
-                raise AIClientNotConfiguredError(
-                    "AI 模型未配置，无法生成含图表的完整报告。"
-                    "请先在「AI 模型配置」中完成配置并连接。"
-                ) from None
-            messages = [
-                {'role': 'system', 'content': SECTION_TOOLS_SYSTEM_PROMPT},
-                {'role': 'user', 'content': prompt},
-            ]
-            raw = ai.generate_with_tools(
-                messages,
-                tools_config['definitions'],
-                tools_config['executable_map'],
-                enable_thinking=False,  # 报告路径走非思考模式
+        raw: str | None = None
+        for attempt in range(2):
+            try:
+                if tools_config:
+                    from core.ai_client import AIClient
+                    ai = AIClient.get_instance()
+                    if not ai.is_available():
+                        raise AIClientNotConfiguredError(
+                            "AI 模型未配置，无法生成含图表的完整报告。"
+                            "请先在「AI 模型配置」中完成配置并连接。"
+                        ) from None
+                    messages = [
+                        {'role': 'system', 'content': SECTION_TOOLS_SYSTEM_PROMPT},
+                        {'role': 'user', 'content': prompt},
+                    ]
+                    raw = ai.generate_with_tools(
+                        messages,
+                        tools_config['definitions'],
+                        tools_config['executable_map'],
+                        enable_thinking=False,  # 报告路径走非思考模式
+                    )
+                else:
+                    raw = generate_fn(prompt)
+                break
+            except AIClientError as exc:
+                should_retry = isinstance(exc, AIClientEmptyResponseError) or exc.retryable
+                if attempt == 0 and should_retry:
+                    _log.warning(
+                        "PPT slide '%s' AI retry after %s: %s",
+                        heading,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    continue
+                raise
+
+        if raw is None:
+            raise AIClientEmptyResponseError(
+                f"第 {i+1} 页『{heading}』AI 重试后仍未返回内容"
             )
-        else:
-            raw = generate_fn(prompt)
 
         json_str = _extract_json(raw)
 
@@ -859,10 +951,34 @@ def _generate_ppt_report(
                 type_errors=_type_errors_from_error(e),
             ) from e
 
+        allowed_anchors = {
+            f"[INSERT_IMAGE: {figure.get('filename')}]": figure
+            for figure in section_figures
+        }
+        if section_figures:
+            if slide.image_anchor not in allowed_anchors:
+                selected_anchor = next(iter(allowed_anchors))
+                # 唯一候选时没有歧义，代码确定性补齐即可；只有模型编造锚点
+                # 或多个候选无法判定时才需要向用户暴露降级告警。
+                if len(allowed_anchors) > 1 or bool(slide.image_anchor):
+                    figure_warnings.append(
+                        f"第 {i+1} 页「{heading}」未返回有效候选图表锚点，"
+                        f"已按语义规划使用 {selected_anchor}"
+                    )
+                slide.image_anchor = selected_anchor
+        elif slide.image_anchor:
+            figure_warnings.append(
+                f"第 {i+1} 页「{heading}」编造了非候选图表锚点，已移除"
+            )
+            slide.image_anchor = None
+
         slides.append(slide)
 
     report = PPTReport(
         title=title,
         slides=slides,
     )
-    return report.to_builder_dict()
+    result = report.to_builder_dict()
+    if figure_warnings:
+        result["_report_warnings"] = figure_warnings
+    return result

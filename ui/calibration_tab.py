@@ -15,7 +15,7 @@ CalibrationTabWidget(QWidget)
 
 from __future__ import annotations
 
-import os, re, math
+import copy, hashlib, json, os, re, math
 from datetime import datetime
 from typing import Optional
 
@@ -44,6 +44,7 @@ from ui.widgets.chart_panel import ChartPanel
 from dp_engine.calibration.temperature_calibration import (
     load_continuous, assign_setpoints, regress_sensitivity,
     decouple, compare_given_vs_measured, run_temperature_calibration,
+    build_temperature_program_sequence, validate_temperature_program,
 )
 from dp_engine.calibration.strain_calibration import (
     compute_theoretical_strain,
@@ -278,12 +279,13 @@ class DetectionParamsDialog(QDialog):
     """
 
     def __init__(self, current_params: dict, df=None, wavelength_cols=None,
-                 n_expected=None, time_col_idx=None, parent=None):
+                 n_expected=None, setpoints=None, time_col_idx=None, parent=None):
         super().__init__(parent)
         self._params = dict(current_params)
         self._df = df
         self._wavelength_cols = wavelength_cols or []
         self._n_expected = n_expected
+        self._setpoints = list(setpoints or [])
         self._time_col_idx = time_col_idx  # 暗号识别的时间列索引
         self._build_ui()
         self._auto_detect_sample_interval()
@@ -356,6 +358,18 @@ class DetectionParamsDialog(QDialog):
         _, self.min_plat_spin = create_labeled_int_spinbox(
             "最短平台 (点)", 10, 5000,
             self._params.get("min_plateau_samples", 180),
+        )
+        adv_layout.addLayout(_)
+
+        self.quality_filter_check = QCheckBox("低线性度时剔除异常平台")
+        self.quality_filter_check.setChecked(
+            bool(self._params.get("quality_filter_enabled", True))
+        )
+        adv_layout.addWidget(self.quality_filter_check)
+
+        _, self.quality_residual_spin = create_labeled_spinbox(
+            "异常平台残差上限 (pm)", 10.0, 1000.0,
+            self._params.get("quality_residual_threshold_pm", 100.0), decimals=1,
         )
         adv_layout.addLayout(_)
 
@@ -434,13 +448,13 @@ class DetectionParamsDialog(QDialog):
                 std_percentile=self.std_pct_spin.value(),
                 min_plateau_samples=self.min_plat_spin.value(),
                 head_trim_ratio=self.head_trim_spin.value(),
+                quality_jump_threshold_nm=self._params.get("quality_jump_threshold_nm"),
+                min_serial_jump_count=int(self._params.get("min_serial_jump_count", 10)),
             )
             n = len(P)
             exp = self._n_expected or "?"
-            self.match_info.setText(
-                f"检出 {n} 个平台 / 期望 {exp} 个"
-                + (" ✅" if self._n_expected and n == self._n_expected else "")
-            )
+            diagnostic = self._validate_temperature_program(P)
+            self.match_info.setText(self._format_match_info(n, exp, diagnostic))
         except Exception as e:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(
@@ -476,6 +490,7 @@ class DetectionParamsDialog(QDialog):
         try:
             best_pct = self.std_pct_spin.value()
             best_n = 0
+            best_diagnostic: dict = {}
             for pct in range(10, 95, 5):
                 P = detect_plateaus(
                     df_dL, self._wavelength_cols,
@@ -483,17 +498,29 @@ class DetectionParamsDialog(QDialog):
                     std_percentile=float(pct),
                     min_plateau_samples=self.min_plat_spin.value(),
                     head_trim_ratio=self.head_trim_spin.value(),
+                    quality_jump_threshold_nm=self._params.get("quality_jump_threshold_nm"),
+                    min_serial_jump_count=int(self._params.get("min_serial_jump_count", 10)),
                 )
                 n = len(P)
-                if n == self._n_expected:
+                diagnostic = self._validate_temperature_program(P)
+                candidate_key = (
+                    int(diagnostic.get("complete_cycles", 0)),
+                    int(diagnostic.get("longest_ordered_prefix", 0)),
+                    -abs(n - int(self._n_expected)),
+                )
+                best_key = (
+                    int(best_diagnostic.get("complete_cycles", 0)),
+                    int(best_diagnostic.get("longest_ordered_prefix", 0)),
+                    -abs(best_n - int(self._n_expected)),
+                )
+                if candidate_key > best_key:
                     best_pct = float(pct); best_n = n
-                    break
-                if abs(n - self._n_expected) < abs(best_n - self._n_expected):
-                    best_pct = float(pct); best_n = n
+                    best_diagnostic = diagnostic
 
             self.std_pct_spin.setValue(best_pct)
             self.match_info.setText(
-                f"检出 {best_n}/{self._n_expected} 个平台 (阈值={best_pct:.0f}%)"
+                self._format_match_info(best_n, self._n_expected, best_diagnostic)
+                + f" (阈值={best_pct:.0f}%)"
             )
         except Exception as e:
             from PyQt6.QtWidgets import QMessageBox
@@ -505,15 +532,51 @@ class DetectionParamsDialog(QDialog):
             )
             self.match_info.setText("⚠ 自动匹配失败")
 
+    def _validate_temperature_program(self, plateaus: pd.DataFrame) -> dict:
+        if not self._setpoints:
+            return {}
+        labeled = assign_setpoints(plateaus, self._setpoints)
+        _accepted, diagnostic = validate_temperature_program(
+            labeled,
+            self._setpoints,
+            self._params.get("temperature_program_mode", "heating"),
+            cycle_count=int(self._params.get("temperature_cycle_count", 1)),
+        )
+        return diagnostic
+
+    @staticmethod
+    def _format_match_info(n: int, expected, diagnostic: dict) -> str:
+        normalized = int(diagnostic.get("normalized_segments", n))
+        if normalized != n:
+            text = (
+                f"检出 {n} 个候选平台（归并为 {normalized} 个逻辑平台）"
+                f"/ 期望 {expected} 个"
+            )
+        else:
+            text = f"检出 {n} 个候选平台 / 期望 {expected} 个"
+        if not diagnostic:
+            return text
+        complete = diagnostic.get("complete_cycles", 0)
+        required = diagnostic.get("required_cycles", 1)
+        longest = diagnostic.get("longest_ordered_prefix", 0)
+        per_cycle = diagnostic.get("expected_platforms_per_cycle", expected)
+        if diagnostic.get("is_complete", False):
+            return text + f"；完整温度程序 {complete}/{required} ✅"
+        return text + f"；完整温度程序 {complete}/{required}，最长顺序 {longest}/{per_cycle} ⚠"
+
     def get_params(self) -> dict:
-        return {
+        params = dict(self._params)
+        params.update({
             "rolling_window": self.rolling_spin.value(),
             "std_percentile": self.std_pct_spin.value(),
             "min_plateau_samples": self.min_plat_spin.value(),
             "head_trim_ratio": self.head_trim_spin.value(),
+            "quality_filter_enabled": self.quality_filter_check.isChecked(),
+            "quality_residual_threshold_pm": self.quality_residual_spin.value(),
             "sample_interval_s": self.sample_interval_spin.value(),
             "hold_time_min": self.hold_time_spin.value(),
-        }
+        })
+        return params
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -589,7 +652,9 @@ class PhaseAWorker(QThread):
 
     def run(self):
         try:
-            from dp_engine.calibration.step_extractor import detect_plateaus
+            from dp_engine.calibration.step_extractor import (
+                detect_plateaus, filter_plateaus_by_adjacent_jumps,
+            )
             from dp_engine.calibration.temperature_calibration import compute_dL
 
             self.progress.emit("正在计算波长漂移...")
@@ -603,25 +668,134 @@ class PhaseAWorker(QThread):
                 std_percentile=self.params.get("std_percentile", 45.0),
                 min_plateau_samples=self.params.get("min_plateau_samples", 180),
                 head_trim_ratio=self.params.get("head_trim_ratio", 0.70),
+                quality_jump_threshold_nm=self.params.get("quality_jump_threshold_nm"),
+                min_serial_jump_count=int(
+                    self.params.get("min_serial_jump_count", 10)
+                ),
             )
             self.progress.emit(f"检测到 {len(P)} 个平台段")
 
             self.progress.emit("映射平台到设定温度...")
             P = assign_setpoints(P, self.setpoints)
+            candidate_plateaus = P
+            program_mode = self.params.get("temperature_program_mode", "heating")
+            cycle_count = int(self.params.get("temperature_cycle_count", 1))
+            P, program_validation = validate_temperature_program(
+                P,
+                self.setpoints,
+                program_mode,
+                cycle_count=cycle_count,
+            )
+            if program_validation["is_complete"]:
+                self.progress.emit(
+                    "温度程序验证通过: "
+                    f"{program_validation['complete_cycles']}/"
+                    f"{program_validation['required_cycles']} 个完整程序，"
+                    f"保留 {len(P)} 个有效平台段"
+                )
+            else:
+                self.progress.emit(
+                    "温度程序不完整: "
+                    f"完整程序 0/{program_validation['required_cycles']}，"
+                    f"最长连续顺序 "
+                    f"{program_validation['longest_ordered_prefix']}/"
+                    f"{program_validation['expected_platforms_per_cycle']}；"
+                    "不会用异常/残缺平台回归"
+                )
 
             self.progress.emit("回归各光栅灵敏度...")
             dL_cols = [f"{c}_d" for c in self.wavelength_cols]
             S_eff_raw = {}
+            rejected_proxy_columns = candidate_plateaus.attrs.get(
+                "proxy_columns_rejected", {},
+            )
+            adjacent_jump_counts = candidate_plateaus.attrs.get(
+                "source_adjacent_jump_counts", {},
+            )
+            serial_reversal_counts = candidate_plateaus.attrs.get(
+                "source_serial_reversal_counts", {},
+            )
             for i, dc in enumerate(dL_cols):
-                S_eff_raw[dc] = regress_sensitivity(P, dc, self.wavelength_cols[i])
+                wcol = self.wavelength_cols[i]
+                configured_jump_threshold = self.params.get(
+                    "quality_jump_threshold_nm"
+                )
+                jump_threshold_nm = (
+                    float(configured_jump_threshold)
+                    if configured_jump_threshold is not None
+                    else None
+                )
+                source_jump_count = int(adjacent_jump_counts.get(wcol, 0))
+                source_reversal_count = int(serial_reversal_counts.get(wcol, 0))
+                if wcol in rejected_proxy_columns:
+                    sensitivity = {
+                        "slope": float("nan"), "intercept": float("nan"),
+                        "T_base": float("nan"), "r2": float("nan"),
+                        "display": wcol, "total_plateaus": 0,
+                        "detected_plateaus": int(len(candidate_plateaus)),
+                        "used_plateaus": 0,
+                        "excluded_plateau_positions": [],
+                        "quality_filter_applied": False,
+                        "not_processed_reason": (
+                            f"源数据相邻跳变 {rejected_proxy_columns[wcol]} 次"
+                        ),
+                    }
+                elif not program_validation["is_complete"]:
+                    sensitivity = {
+                        "slope": float("nan"), "intercept": float("nan"),
+                        "T_base": float("nan"), "r2": float("nan"),
+                        "display": wcol, "total_plateaus": 0,
+                        "detected_plateaus": int(len(candidate_plateaus)),
+                        "used_plateaus": 0,
+                        "excluded_plateau_positions": [],
+                        "quality_filter_applied": False,
+                        "not_processed_reason": "未检出完整且顺序正确的温度程序",
+                    }
+                else:
+                    source_plateaus, local_exclusions, local_jump_counts = (
+                        filter_plateaus_by_adjacent_jumps(
+                            df, wcol, P,
+                            jump_threshold_nm=jump_threshold_nm,
+                            min_jump_count=int(
+                                self.params.get("min_serial_jump_count", 10)
+                            ),
+                        )
+                    )
+                    sensitivity = regress_sensitivity(
+                        source_plateaus,
+                        dc,
+                        wcol,
+                        quality_filter=bool(self.params.get("quality_filter_enabled", True)),
+                        quality_r2_trigger=float(self.params.get("quality_r2_trigger", 0.98)),
+                        quality_residual_threshold_pm=float(
+                            self.params.get("quality_residual_threshold_pm", 100.0)
+                        ),
+                        balance_setpoints=True,
+                    )
+                    sensitivity["source_invalid_plateau_count"] = len(local_exclusions)
+                    sensitivity["source_invalid_plateau_positions"] = local_exclusions
+                    sensitivity["source_plateau_adjacent_jump_counts"] = local_jump_counts
+                    if local_exclusions:
+                        sensitivity["quality_filter_applied"] = True
+                sensitivity["source_adjacent_jump_count"] = source_jump_count
+                sensitivity["source_jump_threshold_nm"] = jump_threshold_nm
+                sensitivity["source_serial_reversal_count"] = source_reversal_count
+                S_eff_raw[dc] = sensitivity
 
             # ★ 归一化: S_eff key 必须用原始 df 列名，_d 后缀是内部实现细节禁止外泄
             S_eff = {}
             for i, wcol in enumerate(self.wavelength_cols):
                 S_eff[wcol] = S_eff_raw[f"{wcol}_d"]
 
+            calibration_ready = bool(program_validation["is_complete"]) and any(
+                np.isfinite(item.get("slope", float("nan")))
+                for item in S_eff.values()
+            )
             self.progress.emit(f"回归完成: {len(S_eff)} 个光栅")
             result = {"df": df, "base": base, "plateaus": P,
+                      "candidate_plateaus": candidate_plateaus,
+                      "program_validation": program_validation,
+                      "calibration_ready": calibration_ready,
                       "S_eff": S_eff, "wavelength_cols": self.wavelength_cols}
             self._last_result = result  # 测试用：run() 结束后直接读取
             self.finished.emit(result)
@@ -671,6 +845,20 @@ def _run_compensation_pipeline_static(
         eps = np.asarray(r.get("eps_corr", np.empty(0)), dtype=np.float64)
         T_abs = np.asarray(r.get("T_abs", np.empty(0)), dtype=np.float64)
         T_base = float(r.get("T_base", 25.0))
+        valid_samples = np.isfinite(eps) & np.isfinite(T_abs)
+        valid_count = int(np.count_nonzero(valid_samples))
+        if valid_count < 20:
+            results[s_name] = {
+                "model": None,
+                "metrics": None,
+                "grade": grade_sensor_na(
+                    s_name,
+                    f"有效温度/应变点不足（{valid_count} 点）；异常温度段未参与补偿",
+                ),
+            }
+            continue
+        eps = eps[valid_samples]
+        T_abs = T_abs[valid_samples]
 
         try:
             cids = detect_cycles_from_T(T_abs, method="auto")
@@ -733,7 +921,11 @@ class PhaseBWorker(QThread):
     def __init__(self, df, time_h, wavelength_cols, annotation_groups,
                  S_eff_result, strain_coeffs, sample_interval_s=2.0,
                  run_compensation=True, comp_form="lut", poly_order=4,
-                 fs_map=None, subsample_step=None, thresholds=None):
+                 fs_map=None, subsample_step=None, thresholds=None,
+                 temperature_range: tuple[float, float] | None = None,
+                 temperature_reference_C: float | None = None,
+                 temperature_disagreement_limit_C: float = 10.0,
+                 temperature_range_tolerance_C: float = 1.0):
         super().__init__()
         self.df = df; self.time_h = time_h
         self.wavelength_cols = wavelength_cols
@@ -747,6 +939,12 @@ class PhaseBWorker(QThread):
         self.poly_order = poly_order
         self.fs_map = fs_map or {}
         self.thresholds = thresholds  # GradeThresholds | None
+        self.temperature_range = temperature_range
+        self.temperature_reference_C = temperature_reference_C
+        self.temperature_disagreement_limit_C = float(temperature_disagreement_limit_C)
+        self.temperature_range_tolerance_C = max(
+            0.0, float(temperature_range_tolerance_C),
+        )
         self._last_result = None  # for testing
 
     def run(self):
@@ -784,7 +982,10 @@ class PhaseBWorker(QThread):
                 # 实测温度系数 (Phase A 结果 — key 已归一化为原始列名)
                 S1 = self.S_eff_result[wcol1]["slope"]
                 S2 = self.S_eff_result[wcol2]["slope"]
-                T_base = (self.S_eff_result[wcol1]["T_base"] + self.S_eff_result[wcol2]["T_base"]) / 2.0
+                regression_T_base = (
+                    self.S_eff_result[wcol1]["T_base"]
+                    + self.S_eff_result[wcol2]["T_base"]
+                ) / 2.0
 
                 # 用户输入的应变系数
                 coefs = self.strain_coeffs.get(pfx, {})
@@ -792,33 +993,107 @@ class PhaseBWorker(QThread):
                 Ke2 = coefs.get("Ke2", 1.2)
 
                 # 从 dL 增强 df 读漂移数据 (_d 列由 compute_dL 产生)
-                dl1 = df_aug[f"{wcol1}_d"].values
-                dl2 = df_aug[f"{wcol2}_d"].values
+                dl1 = np.asarray(df_aug[f"{wcol1}_d"].to_numpy(), dtype=np.float64)
+                dl2 = np.asarray(df_aug[f"{wcol2}_d"].to_numpy(), dtype=np.float64)
 
-                # 标定KT解耦 (对比用)
-                eps_orig, dT_orig = decouple(dl1, dl2, Ke1, Ke1 * 0.95, Ke2, Ke2 * 0.95)
-                # 修正解耦：用实测 S_eff 替 KT
+                # 该界面只采集 Ke，不采集名义 KT。不能把 Ke×0.95
+                # 伪装成温度系数：其单位错误，且矩阵必然奇异。
+                # 若未来提供名义 KT，可在此处单独计算对比序列；当前明确
+                # 标记为不可用，避免报告和图表把虚构数据当成标定结果。
+                eps_orig = np.full_like(dl1, np.nan, dtype=np.float64)
+                dT_orig = np.full_like(dl1, np.nan, dtype=np.float64)
+                # 实测温度系数解耦：Phase B 的唯一有效解耦结果。
                 eps_corr, dT_corr = decouple(dl1, dl2, Ke1, S1, Ke2, S2)
-                T_abs = dT_corr + T_base
+                # compute_dL is anchored at the first acquired row.  For a
+                # known experiment range, its configured lower bound is the
+                # absolute reference; averaging regression intercepts is not
+                # safe when a channel contains a serially shifted branch.
+                reference_T = (
+                    float(self.temperature_reference_C)
+                    if self.temperature_reference_C is not None
+                    else regression_T_base
+                )
+                T_abs_raw = np.asarray(dT_corr + reference_T, dtype=np.float64)
+                temperature_valid_mask = np.isfinite(T_abs_raw)
+                out_of_range_mask = np.zeros(len(T_abs_raw), dtype=bool)
+                disagreement_mask = np.zeros(len(T_abs_raw), dtype=bool)
+
+                # When one Ke is near zero, that grating is temperature
+                # dominant. A persistent disagreement from its partner is a
+                # serial/false-peak condition, so leave a gap instead of
+                # manufacturing a replacement temperature.
+                dominant_index: int | None = None
+                if abs(Ke1) <= max(1e-9, abs(Ke2) * 0.15):
+                    dominant_index = 0
+                elif abs(Ke2) <= max(1e-9, abs(Ke1) * 0.15):
+                    dominant_index = 1
+                if (
+                    dominant_index is not None
+                    and self.temperature_disagreement_limit_C > 0.0
+                ):
+                    if dominant_index == 0:
+                        dominant_temperature = dl1 / S1
+                        partner_temperature = dl2 / S2
+                    else:
+                        dominant_temperature = dl2 / S2
+                        partner_temperature = dl1 / S1
+                    disagreement_mask = (
+                        np.abs(dominant_temperature - partner_temperature)
+                        > self.temperature_disagreement_limit_C
+                    )
+                    temperature_valid_mask &= ~disagreement_mask
+
+                if self.temperature_range is not None:
+                    temp_min, temp_max = self.temperature_range
+                    if not (
+                        np.isfinite(temp_min)
+                        and np.isfinite(temp_max)
+                        and temp_max > temp_min
+                    ):
+                        raise ValueError("Temperature range requires finite ascending bounds")
+                    tolerance_C = self.temperature_range_tolerance_C
+                    out_of_range_mask = (
+                        (T_abs_raw < temp_min - tolerance_C)
+                        | (T_abs_raw > temp_max + tolerance_C)
+                    )
+                    temperature_valid_mask &= ~out_of_range_mask
+                    T_abs = np.where(
+                        temperature_valid_mask,
+                        np.clip(T_abs_raw, temp_min, temp_max),
+                        np.nan,
+                    )
+                else:
+                    T_abs = np.where(temperature_valid_mask, T_abs_raw, np.nan)
+                temperature_invalid_count = int(
+                    np.count_nonzero(~temperature_valid_mask)
+                )
 
                 sensors[pfx] = {
                     "single_grating": False,
                     "eps_orig": eps_orig, "dT_orig": dT_orig,
-                    "eps_corr": eps_corr, "dT_corr": dT_corr, "T_abs": T_abs,
-                    "S1": S1, "S2": S2, "T_base": T_base,
+                    "eps_corr": eps_corr, "dT_corr": dT_corr,
+                    "T_abs": T_abs, "T_abs_raw": T_abs_raw,
+                    "temperature_valid_mask": temperature_valid_mask,
+                    "temperature_invalid_count": temperature_invalid_count,
+                    "temperature_out_of_range_count": int(np.count_nonzero(out_of_range_mask)),
+                    "temperature_disagreement_count": int(np.count_nonzero(disagreement_mask)),
+                    "S1": S1, "S2": S2, "T_base": reference_T,
+                    "regression_T_base": regression_T_base,
+                    "nominal_kt_available": False,
                 }
 
-                # 标定 vs 实测对比
-                for label, gKT, sEff in [
-                    (f"{pfx}-W1", Ke1 * 0.95, S1),
-                    (f"{pfx}-W2", Ke2 * 0.95, S2),
+                # 未录入名义 KT 时，只保留实测值并将对比字段置空（NaN）。
+                for label, sEff in [
+                    (f"{pfx}-W1", S1),
+                    (f"{pfx}-W2", S2),
                 ]:
                     comparisons.append({
                         "grating": label,
-                        "given_KT": gKT,
+                        "given_KT": float("nan"),
                         "measured_S_eff": sEff,
-                        "diff_pm_per_C": sEff - gKT,
-                        "apparent_strain_ppm_per_C": (sEff - gKT) / Ke1 if abs(Ke1) > 1e-10 else float("nan"),
+                        "diff_pm_per_C": float("nan"),
+                        "apparent_strain_ppm_per_C": float("nan"),
+                        "note": "未提供名义 KT；不生成虚构对比值",
                     })
 
                 self.progress.emit(
@@ -838,11 +1113,61 @@ class PhaseBWorker(QThread):
                 )
                 self.progress.emit("补偿指标计算完成")
 
+            # 报告/诊断记录需要同时保留“补偿前解耦应变”和“补偿后应变”。
+            # 补偿应用必须在 PhaseBWorker 子线程执行，主线程消费者只读结果。
+            diagnostic_series: dict[str, dict[str, np.ndarray]] = {}
+            compensation_oob: dict[str, int] = {}
+            temperature_quality: dict[str, dict[str, int]] = {}
+            for sensor_name, sensor_data in sensors.items():
+                if sensor_data.get("single_grating", False):
+                    continue
+                temperature_quality[sensor_name] = {
+                    "invalid_count": int(sensor_data.get("temperature_invalid_count", 0)),
+                    "out_of_range_count": int(sensor_data.get("temperature_out_of_range_count", 0)),
+                    "disagreement_count": int(sensor_data.get("temperature_disagreement_count", 0)),
+                }
+                eps_raw = np.asarray(
+                    sensor_data.get("eps_corr", np.empty(0)),
+                    dtype=np.float64,
+                )
+                T_abs = np.asarray(
+                    sensor_data.get("T_abs", np.empty(0)),
+                    dtype=np.float64,
+                )
+                diagnostic_entry = {
+                    "eps_raw": eps_raw,
+                    "eps_compensated": np.empty(0, dtype=np.float64),
+                }
+                comp_entry = compensation.get(sensor_name, {})
+                comp_model = (
+                    comp_entry.get("model")
+                    if isinstance(comp_entry, dict)
+                    else None
+                )
+                if (
+                    comp_model is not None
+                    and len(eps_raw) > 0
+                    and len(T_abs) == len(eps_raw)
+                ):
+                    eps_compensated, oob_mask = apply_compensation_model(
+                        eps_raw,
+                        T_abs,
+                        comp_model,
+                    )
+                    diagnostic_entry["eps_compensated"] = eps_compensated
+                    oob_count = int(np.count_nonzero(oob_mask))
+                    if oob_count > 0:
+                        compensation_oob[sensor_name] = oob_count
+                diagnostic_series[sensor_name] = diagnostic_entry
+
             self.progress.emit("解耦分析完成！")
             result = {
                 "sensors": sensors, "comparisons": comparisons,
                 "df": self.df, "time_h": time_h,
                 "compensation": compensation,
+                "diagnostic_series": diagnostic_series,
+                "compensation_oob": compensation_oob,
+                "temperature_quality": temperature_quality,
             }
             self._last_result = result  # for testing
             self.finished.emit(result)
@@ -1127,6 +1452,10 @@ class PhaseADialog(QDialog):
             state = tp._phase_a_state
             saved_annot = state.get("annotation", {}) or {}
             self._annotation_dirty = set(state.get("annotation_dirty", []) or [])
+            # ★ 注入手改列的用户值到 base，后续 merge 才能正确保留
+            for col in self._annotation_dirty:
+                if col in saved_annot:
+                    self._annotation[col] = saved_annot[col]
             from utils.annotation_utils import merge_annotations
             self._annotation = merge_annotations(
                 base=self._annotation,
@@ -1139,6 +1468,13 @@ class PhaseADialog(QDialog):
                 self.tmin.setValue(state["tmin"]); self.tmax.setValue(state["tmax"]); self.tstep.setValue(state["tstep"])
             if state.get("params"):
                 self._params.update(state["params"])
+                saved_mode = self._params.get("temperature_program_mode", "heating")
+                saved_index = self.program_mode_combo.findData(saved_mode)
+                self.program_mode_combo.setCurrentIndex(max(0, saved_index))
+                self.temperature_cycle_spin.setValue(
+                    max(1, int(self._params.get("temperature_cycle_count", 1)))
+                )
+                self._on_temperature_program_changed()
             if state.get("seff_result"):
                 self._on_result(state["seff_result"])
             self._refresh_all()
@@ -1195,7 +1531,7 @@ class PhaseADialog(QDialog):
         run_gb, run_layout = create_form_group("温度范围与检测参数")
         temp_row = QHBoxLayout()
         temp_row.addWidget(QLabel("温度范围:"))
-        self.tmin = QDoubleSpinBox(); self.tmin.setRange(-50,200); self.tmin.setValue(10.0); self.tmin.setPrefix("最低 "); self.tmin.setSuffix(" °C")
+        self.tmin = QDoubleSpinBox(); self.tmin.setRange(-50,200); self.tmin.setValue(0.0); self.tmin.setPrefix("最低 "); self.tmin.setSuffix(" °C")
         temp_row.addWidget(self.tmin)
         self.tmax = QDoubleSpinBox(); self.tmax.setRange(-50,200); self.tmax.setValue(70.0); self.tmax.setPrefix("最高 "); self.tmax.setSuffix(" °C")
         temp_row.addWidget(self.tmax)
@@ -1203,6 +1539,35 @@ class PhaseADialog(QDialog):
         temp_row.addWidget(self.tstep)
         temp_row.addStretch()
         run_layout.addLayout(temp_row)
+
+        protocol_row = QHBoxLayout()
+        protocol_row.addWidget(QLabel("温度程序:"))
+        self.program_mode_combo = QComboBox()
+        self.program_mode_combo.addItem("单向升温（低→高）", "heating")
+        self.program_mode_combo.addItem("单向降温（高→低）", "cooling")
+        self.program_mode_combo.addItem("高低温循环（低→高→低）", "cycle")
+        saved_mode = str(self._params.get("temperature_program_mode", "heating"))
+        saved_index = self.program_mode_combo.findData(saved_mode)
+        self.program_mode_combo.setCurrentIndex(max(0, saved_index))
+        protocol_row.addWidget(self.program_mode_combo)
+        protocol_row.addWidget(QLabel("循环次数:"))
+        self.temperature_cycle_spin = QSpinBox()
+        self.temperature_cycle_spin.setRange(1, 99)
+        self.temperature_cycle_spin.setValue(
+            max(1, int(self._params.get("temperature_cycle_count", 1)))
+        )
+        protocol_row.addWidget(self.temperature_cycle_spin)
+        self.temperature_program_info = QLabel()
+        self.temperature_program_info.setStyleSheet("color: #1890ff;")
+        protocol_row.addWidget(self.temperature_program_info)
+        protocol_row.addStretch()
+        run_layout.addLayout(protocol_row)
+        self.program_mode_combo.currentIndexChanged.connect(self._on_temperature_program_changed)
+        self.temperature_cycle_spin.valueChanged.connect(self._on_temperature_program_changed)
+        self.tmin.valueChanged.connect(self._on_temperature_program_changed)
+        self.tmax.valueChanged.connect(self._on_temperature_program_changed)
+        self.tstep.valueChanged.connect(self._on_temperature_program_changed)
+        self._on_temperature_program_changed()
 
         detect_row = QHBoxLayout()
         detect_row.addWidget(create_button("⚙ 检测参数...", self._open_detect, "secondary"))
@@ -1233,8 +1598,10 @@ class PhaseADialog(QDialog):
         layout.addWidget(self.error_bar)
 
         # ── S_eff 结果表 ──
-        self.seff_table = QTableWidget(0, 5)
-        self.seff_table.setHorizontalHeaderLabels(["暗号", "灵敏度 (pm/°C)", "线性度 R²", "分组", "类型"])
+        self.seff_table = QTableWidget(0, 6)
+        self.seff_table.setHorizontalHeaderLabels([
+            "暗号", "灵敏度 (pm/°C)", "线性度 R²", "分组", "类型", "数据质量",
+        ])
         self.seff_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.seff_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.seff_table.horizontalHeader().setStyleSheet("QHeaderView::section { font-weight: bold; }")
@@ -1320,6 +1687,8 @@ class PhaseADialog(QDialog):
             is_valid = is_valid_annotation(s)
             all_items.append((col_name, s, is_valid))
 
+        # ★ 先清空行避免旧 QTableWidgetItem 在按行更新中被 _on_apply() 读到
+        self.fill_table.setRowCount(0)
         self.fill_table.setRowCount(max(8, len(all_items)))
         for i, (cname, cval, is_valid) in enumerate(all_items):
             self.fill_table.setItem(i, 0, QTableWidgetItem(cname))
@@ -1457,7 +1826,36 @@ class PhaseADialog(QDialog):
             result.append(round(t, 1)); t += step
         return result
 
+    def _temperature_program_mode(self) -> str:
+        return str(self.program_mode_combo.currentData() or "heating")
+
+    def _sync_temperature_program_params(self):
+        self._params["temperature_program_mode"] = self._temperature_program_mode()
+        self._params["temperature_cycle_count"] = self.temperature_cycle_spin.value()
+
+    def _expected_platform_count(self) -> int:
+        return len(build_temperature_program_sequence(
+            self._get_setpoints(),
+            self._temperature_program_mode(),
+            cycle_count=self.temperature_cycle_spin.value(),
+        ))
+
+    def _on_temperature_program_changed(self, *_args):
+        is_cycle = self._temperature_program_mode() == "cycle"
+        self.temperature_cycle_spin.setEnabled(is_cycle)
+        count = self._expected_platform_count()
+        if is_cycle:
+            per_cycle = len(build_temperature_program_sequence(
+                self._get_setpoints(), "cycle", cycle_count=1,
+            ))
+            text = f"期望 {per_cycle} 个平台/循环，当前共 {count} 个"
+        else:
+            text = f"期望 {count} 个平台"
+        self.temperature_program_info.setText(text)
+        self._sync_temperature_program_params()
+
     def _on_run(self):
+        self._sync_temperature_program_params()
         setpoints = self._get_setpoints()
         if len(setpoints) < 2:
             self.error_bar.setText("⚠ 至少需要 2 个设定温度"); self.error_bar.setVisible(True)
@@ -1507,8 +1905,29 @@ class PhaseADialog(QDialog):
             self.seff_table.setItem(i, 2, QTableWidgetItem(f"{s['r2']:.6f}"))
             self.seff_table.setItem(i, 3, QTableWidgetItem(sensor_pfx))
             self.seff_table.setItem(i, 4, QTableWidgetItem(grating_type))
+            if s.get("not_processed_reason"):
+                quality = f"未处理：{s['not_processed_reason']}"
+            elif s.get("source_invalid_plateau_count", 0):
+                quality = (
+                    f"剔除 {s['source_invalid_plateau_count']} 个异常平台"
+                )
+            elif s.get("quality_filter_applied", False):
+                quality = (
+                    f"筛除 {len(s.get('excluded_plateau_positions', []))}/"
+                    f"{s.get('total_plateaus', 0)} 个异常平台"
+                )
+            elif s.get("source_adjacent_jump_count", 0):
+                quality = (
+                    f"原始跳变 {s['source_adjacent_jump_count']} 次，"
+                    "标定平台有效"
+                )
+            else:
+                quality = "相邻跳变 0 次"
+            self.seff_table.setItem(i, 5, QTableWidgetItem(quality))
 
-        self.charts_btn.setEnabled(True)
+        calibration_ready = bool(result.get("calibration_ready", True))
+        validation = result.get("program_validation", {})
+        self.charts_btn.setEnabled(calibration_ready)
         self._phase_a_result = result
 
         s_eff_keys = list(result.get("S_eff", {}).keys())
@@ -1517,6 +1936,18 @@ class PhaseADialog(QDialog):
         self.run_btn.setStyleSheet(_BTN_STYLE_ENABLED)
         self.run_btn.setEnabled(True)
         self.progress_label.setText(f"✅ {len(S_eff)} 个光栅回归完成")
+        if not calibration_ready:
+            self.run_btn.setText("⚠ 温度程序未通过")
+            self.error_bar.setText(
+                "⚠ 未检出完整且顺序正确的温度程序："
+                f"完整程序 {validation.get('complete_cycles', 0)}/"
+                f"{validation.get('required_cycles', 1)}，"
+                f"最长顺序 {validation.get('longest_ordered_prefix', 0)}/"
+                f"{validation.get('expected_platforms_per_cycle', 0)}。"
+                "已跳过回归和后续解耦。"
+            )
+            self.error_bar.setVisible(True)
+            self.progress_label.setText("⚠ 仅保留诊断结果，未生成温度系数")
 
     def _open_charts(self):
         if not self._phase_a_result:
@@ -1534,11 +1965,13 @@ class PhaseADialog(QDialog):
 
     # ── 子对话框 ──
     def _open_detect(self):
+        self._sync_temperature_program_params()
         from utils.file_parser import detect_numeric_wavelength_columns
         _, wave_cols = detect_numeric_wavelength_columns(self._df)
         from ui.calibration_tab import DetectionParamsDialog
         dlg = DetectionParamsDialog(self._params, self._df, wave_cols,
-                                     n_expected=len(self._get_setpoints()),
+                                     n_expected=self._expected_platform_count(),
+                                     setpoints=self._get_setpoints(),
                                      time_col_idx=self._time_col_idx, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._params = dlg.get_params()
@@ -1564,9 +1997,11 @@ class PhaseADialog(QDialog):
             tp._annotation_dict = dict(self._annotation)
             tp._annotation_groups = dict(self._groups)
             tp._annotation_dirty = set(self._annotation_dirty)  # 持久化 dirty 标记
-            if self._phase_a_result:
+            if self._phase_a_result and self._phase_a_result.get("calibration_ready", True):
                 tp._last_result = self._phase_a_result
                 tp._phase_a_done = True
+            elif self._phase_a_result:
+                setattr(tp, "_phase_a_done", False)
             tp._phase_a_state = {
                 "annotation": dict(self._annotation),
                 "annotation_dirty": list(self._annotation_dirty),
@@ -1879,6 +2314,38 @@ class PhaseBDialog(QDialog):
         if tp and tp._phase_b_state and "grade_thresholds" in tp._phase_b_state:
             thresholds = GradeThresholds.from_dict(tp._phase_b_state["grade_thresholds"])
 
+        temperature_range = None
+        temperature_reference_C = None
+        temperature_disagreement_limit_C = 10.0
+        temperature_range_tolerance_C = 1.0
+        phase_a_state = getattr(tp, "_phase_a_state", None) if tp else None
+        if isinstance(phase_a_state, dict):
+            temp_min = float(phase_a_state.get("tmin", 0.0))
+            temp_max = float(phase_a_state.get("tmax", 0.0))
+            if np.isfinite(temp_min) and np.isfinite(temp_max) and temp_max > temp_min:
+                temperature_range = (temp_min, temp_max)
+                temperature_reference_C = temp_min
+            phase_a_params = phase_a_state.get("params") or {}
+            temperature_disagreement_limit_C = float(
+                phase_a_params.get("temperature_disagreement_limit_C", 10.0)
+            )
+            temp_step = float(phase_a_state.get("tstep", 0.0))
+            if np.isfinite(temp_step) and temp_step > 0.0:
+                # At a configured boundary the calibrated dT carries a
+                # finite residual.  Use one quarter of a temperature step
+                # (bounded to 1~3 C) as a confidence band, then clamp it to
+                # the physical range.  Larger excursions remain gaps.
+                temperature_range_tolerance_C = min(
+                    3.0, max(1.0, temp_step * 0.25),
+                )
+            configured_tolerance = phase_a_params.get(
+                "temperature_range_tolerance_C"
+            )
+            if configured_tolerance is not None:
+                temperature_range_tolerance_C = max(
+                    0.0, float(configured_tolerance),
+                )
+
         from ui.calibration_tab import PhaseBWorker
         self._worker = PhaseBWorker(
             self._df, time_h, wavelength_cols, self._groups,
@@ -1887,6 +2354,10 @@ class PhaseBDialog(QDialog):
             comp_form=comp_form, poly_order=poly_order,
             fs_map=fs_map, subsample_step=subsample_step,
             thresholds=thresholds,
+            temperature_range=temperature_range,
+            temperature_reference_C=temperature_reference_C,
+            temperature_disagreement_limit_C=temperature_disagreement_limit_C,
+            temperature_range_tolerance_C=temperature_range_tolerance_C,
         )
         self._worker.progress.connect(lambda m: self.progress_label.setText(m))
         self._worker.finished.connect(self._on_done)
@@ -1900,6 +2371,35 @@ class PhaseBDialog(QDialog):
 
         # ★ 补偿结果已在子线程算完 (Phase 3b)
         self._compensation_results = result.get("compensation", {})
+        temperature_quality = result.get("temperature_quality", {}) or {}
+        skipped_temperature = {
+            name: int(info.get("invalid_count", 0))
+            for name, info in temperature_quality.items()
+            if int(info.get("invalid_count", 0)) > 0
+        }
+        if skipped_temperature:
+            details = "；".join(
+                f"{name}={count} 点"
+                for name, count in sorted(skipped_temperature.items())
+            )
+            QMessageBox.warning(
+                self,
+                "温度数据质量",
+                "以下传感器存在超出实验温度范围或双栅不一致的数据；"
+                "这些点已留空，未参与解耦或补偿：\n" + details,
+            )
+        compensation_oob = result.get("compensation_oob", {}) or {}
+        if compensation_oob:
+            details = "、".join(
+                f"{name}={count}点"
+                for name, count in sorted(compensation_oob.items())
+            )
+            QMessageBox.warning(
+                self,
+                "补偿温度越界",
+                "部分温度超出补偿模型标定范围，已按端点钳位，"
+                f"禁止外推。越界统计：{details}",
+            )
         if not self._compensation_results:
             # 回退: worker 没算 → 用静态函数补算
             fs_map_fb: dict[str, float] = {}
@@ -2641,6 +3141,13 @@ class TemperatureCalibrationPage(QWidget):
         self._detection_params = {
             "rolling_window": 25, "std_percentile": 45.0,
             "min_plateau_samples": 180, "head_trim_ratio": 0.70,
+            "quality_filter_enabled": True,
+            "quality_residual_threshold_pm": 100.0,
+            "quality_r2_trigger": 0.98,
+            "quality_jump_threshold_nm": 0.05,
+            "min_serial_jump_count": 10,
+            "temperature_program_mode": "heating",
+            "temperature_cycle_count": 1,
             "sample_interval_s": 2.0, "hold_time_min": 6.0,
         }
         self._time_col_idx = None
@@ -2732,7 +3239,9 @@ class TemperatureCalibrationPage(QWidget):
         try:
             from utils.file_parser import parse_enlight_file, detect_numeric_wavelength_columns
 
-            df, annotation, meta = parse_enlight_file(path)
+            df, annotation, meta = parse_enlight_file(
+                path, allow_timestamp_restarts=True,
+            )
             self._loaded_df = df
             self._annotation_dict = annotation
             self._annotation_meta = meta
@@ -2952,7 +3461,7 @@ class TemperatureCalibrationPage(QWidget):
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             result = dlg.get_result()
-            if result:
+            if result and result.get("calibration_ready", True):
                 self._last_result = result
                 self._phase_a_done = True
                 S_eff = result.get("S_eff", {})
@@ -2965,6 +3474,12 @@ class TemperatureCalibrationPage(QWidget):
                 self.btn_phase_b.setCursor(Qt.CursorShape.PointingHandCursor)
                 self.btn_phase_b.setEnabled(True)
                 self.btn_phase_b.setToolTip("打开阶段 B 对话框")
+            elif result:
+                self._phase_a_done = False
+                self.btn_phase_b.setStyleSheet(_BTN_STYLE_DISABLED)
+                self.btn_phase_b.setCursor(Qt.CursorShape.ForbiddenCursor)
+                self.btn_phase_b.setEnabled(False)
+                self.btn_phase_b.setToolTip("温度程序未通过完整性验证，不能进入阶段 B")
 
     def _open_phase_b(self):
         if not self._phase_a_done:
@@ -2996,6 +3511,7 @@ class StrainCalibrationPage(QWidget):
         self._strain_configs: dict[str, object] = {}   # sensor_name → StrainSubConfig (镜像 project.strain)
         self._current_sensor: str | None = None          # 当前选中传感器名
         self._working_result: object | None = None        # 当前分析结果 (尚未加入列表)
+        self._analysis_snapshot: dict | None = None       # 已提交到后台的不可变分析输入
         self._project_dirty: bool = False                 # 项目有未保存更改
         self._build_ui()
 
@@ -3218,14 +3734,14 @@ class StrainCalibrationPage(QWidget):
         ann = sources.get(key, "").strip()
         return ann if ann else key
 
-    def _parse_sensor_from_grating_map(self) -> str:
+    def _parse_sensor_from_grating_map(self, sources: dict[str, str] | None = None) -> str:
         """从 _get_grating_sources() 解析传感器名。
 
         G1→'C2-1', G2→'C2-2' → 返回 'C2'。
         前缀按最后一个 '-' 或 '_' 切分 (rsplit)，兼容 'C2-1'/'C2_1'/'A1-W1' 等。
         要求所有光栅解析出的前缀一致；不一致或空则返回空字符串。
         """
-        sources = self._get_grating_sources()
+        sources = dict(sources) if sources is not None else self._get_grating_sources()
         if not sources:
             return ""
         prefixes: set[str] = set()
@@ -3243,26 +3759,50 @@ class StrainCalibrationPage(QWidget):
             return next(iter(prefixes))
         return ""  # 多前缀不一致 → 调用方提示
 
-    def _build_strain_subconfig(self):
-        """从当前应变标定状态构造 StrainSubConfig。"""
+    def _build_strain_subconfig(self, snapshot: dict | None = None):
+        """从当前状态或已冻结的分析输入构造 StrainSubConfig。"""
         from dp_engine.calibration.project_config import StrainSubConfig
-        kind = self._config["grating_kind"]
+        snapshot = snapshot or {
+            "config": self._config,
+            "levels": self._levels,
+            "readings": self._readings,
+            "grating_map": self._grating_map,
+            "sensor_name": self._parse_sensor_from_grating_map(),
+        }
+        config = snapshot["config"]
+        levels = snapshot["levels"]
+        readings = snapshot["readings"]
+        grating_map = snapshot["grating_map"]
+        kind = config["grating_kind"]
         sensor_mode_map = {"single": "single", "dual_anchored": "dual_anchored", "dual_both": "dual_working"}
         # 构建 readings 列表
         readings_list: list[dict] = []
-        for r in range(len(self._levels)):
-            row: dict = {"disp_mm": self._levels[r]}
-            row["eps_theory"] = self._levels[r] / self._config["gauge_length_mm"] * 1e6 if self._config["gauge_length_mm"] > 0 else 0.0
+        for r in range(len(levels)):
+            row: dict = {"disp_mm": levels[r]}
+            row["eps_theory"] = levels[r] / config["gauge_length_mm"] * 1e6 if config["gauge_length_mm"] > 0 else 0.0
+            for grating_index, cycles in sorted(readings.items()):
+                if not isinstance(cycles, dict):
+                    continue
+                for cycle_index, directions in sorted(cycles.items()):
+                    if not isinstance(directions, dict):
+                        continue
+                    for direction in ("load", "unload"):
+                        values = directions.get(direction)
+                        if isinstance(values, list) and r < len(values):
+                            row[f"G{grating_index}_C{cycle_index}_{direction}"] = values[r]
             readings_list.append(row)
+        charts_meta: dict = {}
+        if self._last_result is not None and hasattr(self._last_result, "to_dict"):
+            charts_meta["strain_result"] = self._last_result.to_dict()
         return StrainSubConfig(
-            sensor_name=self._parse_sensor_from_grating_map(),
+            sensor_name=snapshot.get("sensor_name") or self._parse_sensor_from_grating_map(grating_map),
             sensor_mode=sensor_mode_map.get(kind, "single"),
-            gauge_length_mm=self._config["gauge_length_mm"],
-            n_cycles=self._config["n_cycles"],
-            grating_map=dict(self._grating_map),
+            gauge_length_mm=config["gauge_length_mm"],
+            n_cycles=config["n_cycles"],
+            grating_map=dict(grating_map),
             readings=readings_list,
             ke_results=dict(self._ke_results),
-            charts_meta={},
+            charts_meta=charts_meta,
         )
 
     def _is_dual_in_temperature(self) -> tuple[bool, str]:
@@ -3630,7 +4170,7 @@ class StrainCalibrationPage(QWidget):
         """读取已持久化的 self._levels + self._readings (对话框关闭时 _on_closed 已写回)"""
         return self._levels, self._readings
 
-    def _compute_ke_results(self, result) -> dict[str, float]:
+    def _compute_ke_results(self, result, config: dict | None = None) -> dict[str, float]:
         """从 StrainCalibrationResult 提取 Ke (pm/με) 结果。
 
         规则:
@@ -3640,13 +4180,14 @@ class StrainCalibrationPage(QWidget):
           - dual_both: G1 → Ke1, G2 → Ke2
         """
         ke: dict[str, float] = {}
-        kind = self._config["grating_kind"]
+        config = config or self._config
+        kind = config["grating_kind"]
         for g in result.gratings:
             val = float(g.k_pm_per_ue) if not math.isnan(g.k_pm_per_ue) else 0.0
             ke[f"Ke{g.grating_index}"] = val
 
         if kind == "dual_anchored":
-            anchor_idx = self._config.get("anchored_grating") or 2
+            anchor_idx = config.get("anchored_grating") or 2
             ke[f"Ke{anchor_idx}"] = 0.0
         elif kind == "single":
             ke["Ke2"] = 0.0
@@ -3655,42 +4196,68 @@ class StrainCalibrationPage(QWidget):
 
         return ke
 
+    def _capture_analysis_snapshot(self) -> dict:
+        """Freeze the exact data, annotations, and options sent to the worker."""
+        grating_map = copy.deepcopy(self._grating_map)
+        return {
+            "config": copy.deepcopy(self._config),
+            "levels": copy.deepcopy(self._levels),
+            "readings": copy.deepcopy(self._readings),
+            "grating_map": grating_map,
+            "sensor_name": self._parse_sensor_from_grating_map(grating_map),
+        }
+
     def _run_analysis(self):
-        _, readings = self._get_table_data()
-        gauge = self._config["gauge_length_mm"]
+        snapshot = self._capture_analysis_snapshot()
+        config_state = snapshot["config"]
+        gauge = config_state["gauge_length_mm"]
 
         config = StrainCalibrationConfig(
-            gauge_length_mm=gauge, mode=self._config["mode"],
-            n_cycles=self._config["n_cycles"],
-            grating_kind=self._config["grating_kind"],
-            anchored_grating=self._config["anchored_grating"],
-            levels=self._levels,
+            gauge_length_mm=gauge, mode=config_state["mode"],
+            n_cycles=config_state["n_cycles"],
+            grating_kind=config_state["grating_kind"],
+            anchored_grating=config_state["anchored_grating"],
+            levels=snapshot["levels"],
         )
 
+        self._analysis_snapshot = snapshot
         self.analyze_btn.setEnabled(False)
+        self.config_btn.setEnabled(False)
+        self.readings_btn.setEnabled(False)
         self.strain_progress.setText("⏳ 正在分析...")
-        self._worker = StrainCalibrationWorker(config, readings)
+        self._worker = StrainCalibrationWorker(config, snapshot["readings"])
         self._worker.progress.connect(lambda m: self.strain_progress.setText(m))
         self._worker.finished.connect(self._on_strain_result)
-        self._worker.error.connect(lambda e: self.strain_progress.setText(f"❌ {e[:200]}"))
+        self._worker.error.connect(self._on_strain_error)
         self._worker.start()
 
+    def _on_strain_error(self, message: str):
+        self._analysis_snapshot = None
+        self.analyze_btn.setEnabled(True)
+        self.config_btn.setEnabled(True)
+        self.readings_btn.setEnabled(True)
+        self.strain_progress.setText(f"❌ {message[:200]}")
+
     def _on_strain_result(self, result):
+        snapshot = self._analysis_snapshot or self._capture_analysis_snapshot()
         self._last_result = result
-        self._ke_results = self._compute_ke_results(result)
+        self._ke_results = self._compute_ke_results(result, snapshot["config"])
 
         # ── 校验一致性 ──
-        err = self._validate_grating_map_consistency()
+        err = self._validate_grating_map_consistency(snapshot["grating_map"])
         if err:
             self.strain_progress.setText(f"❌ {err}")
             self.analyze_btn.setEnabled(True)
+            self.config_btn.setEnabled(True)
+            self.readings_btn.setEnabled(True)
             self.apply_coef_btn.setEnabled(False)
             self.export_se_btn.setEnabled(False)
             self.export_sw_btn.setEnabled(False)
             self.commit_list_btn.setEnabled(False)
+            self._analysis_snapshot = None
             return
 
-        sensor_name = self._parse_sensor_from_grating_map()
+        sensor_name = snapshot["sensor_name"]
         if not sensor_name:
             if not self._grating_map:
                 msg = "请在读数录入的备注行为每个光栅选择暗号源（如 C2-1 / C2-2）。"
@@ -3699,17 +4266,35 @@ class StrainCalibrationPage(QWidget):
                 msg = f"光栅暗号前缀不一致: {', '.join(anns)}。请确保 G1、G2 属于同一传感器。"
             self.strain_progress.setText(f"❌ {msg}")
             self.analyze_btn.setEnabled(True)
+            self.config_btn.setEnabled(True)
+            self.readings_btn.setEnabled(True)
             self.apply_coef_btn.setEnabled(False)
             self.export_se_btn.setEnabled(False)
             self.export_sw_btn.setEnabled(False)
             self.commit_list_btn.setEnabled(False)
+            self._analysis_snapshot = None
+            return
+
+        identity_error = self._validate_readings_identity(sensor_name, snapshot)
+        if identity_error:
+            self.strain_progress.setText(f"❌ {identity_error}")
+            self.analyze_btn.setEnabled(True)
+            self.config_btn.setEnabled(True)
+            self.readings_btn.setEnabled(True)
+            self.apply_coef_btn.setEnabled(False)
+            self.export_se_btn.setEnabled(False)
+            self.export_sw_btn.setEnabled(False)
+            self.commit_list_btn.setEnabled(False)
+            self._analysis_snapshot = None
             return
 
         # ── 存为当前工作结果（不自动入列表）──
-        sub = self._build_strain_subconfig()
+        sub = self._build_strain_subconfig(snapshot)
         self._working_result = sub
 
         self.analyze_btn.setEnabled(True)
+        self.config_btn.setEnabled(True)
+        self.readings_btn.setEnabled(True)
         self.apply_coef_btn.setEnabled(True)
         self.export_se_btn.setEnabled(True)
         self.export_sw_btn.setEnabled(True)
@@ -3719,20 +4304,38 @@ class StrainCalibrationPage(QWidget):
                                      + "  |  点击「加入已标定列表」保存")
         self._plot_strain(result)
         self._show_strain_text(result)
+        self._analysis_snapshot = None
 
     def _plot_strain(self, result):
-        eps = result.eps_theory
-
-        # 标定曲线
+        # 标定曲线必须复用持久化的真实加载读数；不能用 Ke×理论应变
+        # 回画理想直线，否则图上的点、拟合和 Ke 会彼此矛盾。
         fig = self.curve_panel.get_figure(); fig.clear()
         ax = fig.add_subplot(111)
-        if eps:
-            for g in result.gratings:
-                if np.isnan(g.k_pm_per_ue): continue
-                ax.plot(eps, g.k_pm_per_ue * np.array(eps), "-", lw=2,
-                        label=f"{self._get_grating_label(g.grating_index)}: k={g.k_pm_per_ue:.4f}, R²={g.R2:.5f}")
+        from core.chart_bundle import _extract_calibration_series
+        calibration = _extract_calibration_series(self._working_result)
+        if calibration is not None:
+            eps = np.asarray(calibration["ref"], dtype=np.float64)
+            measured = np.asarray(calibration["measured"], dtype=np.float64)
+            contributing = ", ".join(calibration["contributing_gratings"])
+            ax.scatter(eps, measured, s=24,
+                       label=f"真实加载读数 ({contributing})")
+            intercept = float(measured.mean() - calibration["slope"] * eps.mean())
+            ax.plot(
+                eps,
+                calibration["slope"] * eps + intercept,
+                "-",
+                lw=2,
+                label=(f"拟合: k={calibration['slope']:.4f}, "
+                       f"R²={calibration['r2']:.5f}"),
+            )
+        else:
+            ax.text(0.5, 0.5, "缺少有效的真实加载读数，无法绘制标定曲线",
+                    ha="center", va="center", transform=ax.transAxes)
         ax.set_xlabel("理论应变 (με)"); ax.set_ylabel("波长漂移 (pm)")
-        ax.set_title("Δλ-ε 标定曲线"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.set_title("Δλ-ε 标定曲线")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
         ax.set_xlim(left=0); ax.set_ylim(bottom=0)
         self.curve_panel.draw()
 
@@ -3787,16 +4390,76 @@ class StrainCalibrationPage(QWidget):
 
     # ── 多传感器列表管理 ──
 
-    def _validate_grating_map_consistency(self) -> str | None:
+    def _validate_grating_map_consistency(
+        self, grating_map: dict[str, str] | None = None,
+    ) -> str | None:
         """校验 grating_map 中 G1/G2 暗号前缀一致。返回 None 通过, 否则返回错误消息。"""
-        if not self._grating_map:
+        grating_map = grating_map if grating_map is not None else self._grating_map
+        if not grating_map:
             return None
         prefixes = set()
-        for ann in self._grating_map.values():
+        for ann in grating_map.values():
             if ann and '-' in ann:
                 prefixes.add(ann.split('-')[0])
         if len(prefixes) > 1:
             return f"同一次标定的两个光栅必须属于同一传感器，但找到: {', '.join(sorted(prefixes))}"
+        return None
+
+    @staticmethod
+    def _readings_fingerprint(readings: list[dict]) -> tuple[str, int]:
+        """Return a stable fingerprint of real wavelength inputs, excluding labels and Ke."""
+        reading_key_re = re.compile(r"^G\d+_C\d+_(?:load|unload)$")
+        normalized: list[dict[str, float | None]] = []
+        value_count = 0
+        for row in readings:
+            if not isinstance(row, dict):
+                continue
+            values: dict[str, float | None] = {}
+            for key, raw_value in sorted(row.items()):
+                if reading_key_re.fullmatch(str(key)) is None:
+                    continue
+                try:
+                    value = float(raw_value)
+                except (TypeError, ValueError):
+                    value = float("nan")
+                if math.isfinite(value):
+                    values[str(key)] = round(value, 9)
+                    value_count += 1
+                else:
+                    values[str(key)] = None
+            normalized.append(values)
+        if value_count < 6:
+            return "", value_count
+        payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest(), value_count
+
+    def _find_readings_identity_conflicts(
+        self, sensor_name: str, readings: list[dict],
+    ) -> list[str]:
+        fingerprint, value_count = self._readings_fingerprint(readings)
+        if not fingerprint or value_count < 6:
+            return []
+        conflicts: list[str] = []
+        for saved_name, cfg in self._strain_configs.items():
+            if saved_name == sensor_name:
+                continue
+            saved_readings = getattr(cfg, "readings", []) or []
+            saved_fingerprint, _ = self._readings_fingerprint(saved_readings)
+            if saved_fingerprint and saved_fingerprint == fingerprint:
+                conflicts.append(saved_name)
+        return sorted(conflicts)
+
+    def _validate_readings_identity(
+        self, sensor_name: str, snapshot: dict | None = None,
+    ) -> str | None:
+        """Reject relabelling a saved sensor's raw wavelengths as another sensor."""
+        candidate = self._build_strain_subconfig(snapshot)
+        conflicts = self._find_readings_identity_conflicts(sensor_name, candidate.readings)
+        if conflicts:
+            return (
+                f"当前波长读数与已保存传感器 {', '.join(conflicts)} 完全一致，"
+                f"不能仅把暗号改为 {sensor_name} 后保存。请先录入 {sensor_name} 的真实读数。"
+            )
         return None
 
     def _get_list_label(self, sensor_name: str, config: object) -> str:
@@ -3916,9 +4579,14 @@ class StrainCalibrationPage(QWidget):
             return
         # 恢复 config
         mode_map = {"single": "single", "dual_working": "dual_both", "dual_anchored": "dual_anchored"}
+        rd_list = getattr(cfg, 'readings', []) or []
+        has_unload = any(
+            isinstance(row, dict) and any(str(key).endswith("_unload") for key in row)
+            for row in rd_list
+        )
         self._config.update({
             "gauge_length_mm": getattr(cfg, 'gauge_length_mm', 80.0),
-            "mode": "tension_only",  # readings 结构决定了 mode; 保持简单
+            "mode": "tension_return" if has_unload else "tension_only",
             "n_cycles": getattr(cfg, 'n_cycles', 1),
             "grating_kind": mode_map.get(getattr(cfg, 'sensor_mode', 'single'), 'single'),
             "anchored_grating": None,
@@ -3929,12 +4597,33 @@ class StrainCalibrationPage(QWidget):
             self._grating_map = dict(getattr(cfg, 'grating_map', {}) or {})
         self._ke_results = dict(getattr(cfg, 'ke_results', {}) or {})
         # 从 readings 重建 _levels
-        rd_list = getattr(cfg, 'readings', []) or []
         if rd_list and isinstance(rd_list, list) and isinstance(rd_list[0], dict):
             levels_from_cfg = [r.get("disp_mm", 0.0) for r in rd_list]
             if levels_from_cfg:
                 self._levels = levels_from_cfg
-        self._readings = {}  # readings 存的是 raw dict 格式，这里不清零等 _open_readings 载入
+        restored_readings: dict[int, dict[int, dict[str, list[float]]]] = {}
+        reading_key_re = re.compile(r"^G(?P<grating>\d+)_C(?P<cycle>\d+)_(?P<direction>load|unload)$")
+        for row_index, row in enumerate(rd_list):
+            if not isinstance(row, dict):
+                continue
+            for key, raw_value in row.items():
+                match = reading_key_re.fullmatch(str(key))
+                if match is None:
+                    continue
+                try:
+                    value = float(raw_value)
+                except (TypeError, ValueError):
+                    value = 0.0
+                grating_index = int(match.group("grating"))
+                cycle_index = int(match.group("cycle"))
+                direction = match.group("direction")
+                direction_values = restored_readings.setdefault(
+                    grating_index, {}
+                ).setdefault(cycle_index, {}).setdefault(
+                    direction, [0.0] * len(rd_list)
+                )
+                direction_values[row_index] = value
+        self._readings = restored_readings
         self._current_sensor = sensor_name
         self.config_btn.setText(f"⚙ 标定参数: {self._config_label()}")
         # 按钮使能
@@ -3952,18 +4641,11 @@ class StrainCalibrationPage(QWidget):
         if cfg is None:
             return
         ke = getattr(cfg, 'ke_results', {}) or {}
-        rd_list = getattr(cfg, 'readings', []) or []
         gauge = getattr(cfg, 'gauge_length_mm', 80.0)
         mode = getattr(cfg, 'sensor_mode', 'single')
-        # 从 readings 提取 eps_theory
-        levels = []
-        eps_theory = []
-        for r in rd_list:
-            if not isinstance(r, dict):
-                continue
-            d = r.get("disp_mm", 0.0)
-            levels.append(d)
-            eps_theory.append(d / gauge * 1e6 if gauge > 0 else 0.0)
+        duplicate_sources = self._find_readings_identity_conflicts(
+            sensor_name, getattr(cfg, "readings", []) or [],
+        )
 
         # 文本
         mode_names = {"single": "单栅", "dual_working": "双栅-双工作", "dual_anchored": "双栅-锚固"}
@@ -3973,20 +4655,84 @@ class StrainCalibrationPage(QWidget):
         if ke:
             lines.append(f"应变系数: {', '.join(f'{k}={v:.4f} pm/με' for k, v in ke.items())}\n")
         lines.append("(图表从保存的 readings 懒重算)")
-        self.strain_result_text.setText("\n".join(lines))
 
-        # 标定曲线 (从 Ke 重画拟合线)
+        # 标定曲线（仅使用持久化真实波长读数；旧项目缺读数时显式降级）
         fig = self.curve_panel.get_figure(); fig.clear()
         ax = fig.add_subplot(111)
-        if eps_theory:
-            eps_arr = np.array(eps_theory, dtype=np.float64)
-            for gi, key in enumerate(["Ke1", "Ke2"], start=1):
-                k_val = ke.get(key, 0)
-                if abs(k_val) > 1e-10:
-                    ax.plot(eps_arr, k_val * eps_arr, "-", lw=2,
-                            label=f"{self._get_grating_label(gi)}: k={k_val:.4f} pm/με")
+        from core.chart_bundle import _extract_calibration_series, _extract_saved_fit_series
+        calibration = (
+            _extract_saved_fit_series(cfg)
+            if duplicate_sources
+            else _extract_calibration_series(cfg)
+        )
+        if duplicate_sources:
+            if calibration is not None:
+                lines.append(
+                    "⚠ 历史原始读数与 " + ", ".join(duplicate_sources)
+                    + " 完全相同；以下仅按当前传感器已保存的拟合结果重建，"
+                    "不能替代真实波长读数。"
+                )
+            else:
+                lines.append(
+                    "⚠ 历史原始读数与 " + ", ".join(duplicate_sources)
+                    + " 完全相同，且未保存可重建的拟合结果；请重新录入真实读数。"
+                )
+        self.strain_result_text.setText("\n".join(lines))
+        if calibration is not None:
+            eps_arr = np.asarray(calibration["ref"], dtype=np.float64)
+            measured_arr = np.asarray(calibration["measured"], dtype=np.float64)
+            contributing = ", ".join(calibration["contributing_gratings"])
+            source = calibration.get("source", "measured")
+            if source == "measured":
+                ax.scatter(eps_arr, measured_arr, s=24,
+                           label=f"真实加载读数 ({contributing})")
+                intercept = float(measured_arr.mean() - calibration["slope"] * eps_arr.mean())
+                ax.plot(
+                    eps_arr,
+                    calibration["slope"] * eps_arr + intercept,
+                    "-",
+                    lw=2,
+                    label=f"拟合: k={calibration['slope']:.4f}, R²={calibration['r2']:.5f}",
+                )
+            elif source == "saved_regression":
+                ax.plot(
+                    eps_arr, measured_arr, "o-", lw=2, ms=4,
+                    label=(f"已保存拟合结果 ({contributing}): "
+                           f"k={calibration['slope']:.4f}, R²={calibration['r2']:.5f}"),
+                )
+            else:
+                ax.plot(
+                    eps_arr, measured_arr, "o-", lw=2, ms=4,
+                    label=(f"Ke 拟合响应 ({contributing}): "
+                           f"k={calibration['slope']:.4f}, R²={calibration['r2']:.5f}"),
+                )
+            if duplicate_sources:
+                ax.text(
+                    0.01, 0.99,
+                    "历史原始读数与 " + ", ".join(duplicate_sources)
+                    + " 相同；显示当前传感器的已保存拟合结果。",
+                    ha="left", va="top", transform=ax.transAxes,
+                    fontsize=8, color="#a05a00",
+                    bbox={"facecolor": "#fff8e1", "edgecolor": "#f0c36d", "alpha": 0.9},
+                )
+        elif duplicate_sources:
+            ax.text(
+                0.5, 0.5,
+                "数据归属异常：原始读数与 "
+                + ", ".join(duplicate_sources)
+                + " 完全一致。请重新录入当前传感器的真实读数。",
+                ha="center", va="center", transform=ax.transAxes,
+            )
+        else:
+            ax.text(
+                0.5, 0.5, "旧项目未保存真实波长读数，无法重建标定曲线",
+                ha="center", va="center", transform=ax.transAxes,
+            )
         ax.set_xlabel("理论应变 (με)"); ax.set_ylabel("波长漂移 (pm)")
-        ax.set_title(f"Δλ-ε 标定曲线 — {sensor_name}"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.set_title(f"Δλ-ε 标定曲线 — {sensor_name}")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
         ax.set_xlim(left=0); ax.set_ylim(bottom=0)
         self.curve_panel.draw()
 
@@ -4003,7 +4749,10 @@ class StrainCalibrationPage(QWidget):
             x = np.arange(len(labels_ok)); w = 0.3
             ax2.bar(x, k_vals, w, label="Ke (pm/με)")
             ax2.set_xticks(x); ax2.set_xticklabels(labels_ok)
-        ax2.set_title(f"核心指标 — {sensor_name}"); ax2.legend(fontsize=7); ax2.grid(alpha=0.3, axis="y")
+        ax2.set_title(f"核心指标 — {sensor_name}")
+        if ax2.get_legend_handles_labels()[0]:
+            ax2.legend(fontsize=7)
+        ax2.grid(alpha=0.3, axis="y")
         self.bar_panel.draw()
 
         # 残差图 (暂无残差数据 → 空白)
@@ -4267,7 +5016,8 @@ class StrainCalibrationPage(QWidget):
                 f"项目 '{name}' 已恢复。\n\n"
                 f"温度段: {'有' if pc.temperature else '无'}  |  "
                 f"应变传感器: {len(pc.strain)} 个\n\n"
-                f"⚠ 原始波长读数不包含在项目配置中，请用「📂 加载读数」单独恢复。")
+                "已恢复项目中保存的传感器读数与拟合结果。若图表提示历史读数重复，"
+                "请用「📂 加载读数」重新录入对应传感器的真实读数。")
         except Exception as e:
             QMessageBox.critical(self, "加载失败", str(e))
 
